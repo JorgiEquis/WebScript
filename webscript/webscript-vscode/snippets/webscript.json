@@ -1,0 +1,77 @@
+{
+  "route": {
+    "prefix": "route",
+    "body": "route(\"${1:/}\")",
+    "description": "Declara la ruta que sirve este archivo (debe ir primero)"
+  },
+  "reactive": {
+    "prefix": "reactive",
+    "body": "reactive ${1:nombre} = ${2:valor}",
+    "description": "Variable reactiva: re-renderiza al cambiar"
+  },
+  "var": {
+    "prefix": "var",
+    "body": "var ${1:nombre} = ${2:valor}",
+    "description": "Variable NO reactiva: se calcula una sola vez"
+  },
+  "style": {
+    "prefix": "style",
+    "body": "style ${1:nombre} =\n    -> ${2:propiedad}: ${3:valor}",
+    "description": "Bloque de estilos CSS"
+  },
+  "visual": {
+    "prefix": "visual",
+    "body": "visual ${1:nombre} =\n<${2:div}>\n    ${3}\n</${2:div}>\n",
+    "description": "Componente de UI (plantilla + bindings)"
+  },
+  "visual con binding": {
+    "prefix": "visualb",
+    "body": "visual ${1:nombre} =\n<${2:div}>\n    ${3}\n</${2:div}>\n    -> style: ${4:miEstilo}\n    -> onclick:\n        ${5}\n",
+    "description": "Componente de UI con style y onclick"
+  },
+  "if": {
+    "prefix": "if",
+    "body": "if (${1:condicion})\n    ${2}",
+    "description": "Renderizado condicional"
+  },
+  "if-else": {
+    "prefix": "ifelse",
+    "body": "if (${1:condicion})\n    ${2}\nelse\n    ${3}",
+    "description": "Renderizado condicional con else"
+  },
+  "for": {
+    "prefix": "for",
+    "body": "for (${1:item} in ${2:lista})\n    ${3}",
+    "description": "Bucle sobre una lista"
+  },
+  "render": {
+    "prefix": "render",
+    "body": "render(\n    ${1:nombreVisual}\n)",
+    "description": "Monta uno o más visual en #app"
+  },
+  "server var": {
+    "prefix": "servervar",
+    "body": "server var ${1:nombre} = ${2:valor}",
+    "description": "Variable solo de servidor, nunca llega al cliente"
+  },
+  "server function": {
+    "prefix": "serverfunction",
+    "body": "server function ${1:nombre}(${2:args})\n    ${3}",
+    "description": "Helper de servidor, invisible al cliente (varias por archivo)"
+  },
+  "post function": {
+    "prefix": "postfunction",
+    "body": "post function ${1:postController}(${2:args})\n    ${3}\n    return { ${4:resultado} }",
+    "description": "Endpoint POST de esta ruta (única por archivo, llamable desde el cliente)"
+  },
+  "import": {
+    "prefix": "import",
+    "body": "import { ${1:nombre} } from \"${2:./archivo.ws}\"",
+    "description": "Importa declaraciones de otro archivo .ws sin route()/render()"
+  },
+  "updateServer": {
+    "prefix": "updateServer",
+    "body": "await updateServer({ ${1:campo}: ${2:valor} })",
+    "description": "Manda datos al servidor (solo rutas dinámicas)"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "webscript",
+  "version": "0.1.0",
+  "description": "Lenguaje que unifica HTML, CSS y JS - compilador basado en Node.js",
+  "main": "src/compiler.js",
+  "bin": {
+    "webscript": "src/cli.js"
+  },
+  "scripts": {
+    "build": "node src/cli.js build",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "acorn": "^8.11.0"
+  },
+  "license": "MIT"
+}
