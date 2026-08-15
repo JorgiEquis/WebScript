@@ -3,6 +3,77 @@
 Lenguaje que unifica HTML, CSS y JS en un único archivo `.ws`, con reactividad
 de primera clase. Compilador escrito en Node.js.
 
+## Filosofía de diseño: control en dos capas, no solo una
+
+Si hay que resumir qué distingue a WebScript de "otro lenguaje que compila
+a JS", es esto: **controla cada acción posible, pero en dos capas
+distintas, no confundibles entre sí.**
+
+### Capa 1 — En compilación: si no puede funcionar, no compila
+
+No es un sistema de tipos. Es una negativa sistemática a producir un
+archivo que **ya se sabe** que va a fallar en cuanto alguien lo use — en
+vez de dejarte compilar "bien" y descubrirlo en el navegador o en el
+servidor de producción, con un `ReferenceError` críptico. Este patrón no
+fue un plan inicial: **emergió** de encontrar, una y otra vez a lo largo
+de esta conversación, código que compilaba sin avisos y explotaba en
+tiempo de ejecución — y decidir, cada vez, que el compilador tenía que
+haberlo visto venir. Ejemplos reales, todos verificados:
+
+- Una `server var`/`server reactive`/`server function` referenciada
+  dentro de un `visual` — rechazado, incluso si llega por `import`.
+- Una `server var` leída a secas desde una `reactive` de cliente
+  (`reactive x = contador` en vez de `server.contador`) — rechazado con
+  la forma correcta sugerida, no un `ReferenceError` en el navegador de
+  quien use la página.
+- `get function` coexistiendo con `render()` en el mismo archivo — dos
+  significados de `GET` a la vez, rechazado antes de que sea ambiguo.
+- `server function`/`var`/`reactive`/`function` sin ninguna vía real de
+  ejecución en una ruta "solo backend" — rechazadas como código muerto de
+  raíz, no silenciosamente ignoradas.
+- `watch(NOMBRE)` apuntando a algo que no es una `server reactive`
+  declarada — rechazado, no un observador que nunca se dispara.
+- Un `visual` que se referencia a sí mismo, directa o indirectamente —
+  detectado con DFS sobre el grafo de composición, rechazado con el
+  camino completo del ciclo.
+
+### Capa 2 — En ejecución: supervisión y orquestación activas, no solo reacción pasiva
+
+Esta es la parte que se queda corta si solo se habla de "rechazar en
+compilación" — WebScript también controla activamente **mientras el
+proceso está vivo**, no solo antes de arrancar:
+
+- **Reactividad profunda con rastreo por ruta**: mutar `datos.edad = 99`
+  o `lista.push(x)` dispara actualizaciones exactas — solo lo que
+  realmente depende de ese campo se re-ejecuta, verificado explícitamente
+  que un campo hermano nunca leído no dispara nada de más.
+- **`watch()`**: supervisión real de un valor de servidor mientras
+  cambia — se dispara sin importar cuál de las funciones HTTP fue la que
+  lo modificó, nunca con el valor inicial, siempre en cambios
+  posteriores.
+- **Las cuatro funciones HTTP y `http.*`**: no son solo azúcar sintáctico
+  sobre `fetch` — deciden qué verbo dispara qué lógica en el momento real
+  de cada petición, con sesiones aisladas por cookie, verificadas con
+  servidores reales, no simulados.
+- **Diffing por clave en `for`**: no es "volver a pintar todo" en cada
+  cambio — decide, nodo por nodo, cuál reutilizar y cuál reconstruir,
+  verificado contando cuántos nodos DOM se crean de más (cero, cuando no
+  hacen falta).
+
+### El resumen honesto, sin vender de más
+
+Ninguna de las dos capas es una garantía formal como un sistema de tipos
+— es disciplina de diseño verificada por dos personas en una sola
+conversación muy larga, no por años de producción con miles de usuarios
+encontrando los huecos que a nosotros se nos escaparon. Y tiene un coste
+real: la superficie de validación no para de crecer (cada función nueva
+trajo su propia comprobación de "¿y si esto es inalcanzable?"), y es
+deliberadamente lo opuesto al espíritu permisivo de JS. Si tuviera que
+venderse en una frase: **WebScript prefiere fallar en compilación antes
+que fallar en producción, y cuando algo sí llega a ejecutarse, prefiere
+supervisarlo activamente antes que confiar en que el desarrollador lo
+haga bien a mano.**
+
 ## Uso
 
 ```bash
@@ -19,7 +90,10 @@ npm test
 ```
 
 Corre la suite completa con el *test runner* nativo de Node (`node:test`,
-sin dependencias que instalar) — **58 tests, 17 suites**, cubriendo:
+sin dependencias que instalar) — **141 tests, 40 suites** a estas alturas
+(el número ha ido creciendo turno a turno; ver `tests/` para el desglose
+completo, cada archivo nuevo se documenta en su sección correspondiente
+más abajo), cubriendo:
 
 - **`tests/parser.test.js`** — todas las declaraciones (`reactive`, `var`,
   `style`, `visual`, `route`, `server var`, `server function`,
@@ -158,9 +232,11 @@ for (fruta in lista)
 - `for` **sí hace diffing por clave** (ver sección dedicada más abajo) —
   reutiliza nodos DOM existentes en vez de reconstruir toda la lista en
   cada cambio.
-- Para mutar una `reactive` que es un array, reasigna el array completo
-  (`lista = [...lista, nuevo]`), no uses `.push()` — el sistema reactivo
-  solo detecta el `set` de la propiedad completa, no mutaciones internas.
+- **Reactividad profunda** (ver sección dedicada más abajo): mutar
+  `lista.push(nuevo)` o `datos.campo = x` sí dispara actualizaciones —
+  no hace falta reasignar el array/objeto completo, aunque seguir
+  reasignando (`lista = [...lista, nuevo]`) también sigue funcionando
+  exactamente igual.
 
 ## `for` con clave: diffing real, no reconstrucción completa
 
@@ -287,6 +363,14 @@ en `parseTextNode` — `.trim()` se comía los espacios entre texto literal e
 interpolaciones, `"Hola {nombre}"` renderizaba `"HolaJorge"` sin espacio.
 Corregido normalizando solo el espacio "estructural", de indentación.)
 
+**¿Se puede guardar cualquier tipo?** Sí, sin restricción — `reactive`/
+`var`/`server var` son JS dinámico por debajo: números, texto, booleanos,
+`null`, arrays, objetos anidados con arrays dentro, cualquier combinación.
+Verificado con los siete tipos a la vez en una sola página, incluyendo
+acceso anidado real (`anidado.usuarios[0].nombre`). El tipado opcional de
+abajo no restringe qué tipos existen — solo valida coherencia si decides
+anotar uno explícitamente.
+
 ### Tipado opcional (`reactive`/`var`)
 
 ```
@@ -336,13 +420,13 @@ server var num1 = 100
 ```
 
 > **Nota**: existió también `server reactive` como variante, con la idea de
-> que algún día significara algo distinto (por ejemplo, empujar la
-> actualización a los clientes conectados en tiempo real vía WebSocket). Se
-> quitó porque, sin esa pieza construida, se comportaba **exactamente
-> igual** que `server var` — dos nombres para lo mismo. Si escribes
-> `server reactive NOMBRE`, el compilador te lo dice explícitamente y te
-> sugiere `server var NOMBRE`. El día que haya push real en tiempo real,
-> puede volver con semántica propia.
+> que algún día significara algo distinto. Se quitó porque, sin esa pieza
+> construida, se comportaba **exactamente igual** que `server var` — dos
+> nombres para lo mismo, y el compilador rechazaba `server reactive` con
+> un mensaje sugiriendo `server var`. **Ha vuelto** — ver la sección
+> dedicada a `watch()` más abajo — porque ahora sí tiene un propósito
+> real y distinto: solo las `server reactive` se pueden observar con
+> `watch(NOMBRE)`.
 
 - Solo a nivel de archivo (no hay `server` local dentro de un `visual` —
   no tendría sentido, un `visual` siempre se compila a cliente).
@@ -534,7 +618,16 @@ render(
   indirectamente) y falla con un mensaje claro en vez de colgarse en un
   bucle infinito.
 - Las rutas son relativas al archivo que hace el `import`, resueltas con
-  `path.resolve` normal de Node.
+  `path.resolve` normal de Node — **siempre con `./` o `../` delante**
+  (`"./compartido.ws"`, nunca `"compartido.ws"` a secas ni
+  `"/compartido.ws"` con barra inicial). Una ruta que empieza por `/` se
+  resuelve como ruta **absoluta del sistema de archivos** (busca ese
+  archivo desde la raíz del disco, no relativo a tu proyecto) — es el
+  comportamiento normal de `path.resolve` de Node, no algo especial de
+  WebScript, pero es fácil escribirlo por error esperando que sea
+  relativo. Confirmado: `import { x } from "/otro.ws"` falla con "no se
+  encuentra el archivo importado" salvo que ese archivo exista
+  literalmente en la raíz del sistema.
 - Un archivo librería que use `server function`/`server var` internamente
   sigue siendo invisible al cliente igual que si estuvieran en el mismo
   archivo — la restricción de "prohibido en visuales" se aplica sobre el
@@ -743,8 +836,9 @@ de solo evitar el error.
 Ambos verificados con `node --check` sobre el bundle generado (no solo
 "compila sin tirar error en WebScript", sino "el JS resultante realmente
 parsea"), y contra el resto de ejemplos para confirmar que no rompí nada
-existente (en particular, `updateServer({ visitas: contador + 1 })`, que
-ya usaba `:` explícito, sigue compilando exactamente igual que antes).
+existente (en particular, expresiones como `{ visitas: contador + 1 }`
+pasadas a una `post function`, que ya usaban `:` explícito, siguen
+compilando exactamente igual que antes).
 
 **Límite que queda, documentado a propósito, con el motor de respaldo
 (regex, sin Acorn instalado)**: tras un *destructuring* (`const {
@@ -770,9 +864,8 @@ de una heurística de texto.
 
 ## `post function` — endpoint de servidor con lógica real, llamable desde el cliente
 
-Complementa a `updateServer` (que solo hace "actualizar campos a lo bruto"):
-`post function` tiene cuerpo con lógica propia, y el compilador genera
-automáticamente el *stub* de cliente con el mismo nombre.
+Tiene cuerpo con lógica propia, y el compilador genera automáticamente
+el *stub* de cliente con el mismo nombre.
 
 ```
 server var totalPedidos = 0
@@ -803,11 +896,11 @@ visual formulario =
   llama, no se genera ningún stub de más.
 - El servidor responde a `POST` en la **URL de la propia ruta**
   (`POST /formulario`), no en `/formulario.server-data.json` (ese endpoint
-  sigue siendo exclusivo de `updateServer`). Si la ruta no tiene ninguna
+  es solo de lectura, `GET`). Si la ruta no tiene ninguna
   `post function`, un `POST` ahí devuelve `405`.
 - El valor que devuelve la función (`return {...}`) es la respuesta JSON
-  completa — no está limitado a solo actualizar `server var`
-  como `updateServer`; puede devolver cualquier cosa calculada.
+  completa — puede devolver cualquier cosa calculada, no solo el estado
+  actualizado de una `server var`.
 - Probado de extremo a extremo con `curl`: dos `POST` seguidos acumularon
   correctamente (`5` → `8`), un `GET` normal a la misma URL siguió sirviendo
   el HTML de siempre, y un `POST` a una ruta sin `post function` devolvió
@@ -856,14 +949,25 @@ visual pagina =
   — el servidor acumuló los mensajes correctamente (`total: 1` → `total: 2`
   en envíos sucesivos).
 
-## `updateServer({...})` — mutar servidor desde un handler de cliente (sin `server function`)
+## `updateServer` — eliminado, unificado con `post function`
 
-En vez de inventar un endpoint por función, se reutiliza el mismo endpoint
-de datos de la ruta (`/<baseName>.server-data.json`), extendido para
-aceptar `POST`:
+Existió como atajo para "actualizar campos de `server var` sin escribir
+ningún código de servidor" (reutilizaba el endpoint de datos de la ruta,
+extendido para aceptar `POST`). Se quitó tras comparar directamente el
+coste: `post function` puede replicar exactamente el mismo comportamiento
+con 3-4 líneas más de servidor, y mantener los dos aumentaba el número de
+"sabores" de variable/función de servidor sin una diferencia funcional
+grande — la misma clase de simplificación que ya se hizo antes con
+`server reactive`/`server var`, aunque aquí la distinción no era
+completamente falsa, solo estrecha.
 
 ```
 server var visitas = 42
+
+post function incrementar(args)
+    visitas = visitas + args.cantidad
+    return { visitas: visitas }
+
 reactive contadorCliente = server.visitas
 
 visual panel =
@@ -871,39 +975,31 @@ visual panel =
     <p>Visitas: {contadorCliente}</p>
 </div>
     -> onclick:
-        contadorCliente = await updateServer({ visitas: contadorCliente + 1 }).then(s => s.visitas)
+        var r = await incrementar({ cantidad: 1 })
+        contadorCliente = r.visitas
 ```
 
-- `updateServer({...})` es una función reconocida por el compilador (no
-  hay que declararla) — solo aparece si la ruta es dinámica (usa
-  `server.X` en algún sitio). Hace `POST` al endpoint de datos de esa
-  misma ruta, y el handler que la use se compila automáticamente como
-  `async` — puedes escribir `await` tú mismo o dejar que el compilador lo
-  añada, detecta si ya está para no duplicarlo.
-- El servidor (`serveSite` en `site-builder.js`) solo acepta, del `POST`,
-  las claves que **ya existen** como `server var` en ese
-  archivo — cualquier clave inventada se ignora en silencio, no se crean
-  variables de servidor nuevas desde el cliente. Lo comprobé mandando una
-  clave falsa por `POST`: se descartó sin error, sin aparecer en la
-  respuesta.
-- El nuevo valor **persiste** en el proceso Node — un `GET` posterior
-  devuelve el valor actualizado, no el original. Sigue siendo estado
-  compartido entre todas las visitas (misma limitación de siempre: no hay
-  sesiones).
-- `server var` siguen siendo necesarias como concepto
-  aparte de esto: representan estado que **persiste entre peticiones y se
-  comparte entre visitantes** (como `visitas`) — algo distinto de "calcular
-  algo al vuelo con datos que manda el cliente", que es lo que resuelve
-  `updateServer`. No se sustituyen entre sí, resuelven necesidades
-  distintas.
+- Si escribes `updateServer(...)` en un handler (por costumbre, o copiando
+  código de antes de este cambio), el compilador lo detecta y da un error
+  explícito señalando que se unificó con `post function` — no un
+  `ReferenceError` críptico en el navegador.
+- El endpoint `/<ruta>.server-data.json` pasó a ser **solo de lectura**
+  (`GET`) — un `POST` ahí ahora da `405`. Escribir se hace siempre vía
+  `POST` a la URL de la propia ruta, despachado a la `post function`.
+- Verificado de extremo a extremo con el mismo patrón de antes (`GET`
+  inicial → `POST` a la `post function` → `GET` posterior confirma que
+  persiste), y con el endpoint viejo devolviendo `405` como se espera.
 
-**Bug real que encontré haciendo esto funcionar**: la detección de "esto
-es una `reactive`/`server` referenciada" no distinguía una **clave de
-objeto literal** (`{ visitas: x }`) de una referencia real al valor
-(`visitas` a secas) — ambas parecían iguales para la regex. Esto rompía
-justo `updateServer({ visitas: ... })`. Arreglado con una heurística de
+**Bug real que encontré cuando SÍ existía `updateServer`** (documentado
+aquí porque la lección sigue siendo válida para cualquier caso similar
+con `post function`): la detección de "esto es una `reactive`/`server`
+referenciada" no distinguía una **clave de objeto literal**
+(`{ visitas: x }`) de una referencia real al valor (`visitas` a secas) —
+ambas parecían iguales para la regex. Arreglado con una heurística de
 contexto (¿precedido de `{`/`,` y seguido de `:`? → es una clave, no una
-referencia) en `compiler.js` y `validate.js`.
+referencia) en `compiler.js` y `validate.js` — este arreglo se queda,
+sigue siendo necesario para cualquier objeto literal que pases a una
+`post function`.
 
 ## HTML dinámico: leer datos de servidor desde el cliente
 
@@ -1177,6 +1273,785 @@ directamente.
   forma de que un atributo HTML lleve JS de WebScript tal cual) — la
   interactividad sigue llegando enteramente del `bundle.js`, como siempre.
 
+## WebScript como backend puro: `route()` sin `render()`
+
+Un archivo con `route(...)` pero **sin `render(...)`** se trata como una
+ruta "solo backend" — ni HTML, ni CSS, ni `bundle.js`. La propia URL de la
+ruta pasa a comportarse como un endpoint JSON:
+
+```
+route("/api/contador")
+
+server var total = 0
+
+post function incrementar(args)
+    total = total + args.cantidad
+    return { total: total }
+```
+
+- **`GET /api/contador`** — devuelve el estado actual de sus `server var`
+  como JSON (`{"total": 0}`). Si no tiene ninguna `server var`, devuelve
+  `{}` sin fallar.
+- **`POST /api/contador`** — dispara la `post function`, exactamente igual
+  que en una ruta con página (misma sesión por cookie, mismo aislamiento,
+  mismos errores contenidos si algo revienta).
+- **No se genera ningún `.html`/`.css`/`.bundle.js`** — ni siquiera la
+  concha vacía de siempre. Solo `server.js`, si hay algo de servidor que
+  compilar.
+- Funciona igual en `build` (un solo archivo), `site` y `run` — los tres
+  comandos detectan la ausencia de `render()` y aplican el mismo criterio.
+
+Probado de extremo a extremo: `GET` inicial → `{total: 0}`, `POST
+{cantidad: 5}` → `{total: 5}`, y un `GET` posterior de la misma sesión
+confirma que persiste (`{total: 5}`, no vuelve a `0`).
+
+**Bug real que encontré haciendo esto**: rutas con subcarpetas
+(`route("/api/contador")` → `api/contador.server.js`) fallaban con
+`ENOENT` al escribir el archivo — el `mkdirSync` de la subcarpeta antes
+solo se hacía junto con el `.html`, que en este camino nuevo no existe.
+Arreglado creando el directorio explícitamente antes de escribir
+`server.js` también en el caso "solo backend".
+
+### `put function` / `delete function` — un verbo HTTP por función
+
+Complementan a `post function`: puede haber **una de cada verbo** por
+archivo (post + put + delete a la vez si hace falta), cada una disparada
+por su propio verbo HTTP en la **misma URL** de la ruta:
+
+```
+route("/api/tareas")
+
+server var tareas = []
+
+post function crear(args)
+    tareas = [...tareas, { id: tareas.length, texto: args.texto }]
+    return { tareas: tareas }
+
+put function actualizar(args)
+    tareas = tareas.map(t => t.id == args.id ? { id: t.id, texto: args.texto } : t)
+    return { tareas: tareas }
+
+delete function borrar(args)
+    tareas = tareas.filter(t => t.id != args.id)
+    return { tareas: tareas }
+```
+
+- Antes de esto, solo podía haber **una** `post function` por archivo —
+  no había forma de separar "crear" de "borrar" con lógica propia para
+  cada una en la misma URL. Ahora sí.
+- Mismas reglas que `post function` en todo lo demás: comparten el mismo
+  espacio de nombres (colisión real si repites nombre), su nombre SÍ puede
+  llamarse desde un `visual` (a diferencia de `server var`/`server
+  function`), el compilador genera el *stub* de cliente automáticamente
+  (con el verbo HTTP correcto: `PUT`/`DELETE`) solo si de verdad se llama
+  desde algún handler, y `PUT`/`DELETE` a una ruta que no tiene esa
+  función da `405`.
+- Funciona igual en rutas con página y en rutas "solo backend" (sin
+  `render()`).
+- Probado de extremo a extremo con los tres verbos encadenados sobre la
+  misma sesión: `POST` (crear dos tareas) → `PUT` (editar una) → `DELETE`
+  (borrar otra) → `GET` final refleja exactamente el resultado esperado
+  de las tres operaciones. También probado que el *stub* de cliente
+  **solo** se genera para la función que realmente se llama desde un
+  handler, igual que ya pasaba con `post function`.
+
+### `get function` — solo en rutas "solo backend" (sin `render()`)
+
+Sustituye el volcado por defecto de las `server var` (que ya hacía `GET`
+en una ruta "solo backend") cuando hace falta **calcular** algo en vez de
+solo exponer el estado tal cual:
+
+```
+route("/api/usuario")
+
+server var nombre = "Jorge"
+server var visitas = 100
+
+get function estado(args)
+    return { saludo: "Hola, " + (args.nombre || nombre), visitasTotales: visitas * 2 }
+
+post function incrementar(args)
+    visitas = visitas + 1
+    return { visitas: visitas }
+```
+
+**Decisión de diseño importante, que surgió al discutirlo**: `get
+function` **no puede coexistir con `render()`** en el mismo archivo — se
+rechaza con un `SyntaxError` explícito en tiempo de compilación. La razón:
+en un archivo con página, `GET` ya tiene un significado fijo ("servir el
+HTML"), y no hay forma sin ambigüedad de decidir si una petición `GET`
+debe servir la página o llamar a la función. En vez de que uno gane en
+silencio (comportamiento sorprendente y difícil de depurar), se rechaza
+de raíz.
+
+- **Los argumentos vienen de la *query string*** (`?nombre=Ana`), no de un
+  *body* — un `GET` no lleva cuerpo por convención, y `fetch()` con `GET`
+  tampoco permite mandarlo (a diferencia de `post`/`put`/`delete
+  function`, que sí reciben `args` del *body* JSON). Los valores llegan
+  siempre como **strings** (la *query string* no tiene tipos), a
+  diferencia del *body* JSON que sí preserva números/booleanos/objetos.
+- **Sin *stub* de cliente**: a diferencia de `post`/`put`/`delete
+  function`, no se genera ningún *stub* llamable desde un `visual` —
+  no tendría sentido, ya que `get function` solo existe en archivos sin
+  `render()`, que nunca generan `bundle.js` (no hay ningún cliente que
+  pudiera llamarla).
+- Solo puede haber **una** `get function` por archivo, igual que las
+  otras tres.
+- Probado de extremo a extremo: sin *query string* usa las `server var`
+  directamente; con `?nombre=Ana` usa el argumento; y coexistiendo con
+  `post function incrementar` en el mismo archivo, ambas funcionan de
+  forma independiente sobre la misma sesión.
+
+## Objeto `http`: llamar a OTROS sistemas desde el servidor
+
+Distinto de `post`/`put`/`delete function` (que sirven peticiones que
+**llegan** a esta ruta): `http` es para las que **esta ruta hace hacia
+fuera**, a APIs externas.
+
+```
+http.get(url, headers)
+http.post(url, body, headers)
+http.put(url, body, headers)
+http.delete(url, body, headers)
+```
+
+```
+get function consultar(query)
+    var datos = await http.get("https://api.ejemplo.com/clima?ciudad=" + query.ciudad, {})
+    return { temperatura: datos.temp }
+
+post function notificar(args)
+    var resultado = await http.post("https://api.ejemplo.com/webhook", { mensaje: args.texto }, { "Authorization": "Bearer TOKEN" })
+    return { enviado: true, respuesta: resultado }
+```
+
+- Devuelve el cuerpo de la respuesta **ya parseado** — JSON si es JSON
+  válido, o el texto crudo si no lo es (sin lanzar error, verificado
+  explícitamente con una respuesta `text/plain` real).
+- `body`/`headers` son opcionales; si no hay `Content-Type` en las
+  cabeceras, se pone `application/json` automáticamente cuando hay `body`.
+- Solo se genera en el `server.js` si de verdad se usa (`http.` en algún
+  cuerpo) — mismo criterio que los *stubs* de cliente.
+
+### Bug real encontrado montando esto: `await` no funcionaba en ninguna función de servidor
+
+Antes de construir `http`, comprobé si `fetch()` a secas ya funcionaba
+dentro de una `post function` (dado que el cuerpo es JS "casi crudo" y
+Node ya trae `fetch` global desde la v18) — y encontré que **no**, con un
+error real: `"await is only valid in async functions"`. Las cuatro
+funciones HTTP (`get`/`post`/`put`/`delete function`) se generaban como
+funciones normales, no `async`, así que `await` dentro de ellas ni
+siquiera era sintaxis válida. Arreglado haciendo `async` las cuatro, y
+actualizando el despachador en `site-builder.js` para `await` su
+resultado (necesario porque ahora siempre devuelven una promesa).
+
+**Segundo bug, encontrado al intentar generalizar el arreglo a `server
+function` también**: hacerla `async` rompía un patrón que ya
+funcionaba y estaba probado — llamarla **sin** `await`, esperando su
+valor de vuelta directamente (`doble: duplicar(contador)`). Con
+`server function` async, esa llamada pasa a devolver una promesa, no el
+número — `duplicar(contador)` sale como `{}` en el JSON en vez de `2`.
+Revertido: `server function` se queda **síncrona** a propósito (no puede
+usar `await` dentro; si necesitas llamar a otro sistema, hazlo
+directamente en una `get`/`post`/`put`/`delete function`, que sí es
+`async`). Verificado con un test explícito que confirma que el patrón
+`doble: duplicar(contador)` sin `await` sigue devolviendo `2`, no una
+promesa.
+
+### Sobrecargas por número de parámetros: *query string* y *headers* en las cuatro
+
+Todas (`get`/`post`/`put`/`delete function`) aceptan parámetros
+adicionales según cuántos declares — sin romper nada de lo que ya
+funcionaba con uno solo:
+
+```
+post function crear(args, query, headers)
+    items = [...items, { texto: args.texto, prioridad: query.prioridad || "normal", agente: headers["user-agent"] }]
+    return { items: items }
+
+get function listar(query, headers)
+    return { total: items.length, filtro: query.filtro || "ninguno", tieneAuth: !!headers["authorization"] }
+```
+
+| Parámetros declarados | `get function` | `post`/`put`/`delete function` |
+|---|---|---|
+| 1 | *query string* (como siempre) | *body* JSON (como siempre) |
+| 2 | + cabeceras | + *query string* |
+| 3 | — (no aplica, `get` no tiene *body*) | + cabeceras |
+
+- **Retrocompatible al 100%**: con un solo parámetro, el comportamiento es
+  exactamente el de antes — probado explícitamente que `?ignorado=si` en
+  la URL no se cuela en ningún sitio si la función solo declara `(args)`.
+- **El *stub* de cliente nunca cambia de forma**: aunque la función del
+  servidor declare `(args, query, headers)`, el *stub* generado para el
+  cliente sigue teniendo **un solo parámetro** — `query`/`headers` son
+  contexto que solo ve el servidor (de dónde vino la petición, qué
+  cabeceras trae), el cliente nunca "manda" cabeceras a mano, el navegador
+  ya las pone. Esto necesitó un arreglo: el generador del *stub* usaba
+  `fn.params` completo tanto para la firma como para `JSON.stringify(...)`
+  — con 3 parámetros eso habría generado
+  `JSON.stringify(args, query, headers)`, que NO es "serializa estos tres
+  valores", son los argumentos *replacer*/*space* de `JSON.stringify`,
+  rompiendo el *body* enviado. Corregido para que `JSON.stringify(...)`
+  solo use el primer parámetro (el *body*) — la *query string*, en cambio,
+  si es visible para el cliente, ver más abajo.
+- Cabeceras y valores de *query string* llegan siempre como **strings**
+  (así son en HTTP) — a diferencia del *body* JSON, que si conserva tipos
+  reales (números, booleanos, objetos anidados).
+- Probado de extremo a extremo: `POST` con los tres a la vez (`body` +
+  `?prioridad=alta` + `User-Agent` real) construye el objeto esperado
+  exacto; `GET` detecta correctamente la presencia/ausencia de la cabecera
+  `Authorization`; y una llamada real desde un `visual` (vía el *stub*
+  generado) confirma que la cabecera `User-Agent` del navegador llega
+  intacta al servidor sin que el cliente tuviera que hacer nada especial.
+
+## `JSON.stringify`/`JSON.parse` y sus métodos: retrocompatibilidad total
+
+Como WebScript compila a JS "casi crudo" (solo sustituye nombres de
+`reactive`/`var`/`server var`), `JSON` es el objeto global de JS de
+siempre — no hay ninguna capa propia por encima que pudiera romperlo.
+Verificado explícitamente en cliente **y** servidor: `JSON.stringify`,
+`JSON.parse`, `.filter()`/`.map()` sobre el resultado, `Object.keys()`, y
+el atajo de propiedad (`{ nombre, edad }`) dentro de `JSON.stringify`
+(que ya arreglamos hace tiempo) — todo funciona igual.
+
+### ¿Los objetos parseados de JSON son reactivos "por dentro"?
+
+**Sí — reactividad profunda implementada tras esta misma pregunta** (ver
+la sección dedicada "Reactividad profunda" más abajo). Mutar una
+propiedad anidada, o un índice de array, dispara actualizaciones sin
+necesitar reasignar la variable completa:
+
+```
+reactive datos = JSON.parse(textoJson)
+
+-> onclick:
+    datos.edad = 99                // SÍ actualiza la vista (antes no)
+    datos = { ...datos, edad: 99 } // SIGUE funcionando también
+```
+
+### Bug real encontrado montando esta prueba: referencias cruzadas entre `reactive`
+
+Al construir el ejemplo (`reactive datos = JSON.parse(textoJson)`, donde
+`textoJson` es **otra** `reactive` declarada justo antes) apareció un
+`ReferenceError: textoJson is not defined` real. Causa: el objeto inicial
+que se le pasa a `createStore({...})` se construía con los valores
+**crudos** de cada `reactive.init`, sin pasar por ningún motor de
+sustitución — `textoJson` nunca se convertía en nada utilizable.
+
+Y el arreglo no era tan simple como "sustituir a `state.textoJson`" —
+en ese punto exacto del código generado, la variable `state` **todavía
+no existe** (se está construyendo con esa misma llamada a
+`createStore(...)`), así que esa sustitución habría fallado igual, con
+un `ReferenceError` distinto (`state is not defined`).
+
+**Solución**: calcular el valor inicial de cada `reactive` en una
+variable local previa (`let __init_textoJson = ...`), **en orden de
+declaración**, de modo que una `reactive` posterior pueda referenciar el
+valor ya calculado de una anterior a través de esa variable local
+(`__init_NOMBRE`), no de `state.NOMBRE`. Necesitó una función de
+sustitución nueva (`injectVarsAsLocals`, hermana de la que ya existía)
+que genera un identificador con guion bajo en vez de un acceso de
+propiedad. Aplicado en los dos caminos de montaje (ruta estática y
+dinámica), verificado con el código generado exacto y con ejecución
+real.
+
+**Límite que queda, documentado a propósito**: solo funcionan las
+referencias hacia **atrás** (una `reactive` referenciando a otra
+declarada **antes** en el archivo) — una referencia hacia adelante
+seguiría sin sustituirse, ya que en JS no se puede usar una variable
+`let` antes de declararla. Es un patrón inusual (casi nadie escribe
+`reactive a = b` antes de declarar `b`), así que no se resolvió más allá
+de dejarlo documentado.
+
+## Reactividad profunda: mutar objetos/arrays anidados también actualiza la vista
+
+Hasta este punto, el sistema reactivo era de **un solo nivel**: solo
+`state.NOMBRE = valor` (la reasignación completa) disparaba
+actualizaciones. Mutar una propiedad anidada o un índice de array
+(`datos.edad = 99`, `lista.push(x)`, `lista[0] = x`) no hacía nada — había
+que reasignar siempre (`lista = [...lista, x]`).
+
+Implementado reescribiendo el núcleo de `runtime/reactive.js` (el
+*runtime* que se incluye tal cual en cada `bundle.js`) con el mismo
+patrón que usa Vue 3 por dentro: cada objeto/array que se lee de una
+`reactive` se envuelve en su **propio** `Proxy`, de forma perezosa y
+recursiva (solo al acceder, no de golpe), y las dependencias se rastrean
+por **ruta completa** (`["datos","edad"]`, no solo `"datos"`) — así, un
+efecto que lee `datos.edad` se re-ejecuta cuando cambia `edad`, pero no
+cuando cambia un campo hermano que nunca leyó.
+
+```
+reactive datos = { nombre: "Ana", edad: 25 }
+reactive lista = [1, 2, 3]
+
+-> onclick:
+    datos.edad = 99      // ahora SÍ dispara la vista
+    lista.push(4)        // ahora SÍ dispara la vista
+    lista[0] = 99         // ahora SÍ dispara la vista
+```
+
+### El primer diseño estaba mal, y lo descubrí probándolo
+
+Mi primer intento notificaba, al mutar una ruta, tanto la ruta exacta
+**como todos sus ancestros** — razonando que así un efecto que lee el
+objeto entero (`JSON.stringify(datos)`) también se enteraría de cambios
+en sus campos. Probándolo con un caso mínimo (un efecto que solo lee
+`datos.edad`, y mutar tanto `edad` como un campo hermano `nombre` que
+nunca leyó) aparecieron dos fallos reales:
+
+1. **Doble disparo**: mutar `edad` re-ejecutaba el efecto **dos veces**,
+   no una. Causa: leer `datos.edad` registra el efecto en dos niveles a
+   la vez (`["datos"]`, el paso intermedio, y `["datos","edad"]`, el
+   acceso final) — al notificar también el ancestro, el mismo efecto
+   recibía dos avisos por el mismo cambio.
+2. **Falso positivo**: mutar `nombre` (que el efecto nunca leyó)
+   **también** re-ejecutaba el efecto — porque `nombre` y `edad`
+   comparten el mismo ancestro `["datos"]`, y el efecto ya estaba
+   suscrito ahí solo por haber pasado por él de camino a `edad`.
+
+**La solución correcta era más simple, no más compleja**: notificar
+**solo** la ruta exacta que cambió, nunca los ancestros. El caso
+"efecto que lee el objeto entero" no necesita ningún mecanismo especial
+— `JSON.stringify(datos)` internamente lee cada propiedad una por una (a
+través del mismo `Proxy`), así que ya registra una dependencia fina en
+cada una por sí solo. Verificado explícitamente: mutar un campo
+individual sí re-ejecuta un efecto basado en `JSON.stringify` del objeto
+completo, sin necesitar la lógica de ancestros que causaba los dos fallos
+de arriba.
+
+### Segundo bug, más sutil: doble envoltura rompía el *diffing* por clave
+
+Tras arreglar lo anterior, la suite de tests reveló un fallo real en el
+`for` con clave (`tests/compiler.test.js`, "diffing por clave: no
+reconstruye ítems que no cambiaron") — el mismo test que ya existía desde
+que implementamos esa función. Causa: cuando se lee un array ya envuelto
+en `Proxy` (ej. dentro de `.slice()`, `.filter()`, `.map()`, o un
+`spread`), cada **elemento** que se lee durante esa operación **ya viene
+envuelto** — y el método construye su array de salida con esos elementos
+ya envueltos dentro. En el siguiente render, al leer ese array de nuevo,
+cada elemento (que ya es un `Proxy`) se **volvía a envolver** — un
+`Proxy` sobre otro `Proxy`, con una identidad distinta a la de antes,
+rompiendo la comparación `entry.item !== item` de la que depende el
+*diffing* por clave para decidir si reutilizar un nodo DOM o
+reconstruirlo.
+
+**Arreglado** detectando, antes de envolver algo, si **ya es uno de
+nuestros propios `Proxy`** (vía un símbolo marcador interno) — si lo es,
+se devuelve tal cual, sin volver a envolver. Verificado con el propio
+test de *diffing* que había fallado, y con una prueba real de `.push()`
+sobre un `for` con clave, confirmando que la lista se actualiza
+correctamente sin duplicar ni perder identidad de nodos.
+
+### Garantías verificadas explícitamente
+
+- **Mutación a 3 niveles de profundidad** (`empresa.direccion.ciudad =
+  "Valencia"`) dispara la actualización correcta.
+- **Reasignación completa sigue funcionando** exactamente igual que
+  antes — retrocompatibilidad total con todo el código ya escrito.
+- **Identidad estable entre lecturas repetidas**: `state.empresa ===
+  state.empresa` y `state.empresa.direccion === state.empresa.direccion`
+  dan `true`, tanto en pruebas aisladas del *runtime* como en el
+  *pipeline* completo con el `for` con clave.
+- **Suite completa**: 121 tests, 0 fallos, tras actualizar dos tests que
+  comprobaban el comportamiento **antiguo** (uno legítimamente, ya que
+  documentaba justo la limitación que se acaba de resolver).
+
+**Límite que sigue existiendo, ahora más estrecho**: el sistema todavía
+no distingue "leer `datos.edad` como valor final" de "leer `datos.edad`
+de camino a algo más profundo" en todos los casos imaginables de
+identidad tras operaciones que **reconstruyen** objetos (no solo arrays)
+combinando código propio con más envolturas manuales — el caso cubierto
+y probado es el que de verdad importa en la práctica (arrays vía
+`.slice()`/`.filter()`/`.map()`/*spread*, que es como se reasignan
+listas en WebScript). Un caso exótico no probado explícitamente: envolver
+manualmente un elemento ya reactivo dentro de un objeto **nuevo**
+construido a mano campo por campo (no vía *spread*) podría, en teoría,
+seguir dando una interacción distinta — no se encontró ningún caso real
+así al escribir los ejemplos de esta conversación.
+
+## `server reactive` + `watch()`: observar cambios en el servidor
+
+`server reactive` volvió — pero ahora con un propósito real, distinto de
+`server var`, en vez de ser un sinónimo puro (que fue exactamente por lo
+que se quitó antes). La diferencia: solo las declaradas `reactive` se
+pueden **observar** con `watch(NOMBRE)`:
+
+```
+server reactive var1 = 0
+server var log = []
+
+watch(var1)
+    log = [...log, "var1 cambió a " + var1]
+
+post function actualizar(args)
+    var1 = args.valor
+    return { var1: var1 }
+```
+
+- **Se declara una vez, a nivel de archivo** — se dispara sin importar
+  cuál `get`/`post`/`put`/`delete function` fue la que cambió la
+  variable. Probado explícitamente: cambiar `var1` desde un `POST` y
+  desde un `PUT` distintos, ambos disparan el mismo `watch`.
+- **Nunca corre con el valor inicial** — solo en cambios **posteriores**,
+  a diferencia de un `effect()` del cliente (que sí corre inmediatamente
+  al registrarse). Es el comportamiento estándar de "watch" en cualquier
+  framework que lo tenga. Probado explícitamente: el primer `GET` da
+  `log: []` vacío, aunque `var1` ya valga `0` desde el arranque.
+- **Por qué a nivel de archivo y no dentro de una función concreta**: si
+  viviera dentro de una sola `post function`, solo se enteraría de los
+  cambios que *esa* función en particular hiciera — tendrías que
+  duplicar el mismo bloque en cada función que también toque la
+  variable. A nivel de archivo se escribe una vez y cubre todas.
+- **Cómo funciona por debajo**: cada `server reactive` se guarda en un
+  `Proxy` interno (`__serverReactive`) dentro de `createSessionState()`
+  — asignarla dispara los `watch` registrados para ese nombre. Las
+  referencias sueltas al nombre, dentro de cualquier cuerpo (`server
+  function`, las cuatro HTTP, o el propio `watch`), se sustituyen a
+  acceso a través del `Proxy` reutilizando `injectVars` — el mismo motor
+  de sustitución que ya usa el cliente, no uno nuevo.
+- `watch(NOMBRE)` valida que `NOMBRE` sea una `server reactive` de verdad
+  declarada en el archivo — si es una `server var` normal (no
+  observable), o un nombre inventado, error explícito en compilación con
+  el porqué, no un fallo silencioso.
+
+### Dos bugs reales, preexistentes, encontrados montando esto
+
+Probando `watch()` con un mensaje de texto (`"var1 cambió a " + var1`)
+salieron dos bugs del motor de sustitución compartido — **ninguno
+introducido por `watch()`**, los dos ya afectaban al cliente normal desde
+antes, solo que nunca se habían topado con el patrón exacto que los
+revela.
+
+**1. El texto dentro de una cadena se sustituía por error.** `"var1
+cambió a " + var1` se convertía en `"__serverReactive.var1 cambió a " +
+__serverReactive.var1` — la palabra `var1` **dentro del propio texto**
+también se sustituía, corrompiendo el mensaje. Confirmado que esto
+también rompía el cliente: `"el contador vale " + contador` se convertía
+en `"el state.contador vale " + state.contador`. Arreglado con una
+función nueva (`findStringLiteralSpans`) que detecta los tramos de texto
+dentro de comillas simples/dobles y los excluye de la sustitución —
+respetando `${...}` dentro de un *template literal*, que sí es código de
+verdad y sí debe sustituirse.
+
+**2. `${nombre}` de un *template literal* se confundía con un atajo de
+objeto.** Al arreglar el primero, apareció este: `` `vale ${contador}` ``
+se expandía mal a `` `vale ${contador: state.contador}` `` — la
+detección de "esto es un atajo de objeto tipo `{ contador }`" no
+distinguía si el `{` que tenía delante era en realidad parte de `${`
+(interpolación) o un objeto literal de verdad. Arreglado comprobando
+explícitamente ese caso.
+
+Ambos arreglados en `compiler.js` **y** `validate.js` (que reimplementa
+esta lógica por separado, a propósito, para no acoplar la validación al
+compilador) — y en el camino apareció un tercer fallo, más simple:
+`validate.js` usaba una función (`isInsideAnySpan`) que solo existía en
+`compiler.js`, tirando un `ReferenceError` real en la validación de
+seguridad más importante del lenguaje ("`server var` prohibida en
+`visual`"). Arreglado añadiendo la función también ahí.
+
+Verificado con `node --check`-equivalente (ejecución real del bundle) en
+ambos casos: el texto sale intacto, la interpolación real sí se
+sustituye, y la validación de seguridad volvió a funcionar.
+
+## Bug real encontrado después: el *stub* nunca mandaba la *query string*
+
+Al preguntarme "¿dónde pongo los *query params*?" para llamar desde un
+`visual`, descubrí que la respuesta, tal como estaba el código, era
+**"en ningún sitio" — el *stub* generado nunca los mandaba**. Aunque `post function
+crear(args, query)` declarara un segundo parámetro, el *stub* de cliente
+siempre hacía `fetch(routePath, {...})` sin *query string* ninguna —
+`query` llegaba vacío `{}` siempre que se llamara desde un `visual`
+(mandarlo funcionaba perfectamente si se hacía la petición a mano con
+`curl`, que es como lo había probado hasta entonces — el hueco solo se
+notaba desde el flujo real de cliente).
+
+**Causa**: cuando decidí que el *stub* solo expusiera el primer parámetro
+(razonando que `query`/`headers` son "contexto que solo ve el servidor"),
+generalicé mal — esa lógica es correcta para las **cabeceras** (el
+navegador ya las pone solo, el cliente nunca las "manda" a mano), pero
+**no** para la *query string*, que sí es algo que quien llama elige
+explícitamente, como el propio *body*.
+
+**Arreglado**: si la función declara 2+ parámetros, el *stub* ahora expone
+`(args, query)` — dos parámetros visibles para el cliente — y construye
+la URL con `new URLSearchParams(query).toString()` antes de hacer el
+`fetch`. Las cabeceras (tercer parámetro) siguen sin exponerse, esa parte
+del razonamiento original sí era correcta.
+
+```
+-> onclick:
+    var r = await crear({ texto: "nueva" }, { prioridad: "alta" })
+```
+
+Verificado en las dos puntas: el `server.js` generado recibe
+`query.prioridad === "alta"` de verdad, y — más importante, porque es
+justo lo que faltaba antes — el `bundle.js` generado, ejecutado como lo
+haría un navegador real, construye la URL `/?prioridad=alta` por su
+cuenta al llamar al *stub*, sin que el código del `visual` tuviera que
+construir la URL a mano.
+
+## `server function` inalcanzable: rechazada en tiempo de compilación
+
+Un archivo que declara `route(...)` pero no tiene `render(...)` **ni
+ninguna función HTTP** (`get`/`post`/`put`/`delete function`), y aun así
+declara una `server function`, se rechaza:
+
+```
+route("/api/x")
+
+server function duplicar(x)
+    return x * 2
+```
+```
+SyntaxError: "server function duplicar" (línea 3) es inalcanzable: este
+archivo declara route(...) pero no tiene ninguna función HTTP que pueda
+llamarla, y un archivo con route() no se puede importar desde otro.
+```
+
+**El razonamiento, con los tres casos límite que se descartaron por el
+camino** (los tres verificados con código real, no solo en teoría):
+
+1. **Primer intento, demasiado amplio**: prohibir `server var` **o**
+   `server function` sin ninguna función HTTP. Roto de inmediato — un
+   archivo con `route()` + solo `server var` (sin ninguna función) **ya
+   es un patrón válido y probado**: se sirve su estado por `GET`
+   automáticamente (el volcado por defecto de "WebScript como backend
+   puro", más arriba). `server var` sola SÍ es alcanzable — leíble — así
+   que no puede prohibirse.
+2. **Segundo intento, seguía siendo demasiado amplio**: prohibir `server
+   function` sin ninguna función HTTP, sin más. También roto — un
+   archivo **sin `route()`** (una librería pensada para `import`, como
+   `compartido.ws` en los ejemplos) legítimamente no tiene ninguna
+   función HTTP propia: la función espera a que **otro** archivo la
+   importe y la llame. Ese es justo el patrón que ya usa
+   `examples/demo-import/`.
+3. **Versión final**: la prohibición solo aplica cuando el archivo **sí**
+   declara `route()` — ahí, y solo ahí, la función es de verdad
+   inalcanzable, porque no hay ninguna HTTP function propia que la llame
+   Y un archivo con `route()` no se puede importar desde otro (ya estaba
+   validado desde mucho antes). Los cuatro casos límite (inalcanzable con
+   `route()`, `server var` sola con `route()`, librería sin `route()`, y
+   con al menos una función HTTP) se probaron explícitamente y se
+   comportan como se espera.
+
+## `import` de `server var`/`server function`: ya funcionaba, verificado a fondo
+
+Antes de tocar nada, se comprobó si `import { nombre } from "./lib.ws"`
+ya soportaba traer `server var`/`server function` de otro archivo —
+**sí, ya funcionaba**, sin necesitar ningún cambio. El mecanismo de
+`import` copia cualquier nodo con nombre sin distinguir su tipo, así que
+ya alcanzaba a estos dos sin querer. Verificado con **cinco** escenarios
+reales antes de darlo por bueno:
+
+1. Importar y usar `server var`/`server function` dentro de una `post
+   function` — funciona, con el estado incrementándose correctamente.
+2. Un `server var` importado **sí** se detecta como prohibido si se
+   referencia dentro de un `visual` — la validación de seguridad no tiene
+   ningún hueco por el lado de `import`.
+3. El patrón legítimo `reactive x = server.nombreImportado` para leer en
+   cliente — funciona igual que si estuviera declarado localmente.
+4. Colisión de nombres (importar `contador` y también declararlo
+   localmente) — detectada, mismo error de siempre.
+5. **Independencia entre rutas**: dos rutas distintas que importan el
+   mismo `server var` mantienen cada una su propio estado — probado
+   incrementando una en +10 y la otra en +1, confirmando que no se
+   contaminan entre sí (coherente con el modelo de sesiones: cada archivo
+   compila su propio `createSessionState()`, `import` solo copia la
+   declaración, no crea una referencia compartida en tiempo de
+   ejecución).
+
+## Bug real: `reactive x = servervar` (a secas) compilaba y explotaba en el navegador
+
+Surgió al discutir si `watch()` debería pedir `server.NOMBRE` en vez de
+`NOMBRE` a secas. La respuesta a esa pregunta concreta fue que no —
+dentro del propio `server.js` (en `post`/`put`/`delete`/`server
+function`, y `watch()`), las `server var`/`server reactive` siempre se
+referencian a secas, nunca con `server.`; meter el prefijo ahí sería
+inconsistente con el resto del archivo (`watch(server.var1)` seguido de
+`whisper("..." + var1)` **sin** el prefijo dentro, la misma variable).
+
+Pero la pregunta llevó a comprobar algo que nunca se había probado: ¿qué
+pasa si te **olvidas** del `server.` donde sí hace falta — al leer una
+`server var` en una `reactive` de **cliente**?
+
+```
+server var contador = 100
+
+reactive x = contador   // se olvidó el "server."
+```
+
+**Compilaba sin ningún aviso**, y explotaba en el navegador con
+`ReferenceError: contador is not defined` — `contador` (una `server var`)
+nunca llega al `bundle.js`, así que la referencia a secas queda apuntando
+a nada. Confirmado que **no era específico del `import`** — pasaba
+exactamente igual con una `server var` declarada localmente, sin
+importar nada de por medio. La validación de "prohibido en visuales" solo
+revisaba plantillas/*bindings*/`reactive` locales **dentro** de un
+`visual` — nunca el valor inicial de una `reactive`/`var` **global**.
+
+**Arreglado** extendiendo la misma validación a las declaraciones
+globales: si el valor inicial de cualquier `reactive`/`var` a nivel de
+archivo referencia una `server var`/`server reactive`/`server function` a
+secas, error explícito en compilación señalando el `server.NOMBRE`
+correcto — en vez de un `ReferenceError` críptico en el navegador de
+quien use la página. Verificado que la forma correcta
+(`reactive x = server.contador`) sigue compilando sin ningún falso
+positivo, tanto local como importada.
+
+## Bug real: `var`/`reactive` (cliente) en una ruta "solo backend" eran inertes y silenciosas
+
+Pregunta que lo destapó: en un archivo puramente de servidor (con
+`route()`, sin `render()`), ¿da igual declarar `var` que `server var`?
+
+**No — y era otro caso del mismo patrón**: compilaba sin ningún aviso, y
+solo revienta cuando alguien la usa de verdad.
+
+```
+route("/api/x")
+
+var x = 5   // se compila al bundle.js...
+
+post function leer(args)
+    return { valor: x }   // ...que en una ruta "solo backend" NUNCA se escribe a disco
+```
+
+`POST /api/x` daba `500: "x is not defined"` — `var x = 5` se compila
+como código de **cliente** (`bundle.js`), y una ruta "solo backend" (con
+`route()` pero sin `render()`) nunca escribe ese archivo a disco, se
+descarta entero. `x` no existe en ningún sitio real: ni en `server.js`
+(`var`/`reactive` nunca se compilan ahí), ni en un `bundle.js` que nadie
+sirve.
+
+**Arreglado** con el mismo criterio que ya usamos para "`server function`
+inalcanzable": se rechaza en compilación cualquier `reactive`/`var`
+declarada en un archivo que tiene `route()` pero no `render()`, con un
+mensaje que señala la alternativa correcta (`server var`/`server
+reactive`) o añadir un `visual` + `render(...)` si el archivo debería
+tener página. Una librería **sin** `route()` (pensada para `import`)
+queda exenta, como siempre — ahí sí es un patrón legítimo declarar
+`reactive`/`var` para que otro archivo con página los importe.
+
+## `function` — el equivalente de cliente a `server function`
+
+Pregunta que lo motivó: si `var`/`reactive` tienen su pareja de servidor
+(`server var`/`server reactive`), ¿por qué no hay un `function` de
+cliente, análogo a `server function`? Antes de implementarlo comprobé si
+hacía falta de verdad, o si `var NOMBRE = (params) => valor` ya cubría lo
+mismo — y encontré una diferencia real, no solo de estilo: **el valor de
+un `var` tiene que caber en una sola línea** (`^var\s+...\s*=\s*(.+)$` en
+el parser captura todo lo que hay después del `=` hasta el final de esa
+misma línea). Confirmado con código real: un `var duplicar = (x) => {`
+seguido de más líneas indentadas revienta con `SyntaxError`, "no se
+reconoce la instrucción". No hay forma de escribir una función de
+cliente reutilizable con **varias sentencias** sin `function`.
+
+```
+reactive base = 10
+
+function calcularConBase(x)
+    var resultado = x + base
+    if (resultado > 20)
+        return "alto: " + resultado
+    else
+        return "bajo: " + resultado
+```
+
+- Mismo patrón exacto que `server function`: cuerpo indentado en varias
+  líneas, reutilizando `collectIndentedBody` (así que hereda gratis el
+  arreglo de indentación relativa legible que ya hicimos para `watch()`).
+- Compila a una `function` normal de JS (no una `const` con flecha) a
+  nivel superior del `bundle.js` — con *hoisting*, así que se puede
+  llamar desde cualquier sitio (otro `var`, un `handler`, otra
+  `function`) sin importar el orden de declaración en el archivo.
+- Su cuerpo pasa por el mismo motor de sustitución que cualquier otro
+  código de cliente — una `reactive` referenciada dentro se convierte en
+  `state.NOMBRE`, verificado con un caso real (`base` dentro de
+  `calcularConBase` se sustituye correctamente, y el `if`/`else` interno
+  se ejecuta con la lógica esperada: `calcularConBase(15)` con `base=10`
+  da `"alto: 25"`, no un resultado a medias).
+- Comparte el mismo espacio de nombres que `reactive`/`var`/`visual`/etc
+  — colisión real si repites nombre.
+- **Misma protección que `var`/`reactive`** contra el bug que acabamos de
+  cerrar: una `function` declarada en una ruta "solo backend" (con
+  `route()` pero sin `render()`) se rechaza en compilación, sugiriendo
+  `server function` en su lugar — en vez de compilar en silencio y
+  explotar con `ReferenceError` en cuanto alguien la llame.
+
+## `import` transitivo + `whisper()` + `if`/`for` dentro de `watch()`
+
+Tres preguntas en una, todas verificadas con código real:
+
+### Bug real, serio: `import` no traía dependencias transitivas
+
+```
+// otro.ws
+server reactive var1 = 0
+
+server function updateVar()
+    var1++
+
+watch(var1)
+    whisper("Actualizado " + var1)
+```
+```
+// un.ws
+import { updateVar } from "./otro.ws"
+```
+
+Importar **solo** `updateVar` (sin pedir explícitamente `var1`) daba
+`500: "var1 is not defined"` en tiempo real — `updateVar` se copiaba tal
+cual, pero `var1` (de la que depende) nunca llegaba a existir en el
+archivo importador. **Confirmado que esto ya era un bug antes de
+`watch()`**, probándolo primero con `server var`/`server function`
+normales, sin nada nuevo de por medio — nunca se había probado este
+patrón exacto (importar una función sin importar también lo que
+necesita).
+
+**Arreglado de raíz**: `import` ahora resuelve **dependencias
+transitivas** automáticamente — al pedir `updateVar`, escanea su cuerpo
+en busca de qué otros nombres declarados en el mismo archivo usa, y los
+trae también, recursivamente. Con una regla extra para `watch()`:
+**`watch` no se puede pedir por nombre explícitamente** (no tiene un
+nombre propio, observa una variable ajena) — pero si esa variable se
+importa (directa o transitivamente), su `watch()` viene con ella
+automáticamente, para que el comportamiento sea el mismo que usarla
+localmente en el archivo original. Verificado de extremo a extremo con
+servidor real: `POST` a una ruta que solo importa `updateVar` incrementa
+`var1` **y** dispara el `watch` asociado.
+
+### `whisper()` — equivalente a `console.log()`, sin capacidad nueva
+
+Antes de añadirlo, comprobé si `console.log()` ya funcionaba directamente
+dentro de un `watch()` (dado que los cuerpos son JS "casi crudo") — sí,
+sin necesitar nada nuevo. `whisper(...)` es una envoltura fina,
+generada **solo si se usa** (mismo criterio que `http`), pensada
+únicamente para que el vocabulario del lenguaje quede coherente (`http`,
+`watch`, `server reactive`, `whisper`) — no añade ninguna capacidad real
+sobre `console.log()`.
+
+### `if`/`for` dentro de `watch()`: se comportan normal, verificado con lógica real
+
+No es el `if`/`for` de plantilla (eso solo existe dentro de un `visual`)
+— dentro de `watch()` son control de flujo JS normal, con llaves o sin
+ellas, igual que en cualquier `post`/`put`/`delete`/`server function`.
+Probado con lógica real (no solo que compile): un `watch(contador)` con
+un `if`/`else` que clasifica par/impar y un `for` que acumula una suma —
+tras `contador = 3` da `mensajes: ["impar: 3"]` y `suma: 3` (`0+1+2`);
+tras subir a `contador = 4`, añade `"par: 4"` y `suma` sube a `9`
+(`3 + 0+1+2+3`) — las cifras cuadran exactamente con lo esperado.
+
+**Detalle de legibilidad que arreglé de paso**: el código generado para
+CUALQUIER cuerpo de función (no solo `watch`, también
+`post`/`put`/`delete`/`get`/`server function` — un bug preexistente en
+los tres, no nuevo) perdía toda la indentación interna, aplanando
+`if`/`else`/`for` a una sola columna. Seguía siendo JS **válido**
+(confirmado con `node --check`, JS no depende de la indentación para
+nada) y la lógica funcionaba correctamente incluso así — pero era
+difícil de leer. Arreglado con un `collectIndentedBody()` compartido que
+preserva la indentación **relativa** interna, en vez de aplanar todo con
+`.trim()`.
+
 ## Seguridad: path traversal encontrado y arreglado (serio, no cosmético)
 
 Al revisar qué más hacía falta, se me ocurrió comprobar algo que nunca
@@ -1220,7 +2095,7 @@ vez de filtrar datos) y con tests permanentes
 puedan volver a colarse sin que la suite lo note.
 
 **Lo que esto NO cubre** (para ser honesto sobre el alcance): no hay
-protección CSRF en los endpoints `POST` (`post function`/`updateServer`)
+protección CSRF en los endpoints `POST` (`post function`)
 — un sitio malicioso podría, en teoría, disparar esas peticiones
 aprovechando la cookie de sesión del navegador de la víctima. Tampoco hay
 límite de tasa (*rate limiting*) contra abuso/DoS. Ninguno de los dos
@@ -1337,55 +2212,118 @@ repetidos que de verdad causan bugs en tiempo de ejecución:
 
 Implementado en `src/validate.js`, llamado al final de `parseProgram`.
 
-## Limitaciones actuales (verificadas contra el código, no de memoria)
+## Limitaciones actuales (auditoría completa, verificada contra el código)
 
-**Plantillas / HTML**
-- Un `visual` compila a un único elemento raíz. Si el resultado no es
-  exactamente un elemento (varios nodos hermanos, o un `if`/`for` suelto en
-  la raíz), se envuelve automáticamente en un `<div>` — no se puede evitar.
+Recopilación de todo lo que sigue sin resolver a día de hoy — cada punto
+comprobado contra el código real antes de escribirlo aquí, no copiado de
+memoria de menciones anteriores en este documento. Organizado por
+categoría, de más a menos probable que te sorprenda.
+
+### Lenguaje / plantillas
+
 - **No puedes mezclar texto literal con `{expr}` dentro de un mismo
-  atributo.** `class="btn-{tipo}"` NO interpola — se queda literalmente como
-  el string `"btn-{tipo}"`, llaves incluidas. Solo funciona si el atributo
-  es *enteramente* la expresión: `value={contador}` o `value="{contador}"`
-  (con o sin comillas, da igual, pero sin texto alrededor).
-- Solo hay un `<slot />` "por defecto" — no hay slots nombrados
+  atributo.** `class="btn-{tipo}"` NO interpola — se queda literalmente
+  como el string `"btn-{tipo}"`, llaves incluidas. Verificado de nuevo
+  ahora mismo: el atributo generado es exactamente ese texto sin tocar.
+  Solo funciona si el atributo es *enteramente* la expresión
+  (`value={contador}` o `value="{contador}"`).
+- **Solo hay un `<slot />` "por defecto"** — no hay *slots* con nombre
   (`<slot name="header"/>`) para pasar varios huecos distintos a un mismo
-  visual hijo.
+  `visual` hijo. (Nota: la composición con *slot* y *children* sí está
+  soportada tanto en cliente como en SSR — la limitación es
+  específicamente que no hay más de un hueco por componente.)
+- Un `visual` compila a un único elemento raíz — si el resultado no es
+  exactamente un elemento (varios nodos hermanos, o un `if`/`for` suelto
+  en la raíz), se envuelve automáticamente en un `<div>`, sin forma de
+  evitarlo.
+- `for` sin `by` usa el índice como clave — correcto siempre, pero pierde
+  el beneficio de reutilización de nodos si la lista se reordena o
+  inserta en medio (usa `for (item in lista by item.id)` para eso).
 
-**`if` / `for`**
-- `else`/`else if` deben estar exactamente a la **misma indentación** que
-  su `if`. **Ya no falla en silencio**: si queda más o menos indentado, el
-  compilador lanza un `SyntaxError` con la línea, la columna real y la
-  columna esperada, en vez de tragárselo como texto HTML dentro de la rama
-  anterior.
-- El nombre de la variable de un `for (item in lista)` **sí tiene scoping
-  real** ahora: si coincide con una `reactive`/local existente, la del
-  `for` gana dentro del bucle (no colisiona). Comprobado con
-  `for (contador in lista)` cuando ya existe `reactive contador`.
-- `for` **sí hace diffing por clave** (`for (item in lista by item.id)`) —
-  reutiliza nodos DOM existentes en vez de reconstruir toda la lista.
-  Sin `by`, usa el índice como clave (correcto, pero menos eficiente al
-  reordenar/insertar en medio).
-- Para mutar una `reactive` que es un array, hay que reasignar el array
-  completo (`lista = [...lista, nuevo]`); `.push()` no dispara reactividad
-  porque el Proxy solo detecta el `set` de la propiedad completa.
+### Motor de sustitución de identificadores (sin Acorn instalado)
 
-**Composición de `visual`**
-- Un `visual` **no puede referenciarse a sí mismo**, ni directa
-  (`<arbol/>` dentro de `visual arbol`) ni indirectamente (A usa B, B usa
-  A) — el compilador detecta el ciclo con DFS sobre el grafo de
-  composición y lo rechaza con un error que muestra el camino completo.
+Estas cuatro solo aplican al motor de respaldo por regex — **con Acorn
+instalado y verificado, se resuelven solas**, porque el AST sí hace
+seguimiento de ámbitos real:
 
-**General**
-- Las expresiones dentro de `{}` y de los bloques de código son JS "tal
-  cual" con sustitución de identificadores por regex — no hay un parser de
-  JS real, así que expresiones muy complejas (destructuring, funciones
-  flecha inline, etc.) podrían no sustituirse bien o colisionar con nombres
-  de variables reactivas usados como propiedades de otro objeto.
-- No existe aún un modo `dev` con recarga en caliente (solo `build`
-  estático).
+- Tras un *destructuring* (`const { contador } = obj`), una referencia
+  **posterior** a `contador` en el mismo bloque se sigue sustituyendo por
+  `state.contador` en vez de resolver a la variable local — el motor de
+  regex no rastrea que esa línea creó una variable que hace *shadowing*.
+- Dentro de un *destructuring* con valor por defecto
+  (`const { contador = otraReactive } = obj`), ese valor por defecto NO
+  se sustituye si referencia otra `reactive`.
+- **Referencias hacia adelante entre `reactive` no funcionan** — solo
+  hacia atrás. `reactive a = b` seguido de `reactive b = 5` da
+  `ReferenceError: b is not defined` (verificado ahora mismo); al revés
+  (`reactive b = 5` antes que `reactive a = b`) sí funciona. Es un patrón
+  inusual, pero es una limitación real y no se ha resuelto — arreglarlo
+  necesitaría reordenar declaraciones automáticamente según sus
+  dependencias, más trabajo del que parece a primera vista.
+- Un *destructuring* dentro de una **asignación** sin declarar
+  (`({ contador } = obj)`, sin `const`/`let`/`var` delante) no se maneja
+  como caso especial — puede comportarse de forma distinta a lo esperado.
 
-Estas son las siguientes piezas naturales a construir o arreglar cuando
-quieras seguir ampliando el lenguaje — por orden de "sorpresa silenciosa"
-antes que por dificultad: el `else` mal indentado y el scoping de `for` son
-los dos que más te van a morder sin avisar.
+**Pendiente real, no solo teórico**: Acorn se implementó pero **nunca se
+ha podido probar con la librería de verdad instalada** — este entorno no
+tiene acceso a red para hacer `npm install acorn`. Todo lo anterior
+asume que Acorn, una vez instalado, se comporta como está razonado — si
+lo instalas y algo de esto no se resuelve como se espera, sería la
+primera señal de un bug en `src/js-analyzer.js` que nadie ha detectado
+aún.
+
+### Servidor
+
+- **`server function` es siempre síncrona** — no puede usar `await`
+  dentro (a diferencia de `get`/`post`/`put`/`delete function`, que sí
+  son `async`). Si necesitas llamar a otro sistema (`http.*`/`fetch`),
+  hazlo directamente en una de las cuatro HTTP, no en un `server
+  function`. Decisión deliberada: hacerla `async` rompía el patrón de
+  llamarla sin `await` esperando su valor de vuelta directo, que ya
+  estaba en uso.
+- **Sin protección CSRF** en los endpoints `POST`/`PUT`/`DELETE` — un
+  sitio malicioso podría, en teoría, disparar esas peticiones
+  aprovechando la cookie de sesión del navegador de la víctima.
+- **Sin límite de tasa** (*rate limiting*) contra abuso o DoS.
+- **Sesiones solo en memoria**: no hay expiración, ni límite de cuántas
+  se guardan — un servidor de producción de verdad necesitaría expirar
+  sesiones viejas o mover el estado a algo compartido (Redis, base de
+  datos) en vez de un `Map` en memoria del proceso Node. Tampoco
+  comparten estado entre varias instancias del proceso (sin *sticky
+  sessions* o un almacén externo, escalar horizontalmente rompería la
+  consistencia).
+- La cookie de sesión es `HttpOnly` pero no `Secure` (no fuerza HTTPS) —
+  pensado para desarrollo local, no para producción tal cual.
+- `watch()`: el sistema todavía no distingue "leer `datos.edad` como
+  valor final" de "leer `datos.edad` de camino a algo más profundo" en
+  todos los casos imaginables de identidad tras operaciones que
+  reconstruyen objetos combinando código propio con más envolturas
+  manuales — el caso cubierto y probado (arrays vía
+  `.slice()`/`.filter()`/`.map()`/*spread*) es el que de verdad importa
+  en la práctica.
+
+### Experiencia de desarrollo / build
+
+- **No existe un modo `dev` con recarga en caliente** — cada cambio
+  implica recompilar y recargar a mano. Sí existe SSG/SSR (contenido real
+  desde el primer HTML), pero no *hot reload* del propio proceso de
+  desarrollo.
+- **Sin minificación** del `bundle.js`/CSS generado — ni básica ni real.
+- **Sin sistema de tipos real** — el tipado opcional (`reactive number x
+  = 5`) es una anotación validada superficialmente en compilación (solo
+  si el valor inicial es un literal simple), no inferencia ni
+  propagación de tipos a través del código.
+
+### Lo que NO es una limitación, aunque lo parezca a primera vista
+
+Para que no se lea como más incompleto de lo que es — estas cosas
+**sí funcionan**, verificadas explícitamente en algún momento de esta
+conversación, y a veces se asumen rotas por analogía con frameworks
+similares: reactividad profunda en objetos/arrays anidados (`.push()`,
+mutación de propiedades), `JSON.stringify`/`parse` y sus métodos, *query
+string* y cabeceras en las cuatro funciones HTTP, `import` de `server
+var`/`server function`/`server reactive` (incluyendo dependencias
+transitivas), composición de `visual` con *slot* y *children* (cliente y
+SSR), SSG/SSR con *fallback* seguro, y protección explícita contra path
+traversal y fuga de variables globales.
+

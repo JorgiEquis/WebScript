@@ -333,3 +333,116 @@ render(
     assert.deepEqual(items, ['item-0', 'item-1', 'item-2'], 'el orden debe respetar el orden de inserción, no invertirse');
   });
 });
+
+describe('compilador: JSON.stringify/parse y referencias cruzadas entre reactive', () => {
+  test('una reactive puede referenciar a otra reactive anterior en su valor inicial', async () => {
+    const src = `
+reactive textoJson = '{"nombre": "Ana", "edad": 25}'
+reactive datos = JSON.parse(textoJson)
+
+visual v =
+<p>{datos.nombre} tiene {datos.edad} años</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    assert.equal(app.children[0].textContent, 'Ana tiene 25 años');
+  });
+
+  test('JSON.stringify/parse funcionan de extremo a extremo, incluyendo .filter()/Object.keys()', async () => {
+    const src = `
+reactive datos = { nombre: "Jorge", hobbies: ["programar", "leer"] }
+reactive salida = ""
+
+visual v =
+<p>{salida}</p>
+    -> onclick:
+        var texto = JSON.stringify(datos)
+        var vuelto = JSON.parse(texto)
+        var largos = datos.hobbies.filter(h => h.length > 5)
+        salida = vuelto.nombre + ":" + largos.join(",") + ":" + Object.keys(datos).join(",")
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const p = app.children[0];
+    p.listeners.click({ target: p });
+    assert.equal(p.textContent, 'Jorge:programar:nombre,hobbies');
+  });
+
+  test('mutar una propiedad de una reactive-objeto SÍ dispara re-render (reactividad profunda)', async () => {
+    const src = `
+reactive datos = { edad: 25 }
+
+visual v =
+<p>{datos.edad}</p>
+    -> onclick:
+        datos.edad = 99
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const p = app.children[0];
+    p.listeners.click({ target: p });
+    assert.equal(p.textContent, '99', 'mutar una propiedad anidada SÍ debe re-renderizar (reactividad profunda)');
+  });
+
+  test('reasignar la reactive-objeto completa SÍ dispara re-render', async () => {
+    const src = `
+reactive datos = { edad: 25 }
+
+visual v =
+<p>{datos.edad}</p>
+    -> onclick:
+        datos = { ...datos, edad: 99 }
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const p = app.children[0];
+    p.listeners.click({ target: p });
+    assert.equal(p.textContent, '99', 'reasignar la reactive completa sí debe re-renderizar');
+  });
+});
+
+describe('compilador: function (cliente) con cuerpo multilínea', () => {
+  test('ejecuta correctamente, incluyendo if/else e identificadores sustituidos', async () => {
+    const src = `
+reactive base = 10
+
+function calcularConBase(x)
+    var resultado = x + base
+    if (resultado > 20)
+        return "alto: " + resultado
+    else
+        return "bajo: " + resultado
+
+visual v =
+<p>{calcularConBase(15)}</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    assert.equal(app.children[0].textContent, 'alto: 25');
+  });
+});

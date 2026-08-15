@@ -65,6 +65,28 @@ describe('validate: server var / server function prohibidas en visuales', () => 
     assert.doesNotThrow(() => parseSource(src));
   });
 
+  test('reactive global (fuera de cualquier visual) referenciando server var a secas falla', () => {
+    const src = 'server var contador = 100\n\nreactive x = contador\n\nvisual v =\n<p>{x}</p>';
+    assert.throws(() => parseSource(src), /Usa "server\.contador"/);
+  });
+
+  test('var global (no reactive) referenciando server var a secas también falla', () => {
+    const src = 'server var contador = 100\n\nvar x = contador * 2\n\nvisual v =\n<p>x</p>';
+    assert.throws(() => parseSource(src), /Usa "server\.contador"/);
+  });
+
+  test('mismo hueco, ahora vía import de una server var', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-server-bare-'));
+    fs.writeFileSync(path.join(dir, 'otro.ws'), 'server var contador = 100');
+    fs.writeFileSync(path.join(dir, 'pagina.ws'), 'import { contador } from "./otro.ws"\n\nreactive x = contador\n\nvisual v =\n<p>{x}</p>');
+    const src = fs.readFileSync(path.join(dir, 'pagina.ws'), 'utf8');
+    assert.throws(() => parseSource(src, path.join(dir, 'pagina.ws')), /Usa "server\.contador"/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   test('server function referenciada en un visual falla', () => {
     const src = 'server function calc(x)\n    return x * 2\n\nvisual v =\n<p>{calc(1)}</p>';
     assert.throws(() => parseSource(src), /server function/);

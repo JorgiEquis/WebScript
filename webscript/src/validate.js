@@ -3,18 +3,26 @@ const jsAnalyzer = require('./js-analyzer');
 const LABELS = {
   ReactiveDecl: 'reactive',
   VarDecl: 'var',
+  FunctionDecl: 'function',
   StyleDecl: 'style',
   VisualDecl: 'visual',
   ServerVarDecl: 'server var',
+  ServerReactiveDecl: 'server reactive',
   ServerFunctionDecl: 'server function',
   PostFunctionDecl: 'post function',
+  PutFunctionDecl: 'put function',
+  DeleteFunctionDecl: 'delete function',
+  GetFunctionDecl: 'get function',
 };
 
-// Espacios de nombres: reactive/var/visual/server-var/server-function/post-function
-// comparten uno -- colisionan de verdad (variable JS muerta, función pisada en silencio,
-// o ambigüedad sobre si un nombre es de cliente o de servidor). "style" tiene el suyo propio.
+// Espacios de nombres: reactive/var/function/visual/server-var/server-reactive/
+// server-function/get-post-put-delete-function comparten uno -- colisionan de verdad
+// (variable JS muerta, función pisada en silencio, o ambigüedad sobre si un nombre es
+// de cliente o de servidor). "style" tiene el suyo propio. "watch" no declara ningún
+// nombre (solo referencia uno existente), así que no participa en este espacio.
 const SHARED_NAMESPACE = new Set([
-  'ReactiveDecl', 'VarDecl', 'VisualDecl', 'ServerVarDecl', 'ServerFunctionDecl', 'PostFunctionDecl',
+  'ReactiveDecl', 'VarDecl', 'FunctionDecl', 'VisualDecl', 'ServerVarDecl', 'ServerReactiveDecl', 'ServerFunctionDecl',
+  'PostFunctionDecl', 'PutFunctionDecl', 'DeleteFunctionDecl', 'GetFunctionDecl',
 ]);
 
 function labelFor(type) {
@@ -59,6 +67,10 @@ function isObjectKeyPosition(expr, index, length) {
   return (before === '{' || before === ',') && after === ':';
 }
 
+function isInsideAnySpan(index, spans) {
+  return spans.some(([s, e]) => index >= s && index < e);
+}
+
 function findDestructuringSpans(expr) {
   const spans = [];
   const headerRe = /\b(?:const|let|var)\s*\{/g;
@@ -86,6 +98,55 @@ function findDestructuringSpans(expr) {
   return spans;
 }
 
+// Igual que en compiler.js: tramos de TEXTO LITERAL dentro de comillas (respetando
+// ${...} de un template literal, que sí es código) -- sin esto, "referencia" a un
+// server var/función podía detectarse por error dentro de una cadena de texto que
+// simplemente CONTIENE esa palabra, no una referencia de verdad.
+function findStringLiteralSpans(expr) {
+  const spans = [];
+  let i = 0;
+  while (i < expr.length) {
+    const ch = expr[i];
+    if (ch === '"' || ch === "'") {
+      const start = i;
+      const quote = ch;
+      i++;
+      while (i < expr.length && expr[i] !== quote) {
+        if (expr[i] === '\\') { i += 2; continue; }
+        i++;
+      }
+      i++;
+      spans.push([start, Math.min(i, expr.length)]);
+      continue;
+    }
+    if (ch === '`') {
+      i++;
+      let textStart = i;
+      while (i < expr.length && expr[i] !== '`') {
+        if (expr[i] === '\\') { i += 2; continue; }
+        if (expr[i] === '$' && expr[i + 1] === '{') {
+          spans.push([textStart, i]);
+          i += 2;
+          let depth = 1;
+          while (i < expr.length && depth > 0) {
+            if (expr[i] === '{') depth++;
+            else if (expr[i] === '}') depth--;
+            i++;
+          }
+          textStart = i;
+          continue;
+        }
+        i++;
+      }
+      spans.push([textStart, i]);
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return spans;
+}
+
 function referencesName(expr, name) {
   const astRefs = jsAnalyzer.isAvailable() ? jsAnalyzer.analyzeReferences(expr) : null;
   if (astRefs) {
@@ -94,8 +155,10 @@ function referencesName(expr, name) {
 
   const re = new RegExp(`(?<![\\w$])(?<![^.]\\.)${name}(?![\\w$])`, 'g');
   const destructuringSpans = findDestructuringSpans(expr);
+  const stringSpans = findStringLiteralSpans(expr);
   let m;
   while ((m = re.exec(expr)) !== null) {
+    if (isInsideAnySpan(m.index, stringSpans)) continue;
     if (isObjectKeyPosition(expr, m.index, name.length)) continue;
     if (destructuringSpans.some(([s, e]) => m.index >= s && m.index < e)) continue;
     return true;
@@ -210,11 +273,96 @@ function validate(ast) {
     );
   }
 
-  const postFnDecls = ast.body.filter(n => n.type === 'PostFunctionDecl');
-  if (postFnDecls.length > 1) {
+  // Como mucho una función por verbo HTTP (get/post/put/delete) por archivo -- cada
+  // verbo dispara la suya propia en la URL de la ruta; nada impide tener varias a la vez.
+  for (const [type, verb] of [['PostFunctionDecl', 'post'], ['PutFunctionDecl', 'put'], ['DeleteFunctionDecl', 'delete'], ['GetFunctionDecl', 'get']]) {
+    const decls = ast.body.filter(n => n.type === type);
+    if (decls.length > 1) {
+      throw new SyntaxError(
+        `Solo puede haber una "${verb} function" por archivo (encontradas en las líneas ${decls.map(f => f.line).join(', ')}).`
+      );
+    }
+  }
+
+  // "get function" solo tiene sentido si el archivo NO tiene render() -- si lo tiene,
+  // GET ya significa "servir la página", y no hay forma sin ambigüedad de decidir si
+  // una petición GET debe servir el HTML o llamar a la función. Se rechaza explícito
+  // en vez de dejar que uno gane en silencio.
+  const getFnDecl = ast.body.find(n => n.type === 'GetFunctionDecl');
+  const renderDecl = ast.body.find(n => n.type === 'RenderCall');
+  if (getFnDecl && renderDecl) {
     throw new SyntaxError(
-      `Solo puede haber una "post function" por archivo (encontradas en las líneas ${postFnDecls.map(f => f.line).join(', ')}).`
+      `"get function ${getFnDecl.name}" (línea ${getFnDecl.line}) no puede coexistir con ` +
+      `"render(...)" (línea ${renderDecl.line}) en el mismo archivo -- en un archivo con ` +
+      `render(), GET ya significa "servir la página". "get function" solo tiene sentido en ` +
+      `una ruta "solo backend", sin render().`
     );
+  }
+
+  // watch(NOMBRE) solo tiene sentido si NOMBRE es una "server reactive" declarada en el
+  // mismo archivo -- ni una "server var" normal (esas no se observan, watch no dispararía
+  // nunca), ni un nombre inventado.
+  const serverReactiveNamesSet = new Set(ast.body.filter(n => n.type === 'ServerReactiveDecl').map(n => n.name));
+  for (const w of ast.body.filter(n => n.type === 'WatchDecl')) {
+    if (!serverReactiveNamesSet.has(w.name)) {
+      const asServerVar = ast.body.some(n => n.type === 'ServerVarDecl' && n.name === w.name);
+      throw new SyntaxError(
+        `"watch(${w.name})" (línea ${w.line}) -- "${w.name}" no es una "server reactive" ` +
+        `declarada en este archivo${asServerVar ? ` (es "server var", que no se puede observar -- usa "server reactive ${w.name}" en su lugar si necesitas watch())` : ''}.`
+      );
+    }
+  }
+
+  // "server function" sin NINGUNA función HTTP (get/post/put/delete) en un archivo
+  // que SÍ declara route() es inalcanzable de raíz: no hay ninguna de las cuatro que la
+  // llame desde dentro, y un archivo con route() no se puede importar desde otro (ya
+  // validado más abajo) -- así que tampoco puede llegarle una llamada desde fuera. Se
+  // rechaza en vez de dejar código que nunca puede ejecutarse.
+  //
+  // "server var" SOLA (sin server function) NO entra en esta prohibición -- una ruta
+  // "solo backend" sin ninguna función HTTP sigue sirviendo su estado por GET (el
+  // volcado por defecto, ver "WebScript como backend puro"), así que sigue siendo útil.
+  //
+  // Un archivo SIN route() (una librería pensada para "import", como "compartido.ws")
+  // queda fuera de esta comprobación -- ahí "server function" sin llamador propio es
+  // exactamente el patrón esperado: espera a que otro archivo la importe y la use.
+  if (routeDecls.length > 0 && !renderDecl) {
+    const serverFnDecls = ast.body.filter(n => n.type === 'ServerFunctionDecl');
+    const hasHttpFn = ast.body.some(n =>
+      n.type === 'GetFunctionDecl' || n.type === 'PostFunctionDecl' ||
+      n.type === 'PutFunctionDecl' || n.type === 'DeleteFunctionDecl'
+    );
+    if (serverFnDecls.length > 0 && !hasHttpFn) {
+      throw new SyntaxError(
+        `"server function ${serverFnDecls[0].name}" (línea ${serverFnDecls[0].line}) es ` +
+        `inalcanzable: este archivo declara route(...) pero no tiene ninguna función HTTP ` +
+        `(get/post/put/delete function) que pueda llamarla, y un archivo con route() no se ` +
+        `puede importar desde otro. Añade al menos una función HTTP, o quita route(...) si ` +
+        `esto es en realidad una librería pensada para "import" (ahí sí es un patrón válido).`
+      );
+    }
+
+    // "reactive"/"var"/"function" (CLIENTE) en una ruta "solo backend" (route() sin
+    // render()) son inertes: su código compilado (bundle.js) NUNCA se escribe a disco
+    // ahí -- se descarta entero, siempre. Si algo del servidor las referencia (post/put/
+    // delete/get/server function, watch), revienta con un ReferenceError real (el nombre
+    // no existe en server.js, solo se compiló -- y se tiró -- al lado de cliente); si
+    // nadie las referencia, son código muerto sin ningún efecto. Mismo criterio que
+    // "server function inalcanzable": se rechaza en compilación en vez de fallar en silencio.
+    const clientDecls = ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'FunctionDecl');
+    if (clientDecls.length > 0) {
+      const first = clientDecls[0];
+      const alternativa = first.type === 'FunctionDecl'
+        ? `"server function ${first.name}"`
+        : `"server var ${first.name}"/"server reactive ${first.name}"`;
+      throw new SyntaxError(
+        `"${labelFor(first.type)} ${first.name}" (línea ${first.line}) no tiene ningún efecto: ` +
+        `este archivo declara route(...) pero no render(...), así que es una ruta "solo backend" -- ` +
+        `su código de cliente (bundle.js) nunca se escribe a disco, se descarta entero. Si esto es ` +
+        `del servidor, usa ${alternativa} en su lugar; si el archivo debería tener página, añade un ` +
+        `"visual" y "render(...)".`
+      );
+    }
   }
 
   const globalDecls = ast.body.filter(n => LABELS[n.type]);
@@ -290,11 +438,11 @@ function validate(ast) {
   // implicaría exponerlos al cliente, que es justo lo que "server" prohíbe. ("post function"
   // es la única excepción: esa SÍ se puede llamar desde un visual, es su razón de ser.)
   const serverNames = ast.body
-    .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerFunctionDecl')
+    .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl')
     .map(n => n.name);
   const serverNameKind = new Map(
     ast.body
-      .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerFunctionDecl')
+      .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl')
       .map(n => [n.name, labelFor(n.type)])
   );
 
@@ -319,6 +467,43 @@ function validate(ast) {
             );
           }
         }
+      }
+    }
+
+    // El mismo hueco existía en el valor inicial de una "reactive"/"var" GLOBAL (fuera
+    // de cualquier visual) -- "reactive x = contador" (a secas, sin "server.") compilaba
+    // sin ningún aviso y explotaba en el navegador con un ReferenceError real, porque
+    // "contador" (server var) nunca llega al bundle.js. La forma correcta ya existía
+    // (server.NOMBRE, que "referencesName" excluye correctamente por el punto delante),
+    // pero nadie avisaba si se te olvidaba. Se aplica igual tanto si la "server var" es
+    // local como si llegó por "import" -- en ambos casos es el mismo AST, misma regla.
+    for (const decl of ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl')) {
+      for (const serverName of serverNames) {
+        if (referencesName(decl.init, serverName)) {
+          throw new SyntaxError(
+            `"${labelFor(decl.type)} ${decl.name}" (línea ${decl.line}) referencia "${serverName}", que es ` +
+            `"${serverNameKind.get(serverName)}" -- eso nunca llega al bundle.js, así que fallaría en el ` +
+            `navegador con un ReferenceError real. Usa "server.${serverName}" en su lugar (la forma correcta ` +
+            `de leer una server var/reactive desde el cliente).`
+          );
+        }
+      }
+    }
+  }
+
+  // "updateServer" ya no existe -- se unificó con "post function" (ver README). Se
+  // detecta explícitamente para dar un error útil en vez de un ReferenceError críptico
+  // en el navegador si alguien lo escribe por costumbre.
+  for (const v of ast.body.filter(n => n.type === 'VisualDecl')) {
+    for (const b of v.bindings) {
+      if (!b.key.startsWith('on')) continue;
+      const code = b.kind === 'value' ? b.value : b.code;
+      if (/\bupdateServer\s*\(/.test(code)) {
+        throw new SyntaxError(
+          `"visual ${v.name}" usa "updateServer(...)", que ya no existe -- se unificó con ` +
+          `"post function". Declara una "post function" que actualice la(s) "server var" que ` +
+          `necesites y llámala igual que llamarías a "updateServer".`
+        );
       }
     }
   }

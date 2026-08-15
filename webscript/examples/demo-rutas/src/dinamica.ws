@@ -2,6 +2,10 @@ route("/dinamica")
 
 server var visitas = 100
 
+post function incrementar(args)
+    visitas = visitas + args.cantidad
+    return { visitas: visitas }
+
 reactive contadorCliente = server.visitas
 
 style boton =
@@ -17,7 +21,8 @@ visual paginaDinamica =
 </div>
     -> style: boton
     -> onclick:
-        contadorCliente = await updateServer({ visitas: contadorCliente + 1 }).then(s => s.visitas)
+        var r = await incrementar({ cantidad: 1 })
+        contadorCliente = r.visitas
 
 render(
     paginaDinamica

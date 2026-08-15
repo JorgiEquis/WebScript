@@ -48,8 +48,11 @@ describe('parser: declaraciones básicas', () => {
     assert.equal(ast.body[1].init, '10');
   });
 
-  test('"server reactive" da error explicativo con el nombre correcto sugerido', () => {
-    assert.throws(() => parseSource('server reactive visitas = 1'), /usa "server var visitas"/);
+  test('"server reactive" se parsea como ServerReactiveDecl (reintroducida con watch())', () => {
+    const ast = parseSource('server reactive visitas = 1');
+    assert.equal(ast.body[0].type, 'ServerReactiveDecl');
+    assert.equal(ast.body[0].name, 'visitas');
+    assert.equal(ast.body[0].init, '1');
   });
 
   test('server function con parámetros', () => {
@@ -195,5 +198,143 @@ describe('parser: tipado opcional (reactive/var)', () => {
     const ast = parseSource('reactive string = 5');
     assert.equal(ast.body[0].name, 'string');
     assert.equal(ast.body[0].varType, null);
+  });
+});
+
+describe('parser: put function / delete function', () => {
+  test('put function y delete function se parsean correctamente', () => {
+    const ast = parseSource('put function actualizar(args)\n    return args\n\ndelete function borrar(args)\n    return args');
+    assert.equal(ast.body[0].type, 'PutFunctionDecl');
+    assert.equal(ast.body[0].name, 'actualizar');
+    assert.equal(ast.body[1].type, 'DeleteFunctionDecl');
+    assert.equal(ast.body[1].name, 'borrar');
+  });
+
+  test('las tres (post/put/delete) pueden coexistir en el mismo archivo', () => {
+    const src = 'post function a(x)\n    return x\n\nput function b(x)\n    return x\n\ndelete function c(x)\n    return x';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('solo una put function por archivo', () => {
+    assert.throws(
+      () => parseSource('put function a(x)\n    return x\n\nput function b(x)\n    return x'),
+      /Solo puede haber una "put function"/
+    );
+  });
+
+  test('solo una delete function por archivo', () => {
+    assert.throws(
+      () => parseSource('delete function a(x)\n    return x\n\ndelete function b(x)\n    return x'),
+      /Solo puede haber una "delete function"/
+    );
+  });
+
+  test('put function comparte espacio de nombres con reactive/visual/etc', () => {
+    assert.throws(
+      () => parseSource('reactive x = 1\n\nput function x(args)\n    return args'),
+      /Nombre duplicado/
+    );
+  });
+});
+
+describe('validate: server function inalcanzable', () => {
+  test('route() + server function SIN ninguna función HTTP -- rechazado', () => {
+    const src = 'route("/api/x")\n\nserver function duplicar(x)\n    return x * 2';
+    assert.throws(() => parseSource(src), /es inalcanzable/);
+  });
+
+  test('route() + server var SOLA (sin server function) -- permitido, se sirve por GET', () => {
+    const src = 'route("/api/config")\n\nserver var version = "1.0"';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('librería SIN route() con server function -- permitido (patrón de import)', () => {
+    const src = 'server function duplicar(x)\n    return x * 2';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('route() + server function + al menos una función HTTP -- permitido', () => {
+    const src = 'route("/api/x")\n\nserver function duplicar(x)\n    return x * 2\n\npost function usar(args)\n    return { r: duplicar(args.n) }';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+});
+
+describe('import: server var / server function funcionan correctamente', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  test('importar server var/server function desde una librería funciona en una post function', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-import-server-'));
+    fs.writeFileSync(path.join(dir, 'lib.ws'), 'server var contador = 0\n\nserver function duplicar(x)\n    return x * 2');
+    fs.writeFileSync(path.join(dir, 'api.ws'), 'route("/api/x")\n\nimport { contador, duplicar } from "./lib.ws"\n\npost function incrementar(args)\n    contador = contador + 1\n    return { contador: contador, doble: duplicar(contador) }');
+
+    const src = fs.readFileSync(path.join(dir, 'api.ws'), 'utf8');
+    assert.doesNotThrow(() => parseSource(src, path.join(dir, 'api.ws')));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('un server var importado SÍ se detecta como prohibido dentro de un visual', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-import-server2-'));
+    fs.writeFileSync(path.join(dir, 'lib.ws'), 'server var contador = 0');
+    fs.writeFileSync(path.join(dir, 'pagina.ws'), 'import { contador } from "./lib.ws"\n\nvisual v =\n<p>{contador}</p>');
+
+    const src = fs.readFileSync(path.join(dir, 'pagina.ws'), 'utf8');
+    assert.throws(() => parseSource(src, path.join(dir, 'pagina.ws')), /server var/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('validate: reactive/var (cliente) sin efecto en una ruta solo backend', () => {
+  test('route() + var (sin server) + sin render() -- rechazado: el bundle.js se descarta entero', () => {
+    const src = 'route("/api/x")\n\nvar x = 5\n\npost function leer(args)\n    return { valor: x }';
+    assert.throws(() => parseSource(src), /no tiene ningún efecto/);
+  });
+
+  test('route() + reactive (sin server) + sin render() -- también rechazado', () => {
+    const src = 'route("/api/x")\n\nreactive x = 5\n\npost function leer(args)\n    return { valor: x }';
+    assert.throws(() => parseSource(src), /no tiene ningún efecto/);
+  });
+
+  test('la versión correcta (server var) SÍ funciona', () => {
+    const src = 'route("/api/x")\n\nserver var x = 5\n\npost function leer(args)\n    return { valor: x }';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('reactive/var en una librería SIN route() sigue permitido (patrón de import)', () => {
+    const src = 'reactive contadorInicial = 0';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('reactive/var en un archivo CON render() sigue permitido, como siempre', () => {
+    const src = 'reactive x = 5\n\nvisual v =\n<p>{x}</p>\n\nrender(\n    v\n)';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+});
+
+describe('function (cliente) -- equivalente a server function, cuerpo en varias líneas', () => {
+  test('se parsea como FunctionDecl con cuerpo multilínea', () => {
+    const ast = parseSource('function duplicar(x)\n    var y = x * 2\n    return y');
+    assert.equal(ast.body[0].type, 'FunctionDecl');
+    assert.equal(ast.body[0].name, 'duplicar');
+    assert.equal(ast.body[0].params, 'x');
+    assert.match(ast.body[0].body, /var y = x \* 2/);
+  });
+
+  test('comparte espacio de nombres con reactive/var/visual/etc', () => {
+    assert.throws(
+      () => parseSource('reactive duplicar = 1\n\nfunction duplicar(x)\n    return x'),
+      /Nombre duplicado/
+    );
+  });
+
+  test('function en una ruta solo backend (route sin render) es rechazada, sugiere server function', () => {
+    const src = 'route("/api/x")\n\nfunction duplicar(x)\n    return x * 2\n\npost function leer(args)\n    return { valor: duplicar(5) }';
+    assert.throws(() => parseSource(src), /usa "server function duplicar"/);
+  });
+
+  test('function en un archivo con render() sigue permitida, como siempre', () => {
+    const src = 'function duplicar(x)\n    return x * 2\n\nreactive contador = 5\n\nvisual v =\n<p>{duplicar(contador)}</p>\n\nrender(\n    v\n)';
+    assert.doesNotThrow(() => parseSource(src));
   });
 });

@@ -208,6 +208,10 @@ route("/dinamica")
 
 server var visitas = 100
 
+post function incrementar(args)
+    visitas = args.nuevoValor
+    return { visitas: visitas }
+
 reactive contadorCliente = server.visitas
 
 visual test =
@@ -228,10 +232,10 @@ render(
       assert.match(html1, /<h1>Visitas: 100<\/h1>/, 'primera visita: valor inicial de verdad, no concha vacía');
       const cookie = r1.headers.get('set-cookie').split(';')[0];
 
-      await fetch(`http://localhost:${port}/dinamica.server-data.json`, {
+      await fetch(`http://localhost:${port}/dinamica`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Cookie: cookie },
-        body: JSON.stringify({ visitas: 250 }),
+        body: JSON.stringify({ nuevoValor: 250 }),
       });
 
       const r2 = await fetch(`http://localhost:${port}/dinamica`, { headers: { Cookie: cookie } });

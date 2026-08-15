@@ -10,6 +10,22 @@ function build(inputFile, outDir) {
   const source = fs.readFileSync(inputFile, 'utf8');
   const ast = parseProgram(source, path.resolve(inputFile));
 
+  const hasRender = ast.body.some(n => n.type === 'RenderCall');
+
+  // Sin render(): archivo "solo backend" -- ni HTML, ni CSS, ni bundle.js, solo
+  // server.js (si tiene algo de servidor). Mismo criterio que "site"/"run".
+  if (!hasRender) {
+    const { server } = compile(ast, { routePath: '/' });
+    fs.mkdirSync(outDir, { recursive: true });
+    if (server) {
+      fs.writeFileSync(path.join(outDir, 'index.server.js'), server);
+      console.log(`✔ Compilado "${inputFile}" -> ${outDir}/ (index.server.js -- sin render(), no se generó HTML/CSS/JS)`);
+    } else {
+      console.log(`✔ Compilado "${inputFile}" -- sin render() y sin nada de servidor, no se generó ningún archivo.`);
+    }
+    return;
+  }
+
   // Si el archivo usa server.NOMBRE, el bundle necesita el mismo montaje "async +
   // fetch" que usa "site"/"run" -- si no, "server" ni siquiera queda declarado en
   // el bundle y revienta con ReferenceError al cargar.
@@ -59,7 +75,8 @@ function printTable(table, skipped, outDir) {
   const maxRouteLen = Math.max(...table.map(r => r.route.length), 5);
   for (const r of table) {
     const serverTag = r.hasServer ? '  (+server.js)' : '';
-    console.log(`  ${r.route.padEnd(maxRouteLen)}  ->  ${outDir}/${r.html}  (${r.file})${serverTag}`);
+    const target = r.apiOnly ? '(solo backend, sin página)' : `${outDir}/${r.html}`;
+    console.log(`  ${r.route.padEnd(maxRouteLen)}  ->  ${target}  (${r.file})${serverTag}`);
   }
 }
 

@@ -3,6 +3,27 @@ const { validate } = require('./validate');
 const fs = require('fs');
 const path = require('path');
 
+// Recolecta las líneas del cuerpo de un bloque (post/put/delete/get/server function,
+// watch...) preservando la indentación RELATIVA interna -- para que el código
+// generado (server.js) siga siendo legible, con sus propios if/for anidados
+// correctamente sangrados, en vez de aplanar todo a una sola columna con .trim().
+// No afecta a la corrección (JS no depende de la indentación para nada), solo a que
+// el archivo generado se pueda leer de verdad.
+function collectIndentedBody(lines, startIdx, baseIndent) {
+  let j = startIdx;
+  const bodyLines = [];
+  let bodyBaseIndent = null;
+  while (j < lines.length) {
+    if (isBlank(lines[j])) { j++; continue; }
+    if (lines[j].indent <= baseIndent) break;
+    if (bodyBaseIndent === null) bodyBaseIndent = lines[j].indent;
+    const extra = Math.max(0, lines[j].indent - bodyBaseIndent);
+    bodyLines.push(' '.repeat(extra) + lines[j].text.trim());
+    j++;
+  }
+  return { bodyLines, next: j };
+}
+
 function getIndent(line) {
   const match = line.match(/^(\s*)/);
   return match[1].replace(/\t/g, '    ').length;
@@ -65,6 +86,18 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parsePostFunction(lines, i);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('put function ')) {
+      const r = parsePutFunction(lines, i);
+      body.push(r.node);
+      i = r.next;
+    } else if (trimmed.startsWith('delete function ')) {
+      const r = parseDeleteFunction(lines, i);
+      body.push(r.node);
+      i = r.next;
+    } else if (trimmed.startsWith('get function ')) {
+      const r = parseGetFunction(lines, i);
+      body.push(r.node);
+      i = r.next;
     } else if (trimmed.startsWith('server function ')) {
       const r = parseServerFunction(lines, i);
       body.push(r.node);
@@ -73,12 +106,20 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parseServerDecl(lines, i);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('watch(')) {
+      const r = parseWatch(lines, i);
+      body.push(r.node);
+      i = r.next;
     } else if (trimmed.startsWith('reactive ')) {
       const r = parseReactive(lines, i);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('var ')) {
       const r = parseVarDecl(lines, i);
+      body.push(r.node);
+      i = r.next;
+    } else if (trimmed.startsWith('function ')) {
+      const r = parseFunctionDecl(lines, i);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('style ')) {
@@ -118,6 +159,25 @@ function parseImport(lines, i) {
 // Sustituye cada ImportDecl por los nodos reales que importa, leídos y parseados del
 // archivo indicado. El archivo importado NO puede tener route() ni render() -- eso lo
 // convertiría en una página, no en un almacén compartido de declaraciones.
+// Extrae el texto de código de un nodo (para buscar qué otros nombres referencia) --
+// una declaración con "init" (reactive/var/server var/server reactive), o con "body"
+// (cualquier función, o un watch).
+function getCodeText(node) {
+  if (node.init !== undefined) return node.init;
+  if (node.body !== undefined) return node.body;
+  return '';
+}
+
+// Comprobación simple de "¿aparece este nombre como identificador suelto en este
+// código?" -- deliberadamente permisiva (puede dar algún falso positivo, ej. dentro de
+// un comentario o una cadena) porque aquí un falso positivo es inofensivo (se
+// importaría una dependencia de más, sin efecto), mientras que un falso NEGATIVO
+// causaría un ReferenceError real al compilar.
+function referencesIdentifierLoosely(code, name) {
+  const re = new RegExp(`(?<![\\w$])(?<![^.]\\.)${name}(?![\\w$])`);
+  return re.test(code);
+}
+
 function resolveImports(body, filePath, resolving) {
   const hasImports = body.some(n => n.type === 'ImportDecl');
   if (!hasImports) return body;
@@ -154,7 +214,49 @@ function resolveImports(body, filePath, resolving) {
       throw new SyntaxError(`Línea ${node.line}: no puedes importar "${node.source}" -- tiene render(...), es una página, no un almacén compartido.`);
     }
 
-    const byName = new Map(importedAst.body.filter(n => n.name).map(n => [n.name, n]));
+    // "watch" no participa en el mapa por nombre para pedirlo EXPLÍCITAMENTE (no es una
+    // declaración con nombre propio, observa una variable ajena) -- pero si esa
+    // variable se importa (directa o transitivamente), su(s) watch() deben venir con
+    // ella, o si no el comportamiento cambiaría en silencio entre usarla localmente en
+    // "otro.ws" y usarla vía import en este archivo.
+    const byName = new Map(importedAst.body.filter(n => n.name && n.type !== 'WatchDecl').map(n => [n.name, n]));
+    const watchesByVarName = new Map();
+    for (const n of importedAst.body) {
+      if (n.type !== 'WatchDecl') continue;
+      if (!watchesByVarName.has(n.name)) watchesByVarName.set(n.name, []);
+      watchesByVarName.get(n.name).push(n);
+    }
+
+    const included = new Set();
+    const orderedIncluded = [];
+
+    function includeTransitively(depNode) {
+      if (included.has(depNode)) return;
+      included.add(depNode);
+      orderedIncluded.push(depNode);
+
+      if (depNode.type === 'ServerReactiveDecl' && watchesByVarName.has(depNode.name)) {
+        for (const w of watchesByVarName.get(depNode.name)) {
+          if (included.has(w)) continue;
+          included.add(w);
+          orderedIncluded.push(w);
+          scanAndInclude(w);
+        }
+      }
+      scanAndInclude(depNode);
+    }
+
+    function scanAndInclude(depNode) {
+      const code = getCodeText(depNode);
+      if (!code) return;
+      for (const [candidateName, candidateNode] of byName) {
+        if (candidateNode === depNode) continue;
+        if (referencesIdentifierLoosely(code, candidateName)) {
+          includeTransitively(candidateNode);
+        }
+      }
+    }
+
     for (const wanted of node.names) {
       const found = byName.get(wanted);
       if (!found) {
@@ -163,8 +265,10 @@ function resolveImports(body, filePath, resolving) {
           `Línea ${node.line}: "${wanted}" no existe en "${node.source}". Disponibles ahí: ${disponibles}.`
         );
       }
-      result.push(found);
+      includeTransitively(found);
     }
+
+    result.push(...orderedIncluded);
   }
   return result;
 }
@@ -205,28 +309,59 @@ function parseVarDecl(lines, i) {
   };
 }
 
-// post function NOMBRE(args)
+// post/put/delete function NOMBRE(args)
 //     cuerpo...
-// SOLO corre en el servidor, disparado por un POST a la URL de la propia ruta (no al
-// endpoint .server-data.json, que es de updateServer). Dentro del cuerpo, las
-// server reactive/var del mismo archivo se leen/escriben directamente, sin prefijo.
-function parsePostFunction(lines, i) {
-  const header = lines[i].text.trim().match(/^post\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/);
-  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "post function NOMBRE(args)"`);
+// SOLO corre en el servidor, disparado por una petición HTTP con el verbo
+// correspondiente (POST/PUT/DELETE) a la URL de la propia ruta. Dentro del cuerpo,
+// las server var del mismo archivo se leen/escriben directamente, sin prefijo.
+// Puede haber una de CADA verbo por archivo (post + put + delete a la vez, cada una
+// disparada por su propio verbo en la misma URL).
+function parseHttpMethodFunction(lines, i, keyword, nodeType) {
+  const re = new RegExp(`^${keyword}\\s+function\\s+([A-Za-z_$][\\w$]*)\\s*\\(\\s*([^)]*)\\)\\s*$`);
+  const header = lines[i].text.trim().match(re);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${keyword} function NOMBRE(args)"`);
   const [, name, params] = header;
   const baseIndent = lines[i].indent;
 
-  let j = i + 1;
-  const bodyLines = [];
-  while (j < lines.length) {
-    if (isBlank(lines[j])) { j++; continue; }
-    if (lines[j].indent <= baseIndent) break;
-    bodyLines.push(lines[j].text.trim());
-    j++;
-  }
+  const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
 
   return {
-    node: { type: 'PostFunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
+    node: { type: nodeType, name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
+    next: j,
+  };
+}
+
+function parsePostFunction(lines, i) {
+  return parseHttpMethodFunction(lines, i, 'post', 'PostFunctionDecl');
+}
+function parsePutFunction(lines, i) {
+  return parseHttpMethodFunction(lines, i, 'put', 'PutFunctionDecl');
+}
+function parseDeleteFunction(lines, i) {
+  return parseHttpMethodFunction(lines, i, 'delete', 'DeleteFunctionDecl');
+}
+function parseGetFunction(lines, i) {
+  return parseHttpMethodFunction(lines, i, 'get', 'GetFunctionDecl');
+}
+
+// function NOMBRE(params)
+//     cuerpo...
+// Helper de CLIENTE con cuerpo en varias líneas -- lo que "var NOMBRE = (params) => valor"
+// no puede dar, porque el valor de un "var" tiene que caber en una sola línea. Es el
+// equivalente cliente de "server function": mismo cuerpo indentado, misma idea, pero
+// compila a bundle.js en vez de server.js. Puede llamarse desde cualquier handler o
+// desde el valor inicial de otra reactive/var (las funciones en JS quedan "hoisted",
+// así que el orden de declaración no importa).
+function parseFunctionDecl(lines, i) {
+  const header = lines[i].text.trim().match(/^function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "function NOMBRE(params)"`);
+  const [, name, params] = header;
+  const baseIndent = lines[i].indent;
+
+  const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
+
+  return {
+    node: { type: 'FunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
     next: j,
   };
 }
@@ -244,14 +379,7 @@ function parseServerFunction(lines, i) {
   const [, name, params] = header;
   const baseIndent = lines[i].indent;
 
-  let j = i + 1;
-  const bodyLines = [];
-  while (j < lines.length) {
-    if (isBlank(lines[j])) { j++; continue; }
-    if (lines[j].indent <= baseIndent) break;
-    bodyLines.push(lines[j].text.trim());
-    j++;
-  }
+  const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
 
   return {
     node: { type: 'ServerFunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
@@ -263,21 +391,29 @@ function parseServerFunction(lines, i) {
 // SOLO existe en el servidor: nunca se compila a bundle.js, y no puede referenciarse
 // desde ningún "visual" (eso se valida aparte, en validate.js). El valor inicial es
 // opcional -- sin "= valor" arranca en undefined, igual que un "let" normal de JS.
-// (Existió "server reactive" como variante, pero se comportaba exactamente igual que
-// "server var" -- sin push en tiempo real de por medio la distinción no significaba nada,
-// así que se quitó. Si algún día hay WebSocket/push real, puede volver con semántica propia.)
+//
+// server reactive NAME [= EXPR]
+// Igual que "server var", pero ADEMÁS puede observarse con watch(NOMBRE) -- ver más
+// abajo. (Existió antes como sinónimo puro de "server var", sin ninguna diferencia de
+// comportamiento, y se quitó por eso. Ahora watch() le da un propósito real: solo las
+// declaradas "reactive" pueden observarse.)
 function parseServerDecl(lines, i) {
   const t = lines[i].text.trim();
-  const reactiveAttempt = t.match(/^server\s+reactive\s+([A-Za-z_$][\w$]*)/);
-  if (reactiveAttempt) {
-    throw new SyntaxError(
-      `Línea ${lines[i].num}: "server reactive" ya no existe -- usa "server var ${reactiveAttempt[1]}" ` +
-      `en su lugar. Se comportaban exactamente igual (ambas persisten mientras el proceso Node esté vivo), ` +
-      `así que se unificó en un solo nombre.`
-    );
+  const reactiveMatch = t.match(/^server\s+reactive\s+([A-Za-z_$][\w$]*)\s*(?:=\s*(.+))?$/);
+  if (reactiveMatch) {
+    const [, name, init] = reactiveMatch;
+    return {
+      node: {
+        type: 'ServerReactiveDecl',
+        name,
+        init: init ? init.trim() : 'undefined',
+        line: lines[i].num,
+      },
+      next: i + 1,
+    };
   }
   const m = t.match(/^server\s+var\s+([A-Za-z_$][\w$]*)\s*(?:=\s*(.+))?$/);
-  if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "server var NOMBRE" (con o sin "= valor")`);
+  if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "server var NOMBRE" o "server reactive NOMBRE" (con o sin "= valor")`);
   const [, name, init] = m;
   return {
     node: {
@@ -287,6 +423,27 @@ function parseServerDecl(lines, i) {
       line: lines[i].num,
     },
     next: i + 1,
+  };
+}
+
+// watch(NOMBRE)
+//     cuerpo...
+// Corre en el SERVIDOR cuando "NOMBRE" (una "server reactive") cambia de valor -- NUNCA
+// con el valor inicial, solo en cambios POSTERIORES (a diferencia de un "effect" del
+// cliente, que sí corre inmediatamente al registrarse). Se dispara sin importar cuál
+// get/post/put/delete function fue la que cambió la variable -- se declara una vez, a
+// nivel de archivo, y aplica a todas.
+function parseWatch(lines, i) {
+  const header = lines[i].text.trim().match(/^watch\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*$/);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "watch(NOMBRE)"`);
+  const [, name] = header;
+  const baseIndent = lines[i].indent;
+
+  const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
+
+  return {
+    node: { type: 'WatchDecl', name, body: bodyLines.join('\n'), line: lines[i].num },
+    next: j,
   };
 }
 
@@ -402,7 +559,7 @@ function parseRender(lines, i) {
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
-  return { node: { type: 'RenderCall', args }, next: j };
+  return { node: { type: 'RenderCall', args, line: lines[i].num }, next: j };
 }
 
 module.exports = { parseProgram };

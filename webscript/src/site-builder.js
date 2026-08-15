@@ -59,18 +59,75 @@ function discoverRoutes(srcDir) {
 // Compila una lista de rutas ya descubiertas (o construidas a mano, ver
 // buildSingleFileAsSite) a `outDir`. Es el paso común entre "site" (varias rutas,
 // descubiertas escaneando un directorio) y un solo archivo servido en "/".
+// Cuenta cuántos parámetros declara una función (post/put/delete/get) -- determina
+// cuánto contexto extra recibe además del primero (body o query según el verbo):
+// 1 = solo lo básico, 2 = +query (o +headers en get), 3 = +headers.
+function countParams(paramsStr) {
+  const trimmed = (paramsStr || '').trim();
+  if (trimmed === '') return 0;
+  return trimmed.split(',').map(s => s.trim()).filter(Boolean).length;
+}
+
 function compileRoutes(routes, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
 
   const table = [];
   for (const r of routes) {
+    const hasRender = r.ast.body.some(n => n.type === 'RenderCall');
+    const dynamic = usesServerData(r.ast);
+    const serverDataUrl = dynamic ? `/${r.baseName}.server-data.json` : null;
+    const postFnNode = r.ast.body.find(n => n.type === 'PostFunctionDecl') || null;
+    const putFnNode = r.ast.body.find(n => n.type === 'PutFunctionDecl') || null;
+    const deleteFnNode = r.ast.body.find(n => n.type === 'DeleteFunctionDecl') || null;
+    const getFnNode = r.ast.body.find(n => n.type === 'GetFunctionDecl') || null;
+    const httpFnNames = {
+      postFnName: postFnNode ? postFnNode.name : null,
+      postFnParamCount: postFnNode ? countParams(postFnNode.params) : 0,
+      putFnName: putFnNode ? putFnNode.name : null,
+      putFnParamCount: putFnNode ? countParams(putFnNode.params) : 0,
+      deleteFnName: deleteFnNode ? deleteFnNode.name : null,
+      deleteFnParamCount: deleteFnNode ? countParams(deleteFnNode.params) : 0,
+      getFnName: getFnNode ? getFnNode.name : null,
+      getFnParamCount: getFnNode ? countParams(getFnNode.params) : 0,
+    };
+
+    // Ruta "solo backend": sin render(), no hay página que servir -- ni HTML, ni CSS,
+    // ni bundle.js. Se compila SOLO server.js (si hay algo de servidor), y la propia
+    // URL de la ruta pasa a comportarse como un endpoint JSON: GET devuelve el estado
+    // actual de sus "server var" (si tiene), POST/PUT/DELETE disparan la función del
+    // verbo correspondiente (si tiene).
+    if (!hasRender) {
+      const { server } = compile(r.ast, {
+        cssFilename: `${r.baseName}.css`, jsFilename: `${r.baseName}.bundle.js`,
+        serverDataUrl, routePath: r.routePath,
+      });
+      const serverFilename = `${r.baseName}.server.js`;
+      if (server) {
+        const serverPath = path.join(outDir, serverFilename);
+        fs.mkdirSync(path.dirname(serverPath), { recursive: true });
+        fs.writeFileSync(serverPath, server);
+      }
+
+      table.push({
+        route: r.routePath,
+        file: r.file,
+        html: null,
+        apiOnly: true,
+        hasServer: !!server,
+        dynamic,
+        serverDataUrl,
+        baseName: r.baseName,
+        ...httpFnNames,
+        ssgApplied: false,
+        ast: r.ast,
+      });
+      continue;
+    }
+
     const cssFilename = `${r.baseName}.css`;
     const jsFilename = `${r.baseName}.bundle.js`;
     const htmlFilename = `${r.baseName}.html`;
     const serverFilename = `${r.baseName}.server.js`;
-    const dynamic = usesServerData(r.ast);
-    const serverDataUrl = dynamic ? `/${r.baseName}.server-data.json` : null;
-    const postFnNode = r.ast.body.find(n => n.type === 'PostFunctionDecl') || null;
 
     const { html, css, js, server } = compile(r.ast, {
       cssFilename, jsFilename, serverDataUrl, routePath: r.routePath,
@@ -101,11 +158,12 @@ function compileRoutes(routes, outDir) {
       route: r.routePath,
       file: r.file,
       html: htmlFilename,
+      apiOnly: false,
       hasServer: !!server,
       dynamic,
       serverDataUrl,
       baseName: r.baseName,
-      postFnName: postFnNode ? postFnNode.name : null,
+      ...httpFnNames,
       ssgApplied,
       ast: r.ast,
     });
@@ -149,6 +207,15 @@ function startServer(table, outDir, port) {
   const rawModules = new Map(); // baseName -> require(<baseName>.server.js) (tiene createSessionState)
   const sessionStates = new Map(); // baseName -> Map<sessionId, instancia de createSessionState()>
   const MIME = { '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript', '.json': 'application/json' };
+
+  // Extrae query string y cabeceras de una petición, para las funciones
+  // get/post/put/delete que declaren más de un parámetro (ver README).
+  function extractQueryAndHeaders(req) {
+    const queryString = req.url.includes('?') ? req.url.split('?')[1] : '';
+    const query = {};
+    for (const [k, v] of new URLSearchParams(queryString)) query[k] = v;
+    return { query, headers: { ...req.headers } };
+  }
 
   function getRawModule(baseName) {
     // baseName SIEMPRE debe corresponder a una ruta conocida y compilada -- nunca se
@@ -196,7 +263,7 @@ function startServer(table, outDir, port) {
     return sid;
   }
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const urlPath = decodeURIComponent(req.url.split('?')[0]);
     const sessionId = ensureSession(req, res);
 
@@ -221,28 +288,12 @@ function startServer(table, outDir, port) {
         return;
       }
 
+      // Este endpoint es SOLO de lectura -- el "updateServer" que aceptaba POST aquí se
+      // unificó con "post function" (ver README). Escribir se hace vía POST a la URL
+      // de la propia ruta, despachado más abajo, nunca aquí.
       if (req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => { body += chunk; });
-        req.on('end', () => {
-          let updates;
-          try {
-            updates = JSON.parse(body || '{}');
-          } catch (e) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'JSON inválido en el body' }));
-            return;
-          }
-          for (const key of Object.keys(updates)) {
-            if (Object.prototype.hasOwnProperty.call(state, key)) {
-              state[key] = updates[key];
-            }
-          }
-          const data = {};
-          for (const key of Object.keys(state)) data[key] = state[key];
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(data));
-        });
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Este endpoint es solo de lectura -- usa una "post function" para escribir' }));
         return;
       }
 
@@ -255,15 +306,19 @@ function startServer(table, outDir, port) {
 
     const route = table.find(r => r.route === urlPath || (urlPath === '/' && r.route === '/'));
     if (route) {
-      if (req.method === 'POST') {
-        if (!route.postFnName) {
+      const VERB_TO_FN_NAME = { POST: 'postFnName', PUT: 'putFnName', DELETE: 'deleteFnName' };
+      const VERB_TO_PARAM_COUNT = { POST: 'postFnParamCount', PUT: 'putFnParamCount', DELETE: 'deleteFnParamCount' };
+      if (Object.prototype.hasOwnProperty.call(VERB_TO_FN_NAME, req.method)) {
+        const fnName = route[VERB_TO_FN_NAME[req.method]];
+        if (!fnName) {
           res.writeHead(405, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `"${route.route}" no tiene ninguna "post function" definida` }));
+          res.end(JSON.stringify({ error: `"${route.route}" no tiene ninguna función definida para ${req.method}` }));
           return;
         }
+        const paramCount = route[VERB_TO_PARAM_COUNT[req.method]] || 1;
         let body = '';
         req.on('data', chunk => { body += chunk; });
-        req.on('end', () => {
+        req.on('end', async () => {
           let args;
           try {
             args = JSON.parse(body || '{}');
@@ -284,7 +339,12 @@ function startServer(table, outDir, port) {
             return;
           }
           try {
-            const result = state[route.postFnName](args);
+            // 1 parámetro = solo el body (como siempre); 2 = +query string; 3 = +headers.
+            // "await" porque las funciones ahora son async (pueden llamar a fetch/http.*
+            // a otros sistemas y esperar su respuesta antes de devolver la suya).
+            const { query, headers } = extractQueryAndHeaders(req);
+            const callArgs = [args, query, headers].slice(0, paramCount);
+            const result = await state[fnName](...callArgs);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(result === undefined ? null : result));
           } catch (err) {
@@ -294,6 +354,59 @@ function startServer(table, outDir, port) {
         });
         return;
       }
+
+      // GET en una ruta "solo backend" (sin render()): no hay página que servir --
+      // la propia URL responde como un endpoint de datos, igual que
+      // /<ruta>.server-data.json pero en la URL "natural" de la ruta.
+      if (route.apiOnly) {
+        // "get function", si existe, sustituye el volcado por defecto de las server
+        // var -- útil para calcular algo en vez de solo exponer el estado tal cual.
+        // Su primer parámetro es la QUERY STRING (?a=1&b=2), no un body -- un GET no
+        // lleva cuerpo por convención, y fetch() con GET tampoco permite mandarlo.
+        // Con 2 parámetros, el segundo son las cabeceras de la petición.
+        if (route.getFnName) {
+          const { query, headers } = extractQueryAndHeaders(req);
+          const callArgs = [query, headers].slice(0, route.getFnParamCount || 1);
+
+          let state;
+          try {
+            state = getSessionState(route.baseName, sessionId);
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Error interno cargando el servidor de "${route.route}": ${err.message}` }));
+            return;
+          }
+          try {
+            const result = await state[route.getFnName](...callArgs);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result === undefined ? null : result));
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (!route.hasServer) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({}));
+          return;
+        }
+        let state;
+        try {
+          state = getSessionState(route.baseName, sessionId);
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Error interno cargando el servidor de "${route.route}": ${err.message}` }));
+          return;
+        }
+        const data = {};
+        for (const key of Object.keys(state)) data[key] = state[key];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(data));
+        return;
+      }
+
       res.writeHead(200, { 'Content-Type': 'text/html' });
       const shellHtml = fs.readFileSync(path.join(outDir, route.html), 'utf8');
       if (route.dynamic) {
@@ -341,8 +454,12 @@ function startServer(table, outDir, port) {
     console.log(`Servidor en http://localhost:${port}`);
     table.forEach(r => {
       const tags = [];
+      if (r.apiOnly) tags.push('solo backend, sin página');
       if (r.dynamic) tags.push(`GET dinámico -> ${r.serverDataUrl}`);
+      if (r.getFnName) tags.push(`GET -> ${r.getFnName}(...)`);
       if (r.postFnName) tags.push(`POST -> ${r.postFnName}(...)`);
+      if (r.putFnName) tags.push(`PUT -> ${r.putFnName}(...)`);
+      if (r.deleteFnName) tags.push(`DELETE -> ${r.deleteFnName}(...)`);
       console.log(`  ${r.route}  ${tags.length ? '(' + tags.join(', ') + ')' : '(estática)'}`);
     });
   });
