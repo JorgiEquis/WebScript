@@ -5,8 +5,10 @@
   "fileTypes": ["ws"],
   "patterns": [
     { "include": "#comments" },
+    { "include": "#watch-decl" },
     { "include": "#declarations" },
     { "include": "#route-render" },
+    { "include": "#for-header" },
     { "include": "#control-flow" },
     { "include": "#import-from" },
     { "include": "#bindings" },
@@ -28,16 +30,17 @@
     "declarations": {
       "patterns": [
         {
-          "comment": "reactive NOMBRE / var NOMBRE (locales o globales)",
-          "match": "^\\s*(reactive|var)\\s+([A-Za-z_$][\\w$]*)",
+          "comment": "reactive/var [tipo] NOMBRE (locales o globales) -- el tipo (string/number/boolean) es opcional",
+          "match": "^\\s*(reactive|var)\\s+(?:(string|number|boolean)\\s+)?([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.type.webscript" },
-            "2": { "name": "variable.other.webscript" }
+            "2": { "name": "support.type.webscript" },
+            "3": { "name": "variable.other.webscript" }
           }
         },
         {
-          "comment": "server var NOMBRE / server function NOMBRE(...)",
-          "match": "^\\s*(server)\\s+(var|function)\\s+([A-Za-z_$][\\w$]*)",
+          "comment": "async function NOMBRE(...) -- helper de CLIENTE async, puede usar await dentro",
+          "match": "^\\s*(async)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.modifier.webscript" },
             "2": { "name": "storage.type.webscript" },
@@ -45,8 +48,35 @@
           }
         },
         {
-          "comment": "post function NOMBRE(...)",
-          "match": "^\\s*(post)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
+          "comment": "function NOMBRE(...) -- helper de CLIENTE, sin prefijo, cuerpo en varias líneas",
+          "match": "^\\s*(function)\\s+([A-Za-z_$][\\w$]*)",
+          "captures": {
+            "1": { "name": "storage.type.webscript" },
+            "2": { "name": "entity.name.function.webscript" }
+          }
+        },
+        {
+          "comment": "async server function NOMBRE(...) -- puede usar await dentro (http.*, fetch, dependencias async de Node)",
+          "match": "^\\s*(async)\\s+(server)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.webscript" },
+            "2": { "name": "storage.modifier.webscript" },
+            "3": { "name": "storage.type.webscript" },
+            "4": { "name": "entity.name.function.webscript" }
+          }
+        },
+        {
+          "comment": "server var / server reactive / server function NOMBRE",
+          "match": "^\\s*(server)\\s+(var|reactive|function)\\s+([A-Za-z_$][\\w$]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.webscript" },
+            "2": { "name": "storage.type.webscript" },
+            "3": { "name": "entity.name.function.webscript" }
+          }
+        },
+        {
+          "comment": "get/post/put/delete function NOMBRE(...) -- las cuatro funciones HTTP",
+          "match": "^\\s*(get|post|put|delete)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.modifier.webscript" },
             "2": { "name": "storage.type.webscript" },
@@ -65,6 +95,21 @@
       ]
     },
 
+    "watch-decl": {
+      "patterns": [
+        {
+          "comment": "watch(NOMBRE) -- observa una server reactive, corre solo en cambios posteriores",
+          "match": "^\\s*(watch)\\s*(\\()\\s*([A-Za-z_$][\\w$]*)\\s*(\\))",
+          "captures": {
+            "1": { "name": "keyword.control.webscript" },
+            "2": { "name": "punctuation.webscript" },
+            "3": { "name": "variable.other.webscript" },
+            "4": { "name": "punctuation.webscript" }
+          }
+        }
+      ]
+    },
+
     "route-render": {
       "patterns": [
         {
@@ -74,19 +119,28 @@
       ]
     },
 
+    "for-header": {
+      "patterns": [
+        {
+          "comment": "for (item in lista [by clave]) -- \"by\" es opcional, activa el diffing por clave",
+          "match": "^\\s*(for)\\s*(\\()\\s*([A-Za-z_$][\\w$]*)\\s+(in)\\s+([^)]*?)(?:\\s+(by)\\s+([^)]*?))?\\s*(\\))",
+          "captures": {
+            "1": { "name": "keyword.control.loop.webscript" },
+            "2": { "name": "punctuation.webscript" },
+            "3": { "name": "variable.other.webscript" },
+            "4": { "name": "keyword.operator.wordlike.webscript" },
+            "6": { "name": "keyword.operator.wordlike.webscript" },
+            "8": { "name": "punctuation.webscript" }
+          }
+        }
+      ]
+    },
+
     "control-flow": {
       "patterns": [
         {
           "name": "keyword.control.conditional.webscript",
           "match": "^\\s*\\b(if|else\\s+if|else)\\b"
-        },
-        {
-          "name": "keyword.control.loop.webscript",
-          "match": "^\\s*\\b(for)\\b"
-        },
-        {
-          "name": "keyword.operator.wordlike.webscript",
-          "match": "(?<=\\bfor\\s*\\([^)]*\\s)(in)(?=\\s)"
         }
       ]
     },
@@ -164,11 +218,11 @@
         { "include": "#numbers" },
         {
           "name": "keyword.other.webscript",
-          "match": "\\b(props|state|server|await|true|false|null|undefined|this)\\b"
+          "match": "\\b(props|state|server|http|whisper|await|true|false|null|undefined|this)\\b"
         },
         {
           "name": "keyword.control.webscript",
-          "match": "\\b(if|else|for|in|return|function)\\b"
+          "match": "\\b(if|else|for|in|by|return|function)\\b"
         },
         {
           "name": "entity.name.function.webscript",

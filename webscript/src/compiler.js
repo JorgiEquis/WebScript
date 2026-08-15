@@ -129,10 +129,14 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
   for (const fn of serverFunctions) {
     inner.push(
       '',
-      `  // server function -- NO se expone al cliente ni tiene endpoint propio. Síncrona`,
-      `  // (no puede usar "await" dentro) -- si necesitas llamar a otro sistema, hazlo`,
-      `  // directamente en una get/post/put/delete function, que sí es async.`,
-      `  function ${fn.name}(${fn.params}) {`,
+      fn.isAsync
+        ? `  // server function ASYNC -- puede usar "await" dentro (fetch/http.*/otra dependencia`
+        : `  // server function -- NO se expone al cliente ni tiene endpoint propio. Síncrona`,
+      fn.isAsync
+        ? `  // asíncrona de Node). Quien la llame debe usar "await" también, o recibirá una`
+        : `  // (no puede usar "await" dentro) -- si necesitas eso, declárala "async server function".`,
+      fn.isAsync ? `  // Promise en vez del valor real.` : `  // No se expone al cliente ni tiene endpoint propio.`,
+      `  ${fn.isAsync ? 'async ' : ''}function ${fn.name}(${fn.params}) {`,
       ...substituteReactiveRefs(fn.body).split('\n').map(l => `    ${l}`),
       `  }`
     );
@@ -154,8 +158,10 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '',
       `  // watch(${w.name}) -- corre SOLO en cambios posteriores de "${w.name}", nunca con`,
       `  // el valor inicial. Se dispara sin importar cuál get/post/put/delete function fue`,
-      `  // la que cambió la variable.`,
-      `  __watchers.${w.name}.push(() => {`,
+      `  // la que cambió la variable. Siempre async (puede usar "await" dentro sin necesitar`,
+      `  // ningún prefijo especial) -- nada captura su valor de retorno, así que hacerla`,
+      `  // async no rompe ningún patrón existente, a diferencia de "function"/"server function".`,
+      `  __watchers.${w.name}.push(async () => {`,
       ...substituteReactiveRefs(w.body).split('\n').map(l => `    ${l}`),
       `  });`
     );
@@ -791,7 +797,7 @@ function compileJS(reactives, globalVars, functions, visuals, renderCall, global
   // "hoisted" -- se puede llamar desde cualquier sitio del bundle, sin importar el
   // orden de declaración, igual que ya pasa con "server function" en server.js.
   const functionLines = functions
-    .map(fn => `function ${fn.name}(${fn.params}) {\n${transform(fn.body, { localNames: [] }).split('\n').map(l => '  ' + l).join('\n')}\n}`)
+    .map(fn => `${fn.isAsync ? 'async ' : ''}function ${fn.name}(${fn.params}) {\n${transform(fn.body, { localNames: [] }).split('\n').map(l => '  ' + l).join('\n')}\n}`)
     .join('\n\n');
 
   // ¿Se llama a cada función (post/put/delete) desde algún handler? Si nadie la usa,

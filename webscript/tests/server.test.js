@@ -240,6 +240,7 @@ visual app =
 
 post function llamada(args)
     app = <div>adios</div>
+    return {}
 
 render(
     app
@@ -1113,5 +1114,190 @@ watch(x)
     const ast = parseSource(src);
     const { server } = compile(ast, { routePath: '/' });
     assert.match(server, /if \(__serverReactive\.x > 0\)\n\s{8}whisper\("positivo"\)\n\s{4}else\n\s{8}whisper\("no positivo"\)/);
+  });
+});
+
+describe('validate: watch() anidado dentro de otro bloque es redundante y roto -- rechazado', () => {
+  const { parseSource } = require('./helpers/compile-helper');
+
+  test('watch() dentro de server function -- rechazado', () => {
+    const src = `server reactive var1 = 0
+
+server function foo()
+    watch(var1)
+        whisper("cambio")
+
+post function usar(args)
+    foo()
+    var1 = 1
+    return { ok: true }
+`;
+    assert.throws(() => parseSource(src), /"server function foo" contiene "watch\(\.\.\.\)"/);
+  });
+
+  test('watch() dentro de un if, dentro de una post function -- rechazado', () => {
+    const src = `server reactive var1 = 0
+
+post function usar(args)
+    if (args.activar)
+        watch(var1)
+            whisper("nested")
+    var1 = 1
+    return { ok: true }
+`;
+    assert.throws(() => parseSource(src), /"post function usar" contiene "watch\(\.\.\.\)"/);
+  });
+
+  test('watch() dentro de otro watch() -- rechazado, con el mensaje "watch(NOMBRE)" correcto', () => {
+    const src = `server reactive a = 0
+server reactive b = 0
+
+watch(a)
+    watch(b)
+        whisper("no debería llegar aquí")
+`;
+    assert.throws(() => parseSource(src), /"watch\(a\)" contiene "watch\(\.\.\.\)"/);
+  });
+
+  test('watch() legítimo a nivel superior, con if/for DENTRO de su propio cuerpo (sin watch anidado) -- sigue permitido', () => {
+    const src = `server reactive contador = 0
+server var mensajes = []
+
+watch(contador)
+    if (contador % 2 == 0)
+        mensajes = [...mensajes, "par"]
+    else
+        mensajes = [...mensajes, "impar"]
+
+post function incrementar(args)
+    contador = contador + 1
+    return { mensajes: mensajes }
+`;
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('regresión: WatchDecl no debe colarse en la detección de colisión de nombres', () => {
+    // Bug real que salió al añadir "WatchDecl" a LABELS para el mensaje de error de
+    // arriba -- globalDecls usaba "LABELS[n.type]" como filtro, y WatchDecl se coló
+    // ahí sin querer, dando un falso "Nombre duplicado" contra la propia variable que
+    // observa.
+    const src = `server reactive var1 = 0
+
+watch(var1)
+    whisper("cambio")
+
+post function usar(args)
+    var1 = 1
+    return { ok: true }
+`;
+    assert.doesNotThrow(() => parseSource(src));
+  });
+});
+
+describe('async opcional en function/server function; watch() siempre async (ejecución real)', () => {
+  function withExternalSystem(handler, testFn) {
+    return async (base) => {
+      const http2 = require('http');
+      const externo = http2.createServer(handler);
+      await new Promise(resolve => externo.listen(0, resolve));
+      const externalPort = externo.address().port;
+      try {
+        await testFn(base, `http://localhost:${externalPort}`);
+      } finally {
+        externo.close();
+      }
+    };
+  }
+
+  test('async server function puede usar await http.* de verdad, llamada con await desde post function', withServer(
+    {
+      'api.ws': `route("/api/x")
+
+async server function llamarFuera(url)
+    var r = await http.get(url, {})
+    return r
+
+post function usar(args)
+    var datos = await llamarFuera(args.url)
+    return { recibido: datos }
+`,
+    },
+    withExternalSystem(
+      (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ mensaje: 'hola desde fuera' }));
+      },
+      async (base, externalBase) => {
+        const r = await fetch(`${base}/api/x`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: `${externalBase}/x` }),
+        });
+        assert.deepEqual(await r.json(), { recibido: { mensaje: 'hola desde fuera' } });
+      }
+    )
+  ));
+
+  test('server function SIN async sigue funcionando sin await, esperando el valor directo (retrocompatibilidad)', withServer(
+    {
+      'api.ws': `route("/api/x")
+
+server var contador = 0
+
+server function duplicar(x)
+    return x * 2
+
+post function incrementar(args)
+    contador = contador + 1
+    return { contador: contador, doble: duplicar(contador) }
+`,
+    },
+    async (base) => {
+      const r = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      assert.deepEqual(await r.json(), { contador: 1, doble: 2 }, 'duplicar(contador) sin await debe seguir dando el número directo, no una Promise');
+    }
+  ));
+
+  test('watch() ahora siempre async, sin necesitar ningún prefijo -- await http.* funciona dentro', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    const { compile } = require('../src/compiler');
+    const src = `server reactive var1 = 0
+
+watch(var1)
+    await http.post("http://ejemplo.com", {}, {})
+`;
+    const ast = parseSource(src);
+    const { server } = compile(ast, { routePath: '/' });
+    assert.match(server, /__watchers\.var1\.push\(async \(\) => \{/);
+  });
+});
+
+describe('validate: las cuatro funciones HTTP deben devolver siempre algo', () => {
+  const { parseSource } = require('./helpers/compile-helper');
+
+  test('post function sin ningún return -- rechazada', () => {
+    const src = 'route("/api/x")\n\nserver var contador = 0\n\npost function incrementar(args)\n    contador = contador + 1';
+    assert.throws(() => parseSource(src), /no tiene ningún "return"/);
+  });
+
+  test('put/delete/get function sin return también rechazadas (las cuatro, no solo post)', () => {
+    assert.throws(() => parseSource('route("/x")\n\nput function f(args)\n    var x = 1'), /no tiene ningún "return"/);
+    assert.throws(() => parseSource('route("/x")\n\ndelete function f(args)\n    var x = 1'), /no tiene ningún "return"/);
+    assert.throws(() => parseSource('route("/x")\n\nget function f(query)\n    var x = 1'), /no tiene ningún "return"/);
+  });
+
+  test('return sin ningún valor (bare return) -- también rechazado', () => {
+    const src = 'route("/api/x")\n\nserver var contador = 0\n\npost function incrementar(args)\n    contador = contador + 1\n    return';
+    assert.throws(() => parseSource(src), /"return" sin ningún valor/);
+  });
+
+  test('return normal, return null, return {} -- los tres permitidos', () => {
+    assert.doesNotThrow(() => parseSource('route("/a")\n\npost function f(args)\n    return { ok: true }'));
+    assert.doesNotThrow(() => parseSource('route("/b")\n\npost function f(args)\n    return null'));
+    assert.doesNotThrow(() => parseSource('route("/c")\n\npost function f(args)\n    return {}'));
+  });
+
+  test('return dentro de un if/else (ambas ramas devuelven) -- permitido', () => {
+    const src = 'route("/d")\n\npost function f(args)\n    if (args.x > 0)\n        return { positivo: true }\n    else\n        return { positivo: false }';
+    assert.doesNotThrow(() => parseSource(src));
   });
 });

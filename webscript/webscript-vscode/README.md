@@ -6,9 +6,12 @@ Resaltado de sintaxis, snippets y ayuda contextual (hover) para archivos
 ## Qué incluye
 
 - **Resaltado de sintaxis** (`syntaxes/webscript.tmLanguage.json`):
-  - Palabras clave: `route`, `reactive`, `var`, `style`, `visual`, `render`,
-    `server var`, `server function`, `post function`, `import`/`from`,
-    `if`/`else`/`else if`, `for`/`in`.
+  - Palabras clave: `route`, `reactive`, `var`, `function`, `style`,
+    `visual`, `render`, `server var`, `server reactive`,
+    `server function`, `watch`, `get`/`post`/`put`/`delete function`,
+    `http`, `whisper`, `import`/`from`, `if`/`else`/`else if`, `for`/`in`/`by`.
+  - Anotaciones de tipo opcionales (`reactive number x`/`var string y`)
+    resaltadas aparte.
   - Nombres de declaración resaltados como funciones/variables
     (`visual NOMBRE`, `reactive NOMBRE`, etc).
   - Tags HTML (`<div>`, `<Componente />`) y sus atributos.
@@ -17,15 +20,17 @@ Resaltado de sintaxis, snippets y ayuda contextual (hover) para archivos
   - Bindings `-> style:`, `-> onclick:`, etc, con la clave resaltada aparte
     de la flecha.
   - Comentarios `//` de línea completa.
-  - Cadenas (`"`, `'`, `` ` ``) y números.
+  - Cadenas (`"`, `'`, backtick) y números.
 
-- **Snippets** (`snippets/webscript.json`): escribe `visual`, `for`, `if`,
-  `servervar`, `postfunction`, `import`, etc. y pulsa Tab para expandir la
-  plantilla correspondiente.
+- **Snippets** (`snippets/webscript.json`): escribe `visual`, `for`,
+  `forby`, `if`, `servervar`, `serverreactive`, `watch`, `postfunction`,
+  `getfunction`, `httpget`/`httppost`/`httpput`/`httpdelete`, `whisper`,
+  `import`, etc. y pulsa Tab para expandir la plantilla correspondiente.
 
-- **Hover** (`extension.js`): pasa el ratón por encima de cualquier palabra
-  clave (`route`, `reactive`, `var`, `style`, `visual`, `server`, `post`,
-  `import`, `if`, `for`, `updateServer`...) para ver su firma y una
+- **Hover** (`extension.js`): pasa el ratón por encima de cualquier
+  palabra clave (`route`, `reactive`, `var`, `function`, `style`,
+  `visual`, `server`, `watch`, `get`/`post`/`put`/`delete`, `http`,
+  `whisper`, `import`, `if`, `for`, `by`...) para ver su firma y una
   descripción de qué hace, directamente en el editor.
 
 ## Instalación (modo desarrollo, sin publicar)
@@ -34,10 +39,10 @@ Resaltado de sintaxis, snippets y ayuda contextual (hover) para archivos
 
 ```bash
 # macOS / Linux
-cp -r webscript-vscode ~/.vscode/extensions/webscript-language-0.1.0
+cp -r webscript-vscode ~/.vscode/extensions/webscript-language-0.2.0
 
 # Windows (PowerShell)
-Copy-Item -Recurse webscript-vscode "$env:USERPROFILE\.vscode\extensions\webscript-language-0.1.0"
+Copy-Item -Recurse webscript-vscode "$env:USERPROFILE\.vscode\extensions\webscript-language-0.2.0"
 ```
 
 Reinicia VS Code (o `Developer: Reload Window` desde la paleta de comandos)
@@ -56,7 +61,7 @@ y abre cualquier archivo `.ws`.
 npm install -g @vscode/vsce
 cd webscript-vscode
 vsce package
-code --install-extension webscript-language-0.1.0.vsix
+code --install-extension webscript-language-0.2.0.vsix
 ```
 
 ## Notas
@@ -69,3 +74,6 @@ code --install-extension webscript-language-0.1.0.vsix
   cadenas, números, unas pocas palabras clave y nombres de función), no un
   parser de JS completo — para expresiones muy complejas puede no colorear
   cada pieza con precisión, pero no rompe nada.
+- `updateServer` existió y se quitó (unificado con `post function`) —
+  esta extensión ya no lo menciona en ningún sitio, para no documentar
+  algo que el compilador rechaza.

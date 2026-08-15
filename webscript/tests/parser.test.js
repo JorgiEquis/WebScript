@@ -338,3 +338,19 @@ describe('function (cliente) -- equivalente a server function, cuerpo en varias 
     assert.doesNotThrow(() => parseSource(src));
   });
 });
+
+describe('async opcional en function/server function; watch() siempre async', () => {
+  test('async function se parsea con isAsync=true, function normal con isAsync=false', () => {
+    const ast1 = parseSource('async function llamar(url)\n    var r = await fetch(url)\n    return r');
+    assert.equal(ast1.body[0].isAsync, true);
+    const ast2 = parseSource('function duplicar(x)\n    return x * 2');
+    assert.equal(ast2.body[0].isAsync, false);
+  });
+
+  test('async server function se parsea con isAsync=true, server function normal con isAsync=false', () => {
+    const ast1 = parseSource('async server function consultar()\n    var r = await http.get("x", {})\n    return r');
+    assert.equal(ast1.body[0].isAsync, true);
+    const ast2 = parseSource('server function duplicar(x)\n    return x * 2');
+    assert.equal(ast2.body[0].isAsync, false);
+  });
+});

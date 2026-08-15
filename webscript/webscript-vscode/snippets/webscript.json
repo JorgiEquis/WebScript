@@ -9,10 +9,30 @@
     "body": "reactive ${1:nombre} = ${2:valor}",
     "description": "Variable reactiva: re-renderiza al cambiar"
   },
+  "reactive tipada": {
+    "prefix": "reactivet",
+    "body": "reactive ${1|string,number,boolean|} ${2:nombre} = ${3:valor}",
+    "description": "Reactive con anotación de tipo opcional (comprobada solo si el valor inicial es un literal simple)"
+  },
   "var": {
     "prefix": "var",
     "body": "var ${1:nombre} = ${2:valor}",
     "description": "Variable NO reactiva: se calcula una sola vez"
+  },
+  "var tipada": {
+    "prefix": "vart",
+    "body": "var ${1|string,number,boolean|} ${2:nombre} = ${3:valor}",
+    "description": "Var con anotación de tipo opcional (comprobada solo si el valor inicial es un literal simple)"
+  },
+  "function": {
+    "prefix": "function",
+    "body": "function ${1:nombre}(${2:params})\n    ${3}",
+    "description": "Helper de CLIENTE con cuerpo en varias líneas (a diferencia de var, que solo cabe en una línea)"
+  },
+  "async function": {
+    "prefix": "asyncfunction",
+    "body": "async function ${1:nombre}(${2:params})\n    var r = await ${3:fetch(url)}\n    return r",
+    "description": "Helper de CLIENTE que puede usar await dentro -- quien la llame también necesita await"
   },
   "style": {
     "prefix": "style",
@@ -42,7 +62,12 @@
   "for": {
     "prefix": "for",
     "body": "for (${1:item} in ${2:lista})\n    ${3}",
-    "description": "Bucle sobre una lista"
+    "description": "Bucle sobre una lista (usa el índice como clave -- ver 'forby' si necesitas diffing por clave real)"
+  },
+  "for con clave": {
+    "prefix": "forby",
+    "body": "for (${1:item} in ${2:lista} by ${1:item}.${3:id})\n    ${4}",
+    "description": "Bucle con clave estable -- reutiliza nodos DOM en vez de reconstruir toda la lista"
   },
   "render": {
     "prefix": "render",
@@ -54,24 +79,74 @@
     "body": "server var ${1:nombre} = ${2:valor}",
     "description": "Variable solo de servidor, nunca llega al cliente"
   },
+  "server reactive": {
+    "prefix": "serverreactive",
+    "body": "server reactive ${1:nombre} = ${2:valor}",
+    "description": "Como server var, pero observable con watch(NOMBRE)"
+  },
+  "watch": {
+    "prefix": "watch",
+    "body": "watch(${1:nombre})\n    ${2}",
+    "description": "Corre en el servidor SOLO en cambios posteriores de una server reactive (nunca con el valor inicial)"
+  },
   "server function": {
     "prefix": "serverfunction",
     "body": "server function ${1:nombre}(${2:args})\n    ${3}",
-    "description": "Helper de servidor, invisible al cliente (varias por archivo)"
+    "description": "Helper de servidor síncrono, invisible al cliente (varias por archivo, sin await dentro)"
+  },
+  "async server function": {
+    "prefix": "asyncserverfunction",
+    "body": "async server function ${1:nombre}(${2:args})\n    var r = await ${3:http.get(url, {})}\n    return r",
+    "description": "Helper de servidor que puede usar await dentro (http.*, otra dependencia async de Node) -- quien la llame también necesita await"
+  },
+  "get function": {
+    "prefix": "getfunction",
+    "body": "get function ${1:nombre}(${2:query})\n    ${3}",
+    "description": "Corre en un GET a esta ruta -- SOLO válido en un archivo sin render() (ruta 'solo backend')"
   },
   "post function": {
     "prefix": "postfunction",
-    "body": "post function ${1:postController}(${2:args})\n    ${3}\n    return { ${4:resultado} }",
-    "description": "Endpoint POST de esta ruta (única por archivo, llamable desde el cliente)"
+    "body": "post function ${1:nombre}(${2:args})\n    ${3}\n    return { ${4:resultado} }",
+    "description": "Endpoint POST de esta ruta (llamable desde el cliente, genera su stub automáticamente)"
+  },
+  "put function": {
+    "prefix": "putfunction",
+    "body": "put function ${1:nombre}(${2:args})\n    ${3}\n    return { ${4:resultado} }",
+    "description": "Endpoint PUT de esta ruta"
+  },
+  "delete function": {
+    "prefix": "deletefunction",
+    "body": "delete function ${1:nombre}(${2:args})\n    ${3}\n    return { ${4:resultado} }",
+    "description": "Endpoint DELETE de esta ruta"
+  },
+  "http.get": {
+    "prefix": "httpget",
+    "body": "await http.get(${1:url}, ${2:headers})",
+    "description": "Llama a OTRO sistema por HTTP desde una función de servidor (fuera de esta ruta)"
+  },
+  "http.post": {
+    "prefix": "httppost",
+    "body": "await http.post(${1:url}, ${2:body}, ${3:headers})",
+    "description": "Llama a OTRO sistema por HTTP (POST) desde una función de servidor"
+  },
+  "http.put": {
+    "prefix": "httpput",
+    "body": "await http.put(${1:url}, ${2:body}, ${3:headers})",
+    "description": "Llama a OTRO sistema por HTTP (PUT) desde una función de servidor"
+  },
+  "http.delete": {
+    "prefix": "httpdelete",
+    "body": "await http.delete(${1:url}, ${2:body}, ${3:headers})",
+    "description": "Llama a OTRO sistema por HTTP (DELETE) desde una función de servidor"
+  },
+  "whisper": {
+    "prefix": "whisper",
+    "body": "whisper(${1:mensaje})",
+    "description": "Equivalente a console.log() en el servidor"
   },
   "import": {
     "prefix": "import",
     "body": "import { ${1:nombre} } from \"${2:./archivo.ws}\"",
-    "description": "Importa declaraciones de otro archivo .ws sin route()/render()"
-  },
-  "updateServer": {
-    "prefix": "updateServer",
-    "body": "await updateServer({ ${1:campo}: ${2:valor} })",
-    "description": "Manda datos al servidor (solo rutas dinámicas)"
+    "description": "Importa declaraciones de otro archivo .ws sin route()/render() (trae dependencias transitivas automáticamente)"
   }
 }

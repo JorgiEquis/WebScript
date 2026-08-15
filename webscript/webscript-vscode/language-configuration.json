@@ -21,7 +21,7 @@
     ["`", "`"]
   ],
   "indentationRules": {
-    "increaseIndentPattern": "^\\s*((reactive|var|style|visual|for|if|else( if)?|server( var| function)?|post function)\\b.*=?\\s*|<[A-Za-z][^/]*[^/]>)\\s*$",
+    "increaseIndentPattern": "^\\s*((reactive|var|function|style|visual|for|if|else( if)?|watch|server( var| reactive| function)?|(get|post|put|delete) function)\\b.*=?\\s*|<[A-Za-z][^/]*[^/]>)\\s*$",
     "decreaseIndentPattern": "^\\s*(</[A-Za-z].*>)\\s*$"
   }
 }

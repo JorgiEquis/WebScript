@@ -1899,6 +1899,161 @@ quien use la página. Verificado que la forma correcta
 (`reactive x = server.contador`) sigue compilando sin ningún falso
 positivo, tanto local como importada.
 
+## Las cuatro funciones HTTP deben devolver siempre algo
+
+Comprobé primero si esto era necesario o solo preferencia de estilo:
+**sin ningún `return`, el compilador no revienta hoy** — el despachador
+convierte `undefined` en `null` y responde `200` igualmente. No es un
+*crash*, pero es exactamente el tipo de sorpresa silenciosa que hemos ido
+cerrando en todo este proyecto: el desarrollador se olvida de un
+`return` y el cliente recibe `null`, sin ningún aviso de que faltaba
+algo.
+
+```
+post function incrementar(args)
+    contador = contador + 1
+    // sin return -- el cliente recibía "null", sin saber que faltaba algo
+```
+
+**Arreglado** con una comprobación superficial, no un análisis de flujo
+real: se rechaza si el cuerpo de una `get`/`post`/`put`/`delete function`
+no contiene **ningún** `return` en absoluto, o si tiene un `return` **sin
+valor** (`return;`, que devuelve `undefined` explícitamente — igual de
+silencioso que no tener ninguno). `return null`/`return {}` a propósito
+siguen permitidos, porque ahí sí hay un valor explícito, aunque sea
+"vacío".
+
+**Límite reconocido a propósito**: no detecta el caso más sutil de
+"algunas ramas de un `if` devuelven y otras no" — eso necesitaría
+análisis real de flujo de código, no una heurística de texto. Verificado
+que el caso legítimo (`if`/`else` donde **ambas** ramas sí devuelven)
+compila sin ningún falso positivo.
+
+**Bug lateral que salió al implementar esto**: un test existente
+(`tests/server.test.js`, "resiliencia ante un `server.js` roto")
+verificaba que una `post function` con JS **sintácticamente inválido**
+seguía dando un `500` limpio sin tumbar el proceso — pero esa función de
+prueba nunca tenía `return`, así que la nueva validación la atrapaba en
+**compilación**, antes de llegar al escenario de fallo en **ejecución**
+que el test quería probar. Arreglado añadiendo un `return` al cuerpo roto
+sin quitarle lo que lo hacía inválido como JS (la sintaxis rota sigue
+ahí, delante del `return`) — el test sigue verificando exactamente lo
+mismo que antes, solo que ahora pasa primero por la nueva validación sin
+que esta se interponga.
+
+## `async` opcional en `function`/`server function`; `watch()` siempre `async`
+
+Pregunta que lo motivó: si `http.*` necesita `await`, y `function`/`server
+function`/`watch()` son síncronas por defecto, ¿cómo iban a poder usar
+`http.*`, `fetch`, o una dependencia asíncrona de Node (como el driver de
+`sqlite`)? Confirmado con código real: los tres daban `SyntaxError:
+await is only valid in async functions`.
+
+**No era tan simple como "hacerlas todas `async`"** — ya nos habíamos
+topado con esto exacto al construir `watch()`: hacer `server function`
+siempre `async` rompía un patrón **ya en uso**, llamarla sin `await`
+esperando el valor de vuelta directo (`duplicar(contador)` como número,
+no como una Promise).
+
+**Matiz importante que surgió discutiéndolo**: las cuatro funciones HTTP
+nunca tuvieron este problema porque, desde el principio, quien las llama
+**ya estaba diseñado para esperar un valor async** (el *stub* de cliente
+usa `.then()`, el despachador usa `await`) — el riesgo de romper algo
+solo existe donde ya había una llamada **síncrona** capturando el valor
+directamente. Y ni siquiera ahí aplica siempre: una función **void** (sin
+valor de retorno que le importe a nadie) puede hacerse `async` sin ningún
+riesgo, igual que `watch()`.
+
+**Solución implementada**, con esos dos matices en cuenta:
+
+- **`watch()` pasa a ser siempre `async`**, sin necesitar ningún prefijo
+  — nada captura su valor de retorno, así que no había ningún patrón que
+  romper.
+- **`function`/`server function` ganan un prefijo `async` OPCIONAL**,
+  igual que en JS de verdad — por defecto siguen siendo síncronas
+  (retrocompatibilidad total), y con `async function`/`async server
+  function` delante, pueden usar `await` dentro, a cambio de que quien
+  las llame también necesite `await`.
+
+```
+async function llamarFuera(url)
+    var r = await fetch(url)
+    return r
+
+async server function consultarDB()
+    var fila = await db.get("SELECT * FROM tabla")
+    return fila
+```
+
+Verificado de extremo a extremo con servidor real (contra un "sistema
+externo" simulado, no solo compilación): una `post function` (ya siempre
+`async`) llama con `await` a una `async server function` que a su vez usa
+`await http.get(...)` — la respuesta llega correcta. Y, más importante
+para no repetir el error anterior, verificado que la versión **sin**
+`async` (`server function duplicar(x) { return x * 2 }`, llamada sin
+`await`) **sigue devolviendo el número directo**, no una Promise —
+retrocompatibilidad confirmada con ejecución real, no solo revisando el
+código generado.
+
+## `watch()` anidado dentro de otro bloque: rechazado, redundante y roto a la vez
+
+Pregunta que lo motivó: ¿debería `watch()` poder anidarse dentro de una
+`function`/`if`/`for`? Lo probé en tres sitios distintos antes de decidir
+nada:
+
+```
+server function foo()
+    watch(var1)          // dentro de otra función
+        whisper("cambio")
+
+post function usar(args)
+    if (args.activar)
+        watch(var1)       // dentro de un if
+            whisper("nested")
+```
+
+**Los dos casos compilaban "sin error" y reventaban en producción** con
+`500: "watch is not defined"`. Causa: `watch` solo se reconoce como
+declaración de **nivel superior** del archivo — dentro del cuerpo de
+cualquier función (que se trata como JS "casi crudo"), el texto
+`watch(var1)` no se interpreta como la construcción especial, se
+sustituye `var1` → `__serverReactive.var1` igual que cualquier otra
+referencia, y queda como una llamada normal a una función `watch` que no
+existe en ese ámbito.
+
+**Tercer caso, cualitativamente distinto**: dentro de un `for` de
+**plantilla** (en un `visual`), `watch(item)\n    whisper("x")` ni
+siquiera se interpreta como código — se convierte en **texto literal**
+en la página (`document.createTextNode("watch(item)whisper(\"x\")")`),
+sin ningún aviso.
+
+**Arreglado** para los dos primeros casos (los que de verdad revientan):
+se rechaza en compilación si el cuerpo de cualquier
+`server`/`post`/`put`/`delete`/`get function` — o de otro `watch` —
+contiene `watch(` en su texto. El mensaje explica las dos razones a la
+vez: no funcionaría (no se reconoce ahí, sería un `ReferenceError`), y
+aunque funcionara sería redundante (`watch(NOMBRE)` a nivel de archivo
+ya se dispara sin importar cuál función cambió la variable). Verificado
+con cuatro casos: dentro de una `server function`, dentro de un `if`
+dentro de una `post function`, dentro de otro `watch` (con el mensaje
+mostrando correctamente `"watch(a)"`, no el nombre interno del nodo), y
+confirmando que el patrón **legítimo** (`if`/`for` **dentro** del propio
+cuerpo de un `watch`, sin ningún `watch` anidado ahí dentro) sigue
+funcionando exactamente igual que antes.
+
+**Bug lateral que encontré arreglando el mensaje de error**: para que el
+error dijera `"watch(a)"` en vez de `"WatchDecl a"`, añadí `WatchDecl` al
+diccionario de etiquetas legibles (`LABELS`) — pero ese mismo diccionario
+también se usaba como filtro para decidir qué nodos participan en la
+detección de colisión de nombres (`ast.body.filter(n => LABELS[n.type])`).
+Al añadir `WatchDecl` ahí, se coló también en esa detección, dando un
+falso `"Nombre duplicado"` entre una `server reactive` y su propio
+`watch()` — la misma variable, marcada como si colisionara consigo
+misma. Arreglado usando el conjunto correcto (`SHARED_NAMESPACE`) para
+ese filtro en vez del diccionario de etiquetas, que son dos cosas
+distintas aunque se parecían lo suficiente para confundirlas. Cubierto
+con un test de regresión explícito.
+
 ## Bug real: `var`/`reactive` (cliente) en una ruta "solo backend" eran inertes y silenciosas
 
 Pregunta que lo destapó: en un archivo puramente de servidor (con

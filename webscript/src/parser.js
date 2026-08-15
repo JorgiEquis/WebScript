@@ -98,8 +98,12 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parseGetFunction(lines, i);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('async server function ')) {
+      const r = parseServerFunction(lines, i, true);
+      body.push(r.node);
+      i = r.next;
     } else if (trimmed.startsWith('server function ')) {
-      const r = parseServerFunction(lines, i);
+      const r = parseServerFunction(lines, i, false);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('server ')) {
@@ -118,8 +122,12 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parseVarDecl(lines, i);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('async function ')) {
+      const r = parseFunctionDecl(lines, i, true);
+      body.push(r.node);
+      i = r.next;
     } else if (trimmed.startsWith('function ')) {
-      const r = parseFunctionDecl(lines, i);
+      const r = parseFunctionDecl(lines, i, false);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('style ')) {
@@ -352,16 +360,27 @@ function parseGetFunction(lines, i) {
 // compila a bundle.js en vez de server.js. Puede llamarse desde cualquier handler o
 // desde el valor inicial de otra reactive/var (las funciones en JS quedan "hoisted",
 // así que el orden de declaración no importa).
-function parseFunctionDecl(lines, i) {
-  const header = lines[i].text.trim().match(/^function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/);
-  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "function NOMBRE(params)"`);
+// function NOMBRE(params) / async function NOMBRE(params)
+//     cuerpo...
+// "async" es OPCIONAL: por defecto (sin él) sigue siendo síncrona, exactamente como
+// antes -- necesario porque llamarla SIN "await" esperando su valor de vuelta directo
+// es un patrón ya en uso (ej. "duplicar(contador)"), y si fuera async siempre, ese
+// valor pasaría a ser una Promise en vez del valor real. Con "async" delante, sí puede
+// usar "await" dentro (fetch, u otra dependencia asíncrona) -- a cambio, quien la llame
+// tiene que usar "await" también, o recibirá una Promise en vez del valor.
+function parseFunctionDecl(lines, i, isAsync) {
+  const re = isAsync
+    ? /^async\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/
+    : /^function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/;
+  const header = lines[i].text.trim().match(re);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${isAsync ? 'async ' : ''}function NOMBRE(params)"`);
   const [, name, params] = header;
   const baseIndent = lines[i].indent;
 
   const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
 
   return {
-    node: { type: 'FunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
+    node: { type: 'FunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), isAsync: !!isAsync, line: lines[i].num },
     next: j,
   };
 }
@@ -373,16 +392,19 @@ function parseFunctionDecl(lines, i) {
 // propio, y está prohibida en cualquier "visual" (igual que server var). Solo es
 // llamable desde otro código de servidor -- típicamente desde dentro de una
 // "post function" del mismo archivo.
-function parseServerFunction(lines, i) {
-  const header = lines[i].text.trim().match(/^server\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/);
-  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "server function NOMBRE(params)"`);
+function parseServerFunction(lines, i, isAsync) {
+  const re = isAsync
+    ? /^async\s+server\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/
+    : /^server\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/;
+  const header = lines[i].text.trim().match(re);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${isAsync ? 'async ' : ''}server function NOMBRE(params)"`);
   const [, name, params] = header;
   const baseIndent = lines[i].indent;
 
   const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
 
   return {
-    node: { type: 'ServerFunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
+    node: { type: 'ServerFunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), isAsync: !!isAsync, line: lines[i].num },
     next: j,
   };
 }

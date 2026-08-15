@@ -13,6 +13,7 @@ const LABELS = {
   PutFunctionDecl: 'put function',
   DeleteFunctionDecl: 'delete function',
   GetFunctionDecl: 'get function',
+  WatchDecl: 'watch',
 };
 
 // Espacios de nombres: reactive/var/function/visual/server-var/server-reactive/
@@ -313,6 +314,64 @@ function validate(ast) {
     }
   }
 
+  // "watch(...)" DENTRO de otro bloque (server function, post/put/delete/get function, o
+  // dentro de otro watch) es redundante Y roto: "watch" solo existe como construcción de
+  // nivel superior del archivo -- dentro de un cuerpo de función, el texto "watch(x)" no
+  // se reconoce como la construcción especial, se trata como una llamada normal a una
+  // función que no existe, y revienta con un ReferenceError real en tiempo de ejecución
+  // ("watch is not defined"). Redundante además: watch() ya se dispara sin importar cuál
+  // función lo cambió, así que "anidarlo dentro de una función concreta" nunca añade nada
+  // que declararlo a nivel de archivo no diera ya.
+  const functionBodies = ast.body.filter(n =>
+    n.type === 'ServerFunctionDecl' || n.type === 'PostFunctionDecl' || n.type === 'PutFunctionDecl' ||
+    n.type === 'DeleteFunctionDecl' || n.type === 'GetFunctionDecl' || n.type === 'WatchDecl'
+  );
+  for (const fn of functionBodies) {
+    const nestedWatch = fn.body.match(/\bwatch\s*\(/);
+    if (nestedWatch) {
+      const etiqueta = fn.type === 'WatchDecl' ? `watch(${fn.name})` : `${labelFor(fn.type)} ${fn.name}`;
+      throw new SyntaxError(
+        `"${etiqueta}" contiene "watch(...)" dentro de su cuerpo -- ` +
+        `"watch" solo existe como declaración de NIVEL SUPERIOR del archivo, nunca dentro de otro bloque ` +
+        `(función, if, for). Anidado así, ni siquiera se reconoce como la construcción especial: se trata ` +
+        `como una llamada normal a una función "watch" que no existe, y reventaría con un ReferenceError en ` +
+        `tiempo de ejecución. Además sería redundante -- watch(NOMBRE) a nivel de archivo YA se dispara sin ` +
+        `importar cuál función cambió la variable, así que "meterlo dentro de una función concreta" no ` +
+        `añadiría nada. Sácalo a nivel superior del archivo.`
+      );
+    }
+  }
+
+  // Las cuatro funciones HTTP (get/post/put/delete function) deben devolver algo
+  // SIEMPRE -- sin esto, ahora mismo no revienta (el despachador convierte
+  // "undefined" en "null" y responde 200 igualmente), pero es exactamente el tipo de
+  // sorpresa silenciosa que hemos ido cerrando en todo el proyecto: el desarrollador
+  // se olvida de un "return" y el cliente recibe "null" sin ningún aviso de que
+  // faltaba algo. Comprobación superficial, no un análisis de flujo real: rechaza si
+  // no hay NINGÚN "return" en el cuerpo, o si hay un "return" sin ningún valor (bare
+  // return, que devuelve undefined explícitamente) -- no detecta el caso más sutil de
+  // "algunas ramas de un if devuelven y otras no", eso necesitaría análisis de código
+  // real, no una heurística de texto.
+  const httpFnTypes = new Set(['GetFunctionDecl', 'PostFunctionDecl', 'PutFunctionDecl', 'DeleteFunctionDecl']);
+  for (const fn of ast.body.filter(n => httpFnTypes.has(n.type))) {
+    const hasAnyReturn = /\breturn\b/.test(fn.body);
+    if (!hasAnyReturn) {
+      throw new SyntaxError(
+        `"${labelFor(fn.type)} ${fn.name}" (línea ${fn.line}) no tiene ningún "return" -- las cuatro ` +
+        `funciones HTTP deben devolver siempre algo. Sin esto, el cliente recibiría "null" sin ningún ` +
+        `aviso de que faltaba un valor. Añade "return { ... }" (o lo que corresponda) al final.`
+      );
+    }
+    const hasBareReturn = /\breturn\s*(;|$)/m.test(fn.body);
+    if (hasBareReturn) {
+      throw new SyntaxError(
+        `"${labelFor(fn.type)} ${fn.name}" (línea ${fn.line}) tiene un "return" sin ningún valor -- eso ` +
+        `devuelve "undefined" explícitamente, y el cliente lo recibiría como "null" sin ningún aviso. ` +
+        `Devuelve algo explícito, aunque sea "return {}" o "return null" a propósito.`
+      );
+    }
+  }
+
   // "server function" sin NINGUNA función HTTP (get/post/put/delete) en un archivo
   // que SÍ declara route() es inalcanzable de raíz: no hay ninguna de las cuatro que la
   // llame desde dentro, y un archivo con route() no se puede importar desde otro (ya
@@ -365,7 +424,7 @@ function validate(ast) {
     }
   }
 
-  const globalDecls = ast.body.filter(n => LABELS[n.type]);
+  const globalDecls = ast.body.filter(n => SHARED_NAMESPACE.has(n.type) || n.type === 'StyleDecl');
 
   const seenShared = new Map(); // name -> { type, line }
   const seenStyles = new Map(); // name -> { line }
