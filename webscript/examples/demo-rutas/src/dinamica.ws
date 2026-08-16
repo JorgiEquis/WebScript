@@ -15,14 +15,13 @@ style boton =
     -> padding: 8px 16px
 
 visual paginaDinamica =
-<div>
+<div class={boton} onclick={
+    var r = await incrementar({ cantidad: 1 })
+    contadorCliente = r.visitas
+}>
     <h1>Ruta dinamica</h1>
     <p>Visitas segun el servidor: {contadorCliente}</p>
 </div>
-    -> style: boton
-    -> onclick:
-        var r = await incrementar({ cantidad: 1 })
-        contadorCliente = r.visitas
 
 render(
     paginaDinamica

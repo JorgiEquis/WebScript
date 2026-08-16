@@ -5,12 +5,9 @@ style boton =
     -> color: white
 
 visual agregar =
-<button>
+<button class={boton} onclick={lista = [...lista, "kiwi"]}>
     Añadir fruta
 </button>
-    -> style: boton
-    -> onclick:
-        lista = [...lista, "kiwi"]
 
 visual listaFrutas =
 <ul>

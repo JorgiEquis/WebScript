@@ -7,13 +7,10 @@ style boton =
     -> color: white
 
 visual home =
-<div>
+<div class={boton} onclick={contador++}>
     <h1>Página de inicio</h1>
     <p>Contador: {contador}</p>
 </div>
-    -> style: boton
-    -> onclick:
-        contador++
 
 render(
     home

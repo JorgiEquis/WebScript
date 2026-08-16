@@ -66,8 +66,8 @@
           }
         },
         {
-          "comment": "server var / server reactive / server function NOMBRE",
-          "match": "^\\s*(server)\\s+(var|reactive|function)\\s+([A-Za-z_$][\\w$]*)",
+          "comment": "server var / server reactive / server wson / server function NOMBRE",
+          "match": "^\\s*(server)\\s+(var|reactive|wson|function)\\s+([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.modifier.webscript" },
             "2": { "name": "storage.type.webscript" },
@@ -84,8 +84,8 @@
           }
         },
         {
-          "comment": "style NOMBRE = / visual NOMBRE =",
-          "match": "^\\s*(style|visual)\\s+([A-Za-z_$][\\w$]*)\\s*(=)",
+          "comment": "style NOMBRE = / visual NOMBRE = / wson NOMBRE =",
+          "match": "^\\s*(style|visual|wson)\\s+([A-Za-z_$][\\w$]*)\\s*(=)",
           "captures": {
             "1": { "name": "storage.type.webscript" },
             "2": { "name": "entity.name.function.webscript" },
@@ -161,7 +161,7 @@
     "bindings": {
       "patterns": [
         {
-          "comment": "-> style: nombre  |  -> onclick:  |  -> atributo: valor",
+          "comment": "-> propiedad: valor (style) | -> from/to/via/content: valor (wson) -- ya NO se usa para eventos/atributos de visual, esos van en línea en la etiqueta (onclick={...}, class={...})",
           "match": "(->)\\s*([A-Za-z_][\\w-]*)\\s*(:)",
           "captures": {
             "1": { "name": "keyword.operator.arrow.webscript" },
@@ -218,7 +218,7 @@
         { "include": "#numbers" },
         {
           "name": "keyword.other.webscript",
-          "match": "\\b(props|state|server|http|whisper|await|true|false|null|undefined|this)\\b"
+          "match": "\\b(props|state|server|http|whisper|WSON|await|true|false|null|undefined|this)\\b"
         },
         {
           "name": "keyword.control.webscript",

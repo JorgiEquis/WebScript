@@ -4,6 +4,7 @@
   "description": "Resaltado de sintaxis, snippets y ayuda contextual (hover) para archivos .ws de WebScript",
   "version": "0.2.0",
   "publisher": "local",
+  "icon": "icons/ws-icon-128.png",
   "engines": {
     "vscode": "^1.75.0"
   },
@@ -16,7 +17,11 @@
         "id": "webscript",
         "aliases": ["WebScript", "webscript"],
         "extensions": [".ws"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/ws-icon-light.svg",
+          "dark": "./icons/ws-icon.svg"
+        }
       }
     ],
     "grammars": [

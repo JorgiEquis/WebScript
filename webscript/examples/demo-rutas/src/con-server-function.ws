@@ -20,16 +20,15 @@ style boton =
     -> padding: 8px 16px
 
 visual pagina =
-<div>
+<div class={boton} onclick={
+    var r = await postController({ precio: 100 })
+    resultado = r.conIva
+    total = r.totalConIva
+}>
     <h1>Con server function</h1>
     <p>Resultado: {resultado}</p>
     <p>Total acumulado: {total}</p>
 </div>
-    -> style: boton
-    -> onclick:
-        var r = await postController({ precio: 100 })
-        resultado = r.conIva
-        total = r.totalConIva
 
 render(
     pagina

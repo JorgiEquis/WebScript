@@ -14,19 +14,16 @@ style boton =
     -> color: white
 
 visual campoTexto =
-<input placeholder="Escribe algo">
-    -> oninput:
-        texto = event.target.value
+<input placeholder="Escribe algo" oninput={texto = event.target.value}>
 
 visual botonEnviar =
-<button>
+<button class={boton} onclick={
+    var r = await postController({ texto: texto })
+    total = r.total
+    texto = ""
+}>
     Enviar
 </button>
-    -> style: boton
-    -> onclick:
-        var r = await postController({ texto: texto })
-        total = r.total
-        texto = ""
 
 visual pagina =
 <div>

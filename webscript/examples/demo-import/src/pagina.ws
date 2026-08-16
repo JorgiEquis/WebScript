@@ -10,13 +10,12 @@ post function postController(args)
     return { conIva: conIva }
 
 visual boton =
-<button>
+<button class={botonPrimario} onclick={
+    var r = await postController({ precio: precio })
+    resultado = r.conIva
+}>
     Calcular
 </button>
-    -> style: botonPrimario
-    -> onclick:
-        var r = await postController({ precio: precio })
-        resultado = r.conIva
 
 visual paginaPrincipal =
 <div>

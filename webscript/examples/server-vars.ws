@@ -8,12 +8,9 @@ style boton =
     -> color: white
 
 visual panel =
-<button>
+<button class={boton} onclick={contadorCliente++}>
     Cliente: {contadorCliente}
 </button>
-    -> style: boton
-    -> onclick:
-        contadorCliente++
 
 render(
     panel

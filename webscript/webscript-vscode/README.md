@@ -5,33 +5,45 @@ Resaltado de sintaxis, snippets y ayuda contextual (hover) para archivos
 
 ## Qué incluye
 
+- **Icono de archivo** (`icons/ws-icon.svg`/`ws-icon-light.svg`): un
+  monograma "WS" morado (`#7c3aed`, el mismo color usado en varios
+  ejemplos del propio proyecto), con variante clara y oscura según el
+  tema de VS Code — igual que hacen los archivos `.js`/`.ts`. Aparece en
+  el explorador de archivos y en las pestañas sin necesitar instalar un
+  tema de iconos completo. También sirve como icono de la propia
+  extensión en el *marketplace*.
+
 - **Resaltado de sintaxis** (`syntaxes/webscript.tmLanguage.json`):
   - Palabras clave: `route`, `reactive`, `var`, `function`, `style`,
-    `visual`, `render`, `server var`, `server reactive`,
+    `visual`, `render`, `server var`, `server reactive`, `server wson`,
     `server function`, `watch`, `get`/`post`/`put`/`delete function`,
-    `http`, `whisper`, `import`/`from`, `if`/`else`/`else if`, `for`/`in`/`by`.
+    `http`, `whisper`, `WSON`, `wson`, `import`/`from`, `if`/`else`/`else if`, `for`/`in`/`by`.
   - Anotaciones de tipo opcionales (`reactive number x`/`var string y`)
     resaltadas aparte.
   - Nombres de declaración resaltados como funciones/variables
     (`visual NOMBRE`, `reactive NOMBRE`, etc).
-  - Tags HTML (`<div>`, `<Componente />`) y sus atributos.
+  - Tags HTML (`<div>`, `<Componente />`) y sus atributos, incluyendo
+    atributos en línea (`onclick={código}`, `class={expr}`) en
+    **cualquier** nodo de la plantilla, no solo la raíz.
   - Interpolaciones `{...}`, con anidamiento real (`{ JSON.stringify({a:1}) }`
     resalta bien) y soporte para *template literals* con `${...}` dentro.
-  - Bindings `-> style:`, `-> onclick:`, etc, con la clave resaltada aparte
-    de la flecha.
+  - Bloques `-> propiedad: valor` de `style`/`wson` (`from`/`to`/`via`/
+    `content`), con la clave resaltada aparte de la flecha.
   - Comentarios `//` de línea completa.
   - Cadenas (`"`, `'`, backtick) y números.
 
-- **Snippets** (`snippets/webscript.json`): escribe `visual`, `for`,
-  `forby`, `if`, `servervar`, `serverreactive`, `watch`, `postfunction`,
-  `getfunction`, `httpget`/`httppost`/`httpput`/`httpdelete`, `whisper`,
-  `import`, etc. y pulsa Tab para expandir la plantilla correspondiente.
+- **Snippets** (`snippets/webscript.json`): escribe `visual`, `visualb`,
+  `for`, `forby`, `if`, `servervar`, `serverreactive`, `watch`, `wson`,
+  `serverwson`, `wsonsend`, `postfunction`, `getfunction`,
+  `httpget`/`httppost`/`httpput`/`httpdelete`, `whisper`, `import`, etc.
+  y pulsa Tab para expandir la plantilla correspondiente.
 
 - **Hover** (`extension.js`): pasa el ratón por encima de cualquier
   palabra clave (`route`, `reactive`, `var`, `function`, `style`,
-  `visual`, `server`, `watch`, `get`/`post`/`put`/`delete`, `http`,
-  `whisper`, `import`, `if`, `for`, `by`...) para ver su firma y una
-  descripción de qué hace, directamente en el editor.
+  `visual`, `server`, `watch`, `wson`, `WSON`, `get`/`post`/`put`/`delete`,
+  `http`, `whisper`, `import`, `if`, `for`, `by`, `onclick`/cualquier
+  `onXXX`...) para ver su firma y una descripción de qué hace,
+  directamente en el editor.
 
 ## Instalación (modo desarrollo, sin publicar)
 

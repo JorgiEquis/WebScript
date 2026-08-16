@@ -40,7 +40,7 @@ function evalExpr(expr, scope) {
   }
 }
 
-function renderTemplateNode(node, scope, ctx, rootOverride) {
+function renderTemplateNode(node, scope, ctx) {
   if (ctx.failed) return '';
   if (!node) return '';
 
@@ -111,20 +111,18 @@ function renderTemplateNode(node, scope, ctx, rootOverride) {
     const attrs = { ...(node.attrs || {}) };
     let attrsStr = '';
     for (const [k, v] of Object.entries(attrs)) {
+      // Los manejadores de eventos (onclick={...}, onXXX={...}) NUNCA se renderizan como
+      // atributo HTML estático -- el HTML servido no tiene ningún JS ejecutándose todavía,
+      // esos se conectan en el cliente cuando el bundle monta de verdad. Rendericarlos
+      // aquí intentaría evaluar el CÓDIGO del handler como si fuera un valor de atributo,
+      // produciendo HTML roto o un fallo real.
+      if (/^on[a-z]+$/.test(k)) continue;
       if (v === true) { attrsStr += ` ${k}`; continue; }
       if (typeof v === 'string' && v.startsWith('{') && v.endsWith('}')) {
         const r = evalExpr(v.slice(1, -1), scope);
         if (!r.ok) { ctx.failed = true; return ''; }
         attrsStr += ` ${k}="${escapeHtml(r.value)}"`;
       } else {
-        attrsStr += ` ${k}="${escapeHtml(v)}"`;
-      }
-    }
-    if (rootOverride) {
-      if (rootOverride.extraClasses.length > 0) {
-        attrsStr += ` class="${escapeHtml(rootOverride.extraClasses.join(' '))}"`;
-      }
-      for (const [k, v] of Object.entries(rootOverride.extraAttrs)) {
         attrsStr += ` ${k}="${escapeHtml(v)}"`;
       }
     }
@@ -152,15 +150,7 @@ function renderVisual(visual, ctx, props) {
     scope[v.name] = val.value;
   }
 
-  const extraClasses = [];
-  const extraAttrs = {};
-  for (const b of visual.bindings) {
-    if (b.key === 'style') { extraClasses.push(b.value); continue; }
-    if (b.key.startsWith('on')) continue; // sin handlers en HTML servido -- eso lo pone el cliente
-    extraAttrs[b.key] = b.kind === 'value' ? b.value : b.code;
-  }
-
-  return renderTemplateNode(visual.template, scope, ctx, { extraClasses, extraAttrs });
+  return renderTemplateNode(visual.template, scope, ctx);
 }
 
 // Punto de entrada. `ast` es el AST completo de la ruta (como el que usa compiler.js).
@@ -172,6 +162,7 @@ function renderRouteToHtml(ast, options = {}) {
   const reactives = ast.body.filter(n => n.type === 'ReactiveDecl');
   const globalVarsList = ast.body.filter(n => n.type === 'VarDecl');
   const visuals = ast.body.filter(n => n.type === 'VisualDecl');
+  const styles = ast.body.filter(n => n.type === 'StyleDecl');
   const renderCall = ast.body.find(n => n.type === 'RenderCall');
   if (!renderCall) return { ok: false, html: '' };
 
@@ -181,6 +172,11 @@ function renderRouteToHtml(ast, options = {}) {
   };
 
   const globalScope = { server: options.serverScope || {} };
+  // El nombre de un "style" es literalmente su propia clase CSS -- se añade al scope
+  // como una cadena que se referencia a sí misma, para que "class={estilo}" (o
+  // "class={activo ? estilo : 'otra'}") se evalúe correctamente en SSR sin necesitar
+  // ninguna sustitución especial, igual que cualquier otra variable del scope.
+  for (const s of styles) { globalScope[s.name] = s.name; }
   for (const r of reactives) {
     const v = evalExpr(r.init, globalScope);
     if (!v.ok) return { ok: false, html: '' };

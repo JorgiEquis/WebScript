@@ -21,12 +21,9 @@ visual resumen =
 </div>
 
 visual subirPrecio =
-<button>
+<button class={boton} onclick={cantidad = cantidad + 1}>
     Subir cantidad
 </button>
-    -> style: boton
-    -> onclick:
-        cantidad = cantidad + 1
 
 render(
     resumen,

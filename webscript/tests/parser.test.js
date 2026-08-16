@@ -354,3 +354,39 @@ describe('async opcional en function/server function; watch() siempre async', ()
     assert.equal(ast2.body[0].isAsync, false);
   });
 });
+
+describe('WSON: bloque -> clave: valor como valor inicial de reactive/var/server var/server reactive', () => {
+  test('server var con bloque WSON se sintetiza como objeto literal', () => {
+    const src = 'server var message = "Hola"\n\nserver var sender =\n    -> from: "yo"\n    -> to: "/x"\n    -> via: "POST"\n    -> content: message';
+    const ast = parseSource(src);
+    const sender = ast.body[1];
+    assert.equal(sender.type, 'ServerVarDecl');
+    assert.equal(sender.init, '{ from: "yo", to: "/x", via: "POST", content: message }');
+  });
+
+  test('funciona igual en reactive/var/server reactive, no solo server var', () => {
+    const src1 = 'reactive sender =\n    -> to: "/x"\n    -> content: "hola"';
+    assert.match(parseSource(src1).body[0].init, /to: "\/x"/);
+
+    const src2 = 'var sender =\n    -> to: "/x"\n    -> content: "hola"';
+    assert.match(parseSource(src2).body[0].init, /to: "\/x"/);
+
+    const src3 = 'server reactive sender =\n    -> to: "/x"\n    -> content: "hola"';
+    assert.match(parseSource(src3).body[0].init, /to: "\/x"/);
+  });
+
+  test('sin bloque WSON (una sola línea normal), sigue funcionando exactamente igual que antes', () => {
+    const ast = parseSource('server var x = 5');
+    assert.equal(ast.body[0].init, '5');
+  });
+
+  test('server var/reactive SIN "=" (sin valor inicial) sigue dando undefined, no se confunde con WSON', () => {
+    const ast = parseSource('server var x');
+    assert.equal(ast.body[0].init, 'undefined');
+  });
+
+  test('WSON dentro de un cuerpo de función -- rechazado, no genera JS roto', () => {
+    const src = 'route("/x")\n\npost function f(args)\n    var sender =\n        -> to: "/x"\n        -> content: "hola"\n    return {}';
+    assert.throws(() => parseSource(src), /contiene algo que parece un bloque WSON/);
+  });
+});

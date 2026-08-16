@@ -6,8 +6,9 @@ const path = require('path');
 const { buildSite, startServer } = require('../src/site-builder');
 
 // Arranca un servidor real sobre un directorio temporal de .ws, en un puerto
-// efímero (0 -> el SO elige uno libre), y lo cierra al terminar.
-function withServer(wsFiles, testFn) {
+// efímero (0 -> el SO elige uno libre), y lo cierra al terminar. "serverOptions" es
+// opcional -- se propaga tal cual a startServer() (TTL/límite de sesiones, etc).
+function withServer(wsFiles, testFn, serverOptions) {
   return async () => {
     const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-server-test-'));
     const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-server-out-'));
@@ -15,11 +16,11 @@ function withServer(wsFiles, testFn) {
       fs.writeFileSync(path.join(srcDir, name), content);
     }
     const { table } = buildSite(srcDir, outDir);
-    const server = startServer(table, outDir, 0);
+    const server = startServer(table, outDir, 0, serverOptions);
     await new Promise(resolve => server.on('listening', resolve));
     const port = server.address().port;
     try {
-      await testFn(`http://localhost:${port}`);
+      await testFn(`http://localhost:${port}`, server);
     } finally {
       server.close();
       fs.rmSync(srcDir, { recursive: true, force: true });
@@ -300,11 +301,9 @@ describe('validate: updateServer da error explícito (ya no existe)', () => {
 reactive y = server.x
 
 visual test =
-<button>
+<button onclick={y = await updateServer({ x: y + 1 }).then(s => s.x)}>
     click
 </button>
-    -> onclick:
-        y = await updateServer({ x: y + 1 }).then(s => s.x)
 `;
     assert.throws(() => parseSource(src), /se unificó con "post function"/);
   });
@@ -466,13 +465,13 @@ delete function borrar(args)
 reactive lista = server.tareas
 
 visual v =
-<ul>
+<ul onclick={
+    var r = await crear({ item: "x" })
+    lista = r.tareas
+}>
     for (t in lista)
         <li>{t}</li>
 </ul>
-    -> onclick:
-        var r = await crear({ item: "x" })
-        lista = r.tareas
 
 render(
     v
@@ -647,13 +646,13 @@ post function crear(args, query, headers)
 reactive lista = server.items
 
 visual v =
-<ul>
+<ul onclick={
+    var r = await crear({ texto: "x" }, { prioridad: "alta" })
+    lista = r.items
+}>
     for (item in lista)
         <li>{item}</li>
 </ul>
-    -> onclick:
-        var r = await crear({ texto: "x" }, { prioridad: "alta" })
-        lista = r.items
 
 render(
     v
@@ -801,13 +800,13 @@ post function crear(args)
 reactive lista = server.items
 
 visual v =
-<ul>
+<ul onclick={
+    var r = await crear({ texto: "x" })
+    lista = r.items
+}>
     for (item in lista)
         <li>{item}</li>
 </ul>
-    -> onclick:
-        var r = await crear({ texto: "x" })
-        lista = r.items
 
 render(
     v
@@ -915,9 +914,7 @@ reactive contador = 5
 reactive salida = ""
 
 visual v =
-<p>{salida}</p>
-    -> onclick:
-        salida = "el contador vale " + contador
+<p onclick={salida = "el contador vale " + contador}>{salida}</p>
 
 render(
     v
@@ -933,9 +930,7 @@ reactive contador = 5
 reactive salida = ""
 
 visual v =
-<p>{salida}</p>
-    -> onclick:
-        salida = \`el contador de contador vale \${contador}\`
+<p onclick={salida = \`el contador de contador vale \${contador}\`}>{salida}</p>
 
 render(
     v
@@ -1300,4 +1295,842 @@ describe('validate: las cuatro funciones HTTP deben devolver siempre algo', () =
     const src = 'route("/d")\n\npost function f(args)\n    if (args.x > 0)\n        return { positivo: true }\n    else\n        return { positivo: false }';
     assert.doesNotThrow(() => parseSource(src));
   });
+});
+
+describe('WSON + WSON.send(): construcción y envío de mensajes a otros sistemas', () => {
+  function withExternalSystem(handler, testFn) {
+    return async (base) => {
+      const http2 = require('http');
+      const externo = http2.createServer(handler);
+      await new Promise(resolve => externo.listen(0, resolve));
+      const externalPort = externo.address().port;
+      try {
+        await testFn(base, `http://localhost:${externalPort}`);
+      } finally {
+        externo.close();
+      }
+    };
+  }
+
+  test('WSON.send(wson) transmite content al "to" indicado, con via POST por defecto', withServer(
+    {
+      'api.ws': `route("/api/enviar")
+
+server var message = "Hola desde WebScript"
+
+post function enviar(args)
+    var sender = { to: args.destino, content: message }
+    var respuesta = await WSON.send(sender)
+    return { respuesta: respuesta }
+`,
+    },
+    withExternalSystem(
+      (req, res) => {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ recibido: JSON.parse(body || '{}'), metodo: req.method }));
+        });
+      },
+      async (base, externalBase) => {
+        const r = await fetch(`${base}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destino: `${externalBase}/x` }),
+        });
+        const data = await r.json();
+        assert.deepEqual(data.respuesta, { recibido: 'Hola desde WebScript', metodo: 'POST' });
+      }
+    )
+  ));
+
+  test('via distinto de POST se respeta de verdad', withServer(
+    {
+      'api.ws': `route("/api/via")
+
+post function probar(args)
+    var wson = { to: args.destino, via: "PUT", content: "x" }
+    var r = await WSON.send(wson)
+    return { r: r }
+`,
+    },
+    withExternalSystem(
+      (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ metodoRecibido: req.method }));
+      },
+      async (base, externalBase) => {
+        const r = await fetch(`${base}/api/via`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destino: `${externalBase}/x` }),
+        });
+        const data = await r.json();
+        assert.deepEqual(data.r, { metodoRecibido: 'PUT' });
+      }
+    )
+  ));
+
+  test('via no soportado (email/teléfono) falla con mensaje claro, capturable con try/catch', withServer(
+    {
+      'api.ws': `route("/api/noimpl")
+
+post function probar(args)
+    var errorMsg = null
+    try {
+        await WSON.send({ to: "x@ejemplo.com", via: "email", content: "x" })
+    } catch (e) {
+        errorMsg = e.message
+    }
+    return { errorMsg: errorMsg }
+`,
+    },
+    async (base) => {
+      const r = await fetch(`${base}/api/noimpl`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await r.json();
+      assert.match(data.errorMsg, /no soportado todavía/);
+    }
+  ));
+
+  test('construir el wson NO envía nada por sí solo -- hace falta WSON.send() explícito', withServer(
+    {
+      'api.ws': `route("/api/construir")
+
+server wson sender =
+    -> to: "http://esto-no-deberia-llamarse-nunca.invalido"
+    -> content: "x"
+
+post function ver(args)
+    return sender
+`,
+    },
+    async (base) => {
+      // si construir "sender" enviara algo por sí solo, esto fallaría al intentar
+      // resolver un dominio inválido -- comprobamos que simplemente devuelve el
+      // objeto tal cual, sin haber intentado ninguna petición.
+      const r = await fetch(`${base}/api/construir`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      assert.equal(r.status, 200);
+      const data = await r.json();
+      assert.deepEqual(data, { to: 'http://esto-no-deberia-llamarse-nunca.invalido', content: 'x' });
+    }
+  ));
+});
+
+describe('bug real: un onclick con "await" explícito (no solo llamadas a post/put/delete) necesita ser async', () => {
+  test('await WSON.send(...) en un onclick genera una función flecha async, JS válido', async () => {
+    const { compileSource } = require('./helpers/compile-helper');
+    const src = `
+reactive resultado = ""
+reactive mensaje = "hola"
+
+wson sender =
+    -> to: "/api/x"
+    -> content: mensaje
+
+visual v =
+<p onclick={
+    var r = await WSON.send(sender)
+    resultado = JSON.stringify(r)
+}>{resultado}</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /addEventListener\("click", async \(event\) => \{/);
+  });
+
+  test('cualquier "await" explícito en un handler (no solo WSON.send) también fuerza async', async () => {
+    const { compileSource } = require('./helpers/compile-helper');
+    const src = `
+reactive resultado = ""
+
+visual v =
+<p onclick={
+    var r = await fetch("/algo")
+    resultado = "listo"
+}>{resultado}</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /addEventListener\("click", async \(event\) => \{/);
+  });
+
+  test('un handler SIN await sigue generándose sin async (no regresión)', async () => {
+    const { compileSource } = require('./helpers/compile-helper');
+    const src = `
+reactive contador = 0
+
+visual v =
+<p onclick={contador = contador + 1}>{contador}</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /addEventListener\("click", \(event\) => \{/);
+    assert.doesNotMatch(js, /addEventListener\("click", async \(event\)/);
+  });
+});
+
+describe('wson (cliente): de extremo a extremo con click real y servidor externo real', () => {
+  test('el click dispara WSON.send(), el receptor externo real recibe el content, la vista se actualiza con la respuesta', async () => {
+    const http2 = require('http');
+    const receptor = http2.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => { body += c; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, eco: JSON.parse(body) }));
+      });
+    });
+    await new Promise(resolve => receptor.listen(0, resolve));
+    const puerto = receptor.address().port;
+    try {
+      const { compileSource } = require('./helpers/compile-helper');
+      const { runBundle } = require('./helpers/dom-mock');
+      const src = `
+reactive resultado = ""
+reactive mensaje = "hola desde cliente"
+
+wson sender =
+    -> to: "http://localhost:${puerto}/recibir"
+    -> content: mensaje
+
+visual v =
+<div onclick={
+    var r = await WSON.send(sender)
+    resultado = JSON.stringify(r)
+}>
+    <p>{resultado}</p>
+</div>
+
+render(
+    v
+)
+`;
+      const { js } = compileSource(src);
+      const { app, ready } = runBundle(js, { fetch });
+      await ready;
+      const div = app.children[0];
+      await div.listeners.click({ target: div });
+      await new Promise(r => setTimeout(r, 100));
+      assert.equal(div.children[0].textContent, '{"ok":true,"eco":"hola desde cliente"}');
+    } finally {
+      receptor.close();
+    }
+  });
+});
+
+describe('sesiones: expiración por inactividad, límite con desalojo LRU, cookie Secure condicional', () => {
+  test('una sesión inactiva más tiempo que el TTL expira -- misma cookie reinicia el estado', withServer(
+    {
+      'api.ws': `route("/api/x")
+
+server var contador = 0
+
+post function incrementar(args)
+    contador = contador + 1
+    return { contador: contador }
+`,
+    },
+    async (base, server) => {
+      const r1 = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const cookie = r1.headers.get('set-cookie').split(';')[0];
+      assert.deepEqual(await r1.json(), { contador: 1 });
+      assert.equal(server._webscriptSessionDebug.getSessionCount('api/x'), 1);
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+      assert.equal(server._webscriptSessionDebug.getSessionCount('api/x'), 0, 'debe haberse limpiado tras el TTL');
+
+      const r2 = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}' });
+      assert.deepEqual(await r2.json(), { contador: 1 }, 'misma cookie, pero sesión nueva -- el contador reinicia, no sigue en 2');
+    },
+    { sessionTtlMs: 300, sessionCleanupIntervalMs: 100 }
+  ));
+
+  test('una sesión activa (usada antes de expirar) NO se limpia', withServer(
+    {
+      'api.ws': `route("/api/x")
+
+server var contador = 0
+
+post function incrementar(args)
+    contador = contador + 1
+    return { contador: contador }
+`,
+    },
+    async (base, server) => {
+      const r1 = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const cookie = r1.headers.get('set-cookie').split(';')[0];
+
+      // se usa de nuevo ANTES de que expire -- debe seguir viva, y el contador seguir
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const r2 = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}' });
+      assert.deepEqual(await r2.json(), { contador: 2 }, 'sigue siendo la misma sesión, no expiró');
+    },
+    { sessionTtlMs: 300, sessionCleanupIntervalMs: 100 }
+  ));
+
+  test('al superar maxSessions, se desaloja la menos usada recientemente (LRU), nunca la más reciente', withServer(
+    {
+      'api.ws': `route("/api/x")
+
+post function noop(args)
+    return { ok: true }
+`,
+    },
+    async (base, server) => {
+      const cookies = [];
+      for (let i = 0; i < 5; i++) {
+        const r = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        cookies.push(r.headers.get('set-cookie').split(';')[0].split('=')[1]);
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.equal(server._webscriptSessionDebug.getSessionCount('api/x'), 3, 'nunca debe superar maxSessions');
+      assert.equal(server._webscriptSessionDebug.hasSession('api/x', cookies[0]), false, 'la más antigua debe haberse desalojado');
+      assert.equal(server._webscriptSessionDebug.hasSession('api/x', cookies[4]), true, 'la más reciente debe seguir viva');
+    },
+    { maxSessions: 3, sessionTtlMs: 999999 }
+  ));
+
+  test('sin X-Forwarded-Proto, la cookie NO lleva Secure (no rompe desarrollo local por HTTP)', withServer(
+    { 'api.ws': `route("/api/x")\n\npost function f(args)\n    return { ok: true }\n` },
+    async (base) => {
+      const r = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      assert.doesNotMatch(r.headers.get('set-cookie'), /Secure/);
+    }
+  ));
+
+  test('con X-Forwarded-Proto: https (detrás de un proxy real), la cookie SÍ lleva Secure', withServer(
+    { 'api.ws': `route("/api/x")\n\npost function f(args)\n    return { ok: true }\n` },
+    async (base) => {
+      const r = await fetch(`${base}/api/x`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-Proto': 'https' }, body: '{}',
+      });
+      assert.match(r.headers.get('set-cookie'), /Secure/);
+    }
+  ));
+});
+
+describe('WSON: firma HMAC (secret) y WSON.verify() -- confianza entre sistemas', () => {
+  const { parseSource } = require('./helpers/compile-helper');
+  const { compile } = require('../src/compiler');
+
+  test('"secret" en un wson de CLIENTE se rechaza en compilación (riesgo de seguridad real)', () => {
+    const src = 'wson sender =\n    -> to: "/x"\n    -> content: 1\n    -> secret: "malo"\n\nvisual v =\n<p>x</p>\n\nrender(\n    v\n)';
+    assert.throws(() => parseSource(src), /solo tiene sentido en "server wson"/);
+  });
+
+  test('"secret" en un server wson SÍ está permitido', () => {
+    const src = 'route("/x")\n\nserver wson sender =\n    -> to: "http://x"\n    -> content: 1\n    -> secret: "clave"\n\npost function f(args)\n    return sender';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('WSON.send() con secret genera el cálculo de firma; sin secret, no lo genera', () => {
+    const conSecret = parseSource('route("/x")\n\nserver wson s =\n    -> to: "http://x"\n    -> content: 1\n    -> secret: "clave"\n\npost function f(args)\n    var r = await WSON.send(s)\n    return r');
+    const { server: serverConSecret } = compile(conSecret, { routePath: '/' });
+    assert.match(serverConSecret, /X-WSON-Signature/);
+    assert.match(serverConSecret, /createHmac\('sha256', wson\.secret\)/);
+  });
+
+  test('WSON.verify() con comparación en tiempo constante (timingSafeEqual), no ==', () => {
+    const ast = parseSource('route("/x")\n\npost function f(args, query, headers)\n    var ok = WSON.verify(args, headers[\'x-wson-signature\'], "clave")\n    return { ok: ok }');
+    const { server } = compile(ast, { routePath: '/' });
+    assert.match(server, /timingSafeEqual/);
+  });
+
+  test('de extremo a extremo: dos servidores reales, emisor firma y receptor verifica -- firmaValida: true', withServer(
+    { 'api.ws': `route("/recibir")
+
+server var ultimaVerificacion = false
+
+post function recibir(args, query, headers)
+    ultimaVerificacion = WSON.verify(args, headers['x-wson-signature'], "clave-compartida-test")
+    return { firmaValida: ultimaVerificacion }
+` },
+    async (receptorBase) => {
+      const fs2 = require('fs');
+      const os2 = require('os');
+      const path2 = require('path');
+      const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+      const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-hmac-'));
+      const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-hmac-out-'));
+      fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/enviar")
+
+server var mensajeTexto = "pago confirmado"
+
+server wson sender =
+    -> to: "${receptorBase}/recibir"
+    -> content: mensajeTexto
+    -> secret: "clave-compartida-test"
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+`);
+      const { table } = build2(srcDir, outDir);
+      const emisor = start2(table, outDir, 0);
+      await new Promise(resolve => emisor.on('listening', resolve));
+      const emisorPort = emisor.address().port;
+      try {
+        const r = await fetch(`http://localhost:${emisorPort}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const data = await r.json();
+        assert.deepEqual(data, { respuesta: { firmaValida: true } });
+      } finally {
+        emisor.close();
+        fs2.rmSync(srcDir, { recursive: true, force: true });
+        fs2.rmSync(outDir, { recursive: true, force: true });
+      }
+    }
+  ));
+
+  test('mensaje sin firmar, o con firma de un secreto distinto -- ambos detectados como inválidos', withServer(
+    { 'api.ws': `route("/recibir")
+
+post function recibir(args, query, headers)
+    var ok = WSON.verify(args, headers['x-wson-signature'], "clave-correcta")
+    return { firmaValida: ok }
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/recibir`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify('sin firmar'),
+      });
+      assert.deepEqual(await r1.json(), { firmaValida: false });
+
+      const crypto2 = require('crypto');
+      const firmaFalsa = 'sha256=' + crypto2.createHmac('sha256', 'secreto-equivocado').update(JSON.stringify('otro mensaje')).digest('hex');
+      const r2 = await fetch(`${base}/recibir`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-WSON-Signature': firmaFalsa },
+        body: JSON.stringify('otro mensaje'),
+      });
+      assert.deepEqual(await r2.json(), { firmaValida: false });
+    }
+  ));
+});
+
+describe('WSON: cifrado opcional (encrypt) e ID de correlación', () => {
+  const { parseSource } = require('./helpers/compile-helper');
+  const { compile } = require('../src/compiler');
+
+  test('"encrypt" en un wson de CLIENTE se rechaza (mismo riesgo que "secret")', () => {
+    const src = 'wson s =\n    -> to: "/x"\n    -> content: 1\n    -> encrypt: true\n\nvisual v =\n<p>x</p>\n\nrender(\n    v\n)';
+    assert.throws(() => parseSource(src), /"encrypt" -- eso solo tiene sentido en/);
+  });
+
+  test('"encrypt" sin "secret" se rechaza -- no hay clave con la que cifrar', () => {
+    const src = 'route("/x")\n\nserver wson s =\n    -> to: "http://x"\n    -> content: 1\n    -> encrypt: true\n\npost function f(args)\n    return s';
+    assert.throws(() => parseSource(src), /"encrypt" sin "secret"/);
+  });
+
+  test('"encrypt" con "secret" SÍ está permitido en server wson', () => {
+    const src = 'route("/x")\n\nserver wson s =\n    -> to: "http://x"\n    -> content: 1\n    -> secret: "clave"\n    -> encrypt: true\n\npost function f(args)\n    return s';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('el contenido cifrado NUNCA aparece en texto plano en lo que realmente viaja por la red', withServer(
+    { 'api.ws': `route("/api/enviar")
+
+server var datosSecretos = "numero de tarjeta: 4111-1111-1111-1111"
+
+server wson sender =
+    -> to: "PLACEHOLDER"
+    -> content: datosSecretos
+    -> secret: "clave-test"
+    -> encrypt: true
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+` },
+    async (base) => {
+      const http2 = require('http');
+      let cuerpoRecibido = null;
+      const receptorCrudo = http2.createServer((req, res) => {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+          cuerpoRecibido = body;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      await new Promise(resolve => receptorCrudo.listen(0, resolve));
+      const puertoReceptor = receptorCrudo.address().port;
+      try {
+        const fs2 = require('fs');
+        const os2 = require('os');
+        const path2 = require('path');
+        const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+        const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-enc-'));
+        const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-enc-out-'));
+        fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/enviar")
+
+server var datosSecretos = "numero de tarjeta: 4111-1111-1111-1111"
+
+server wson sender =
+    -> to: "http://localhost:${puertoReceptor}/recibir"
+    -> content: datosSecretos
+    -> secret: "clave-test"
+    -> encrypt: true
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+`);
+        const { table } = build2(srcDir, outDir);
+        const emisor = start2(table, outDir, 0);
+        await new Promise(resolve => emisor.on('listening', resolve));
+        const emisorPort = emisor.address().port;
+        try {
+          await fetch(`http://localhost:${emisorPort}/api/enviar`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+          });
+          await new Promise(resolve => setTimeout(resolve, 100));
+          assert.ok(cuerpoRecibido, 'el receptor crudo debe haber recibido algo');
+          assert.doesNotMatch(cuerpoRecibido, /4111/, 'el número de tarjeta NUNCA debe aparecer en texto plano en la red');
+          assert.match(cuerpoRecibido, /__wsonEncrypted/, 'debe llevar el sobre cifrado');
+        } finally {
+          emisor.close();
+          fs2.rmSync(srcDir, { recursive: true, force: true });
+          fs2.rmSync(outDir, { recursive: true, force: true });
+        }
+      } finally {
+        receptorCrudo.close();
+      }
+    }
+  ));
+
+  test('de extremo a extremo: emisor cifra+firma, receptor verifica+descifra+lee el id de correlación', withServer(
+    { 'api.ws': `route("/recibir")
+
+server var contenidoDescifrado = ""
+server var firmaValida = false
+
+post function recibir(args, query, headers)
+    firmaValida = WSON.verify(args, headers['x-wson-signature'], "clave-e2e")
+    contenidoDescifrado = WSON.showContent(args, "clave-e2e")
+    return { firmaValida: firmaValida, contenido: contenidoDescifrado, tieneId: headers['x-wson-correlation-id'] !== undefined }
+` },
+    async (receptorBase) => {
+      const fs2 = require('fs');
+      const os2 = require('os');
+      const path2 = require('path');
+      const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+      const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-e2e-'));
+      const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-e2e-out-'));
+      fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/enviar")
+
+server var mensaje = "dato confidencial"
+
+server wson sender =
+    -> to: "${receptorBase}/recibir"
+    -> content: mensaje
+    -> secret: "clave-e2e"
+    -> encrypt: true
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+`);
+      const { table } = build2(srcDir, outDir);
+      const emisor = start2(table, outDir, 0);
+      await new Promise(resolve => emisor.on('listening', resolve));
+      const emisorPort = emisor.address().port;
+      try {
+        const r = await fetch(`http://localhost:${emisorPort}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const data = await r.json();
+        assert.deepEqual(data, { respuesta: { firmaValida: true, contenido: 'dato confidencial', tieneId: true } });
+      } finally {
+        emisor.close();
+        fs2.rmSync(srcDir, { recursive: true, force: true });
+        fs2.rmSync(outDir, { recursive: true, force: true });
+      }
+    }
+  ));
+
+  test('WSON.showContent con clave equivocada, o con el cifrado manipulado, devuelve null', () => {
+    const ast = parseSource('route("/x")\n\npost function f(args, query, headers)\n    return WSON.showContent(args, "clave")');
+    const { server } = compile(ast, { routePath: '/' });
+    const fs2 = require('fs');
+    const path2 = require('path');
+    const tmpFile = path2.join(require('os').tmpdir(), `wson-showcontent-${Date.now()}.server.js`);
+    fs2.writeFileSync(tmpFile, server);
+    const mod = require(tmpFile);
+    const state = mod.createSessionState();
+
+    const crypto2 = require('crypto');
+    const key = crypto2.createHash('sha256').update('clave' + ':wson-encrypt').digest();
+    const iv = crypto2.randomBytes(12);
+    const cipher = crypto2.createCipheriv('aes-256-gcm', key, iv);
+    const ciphertext = Buffer.concat([cipher.update(JSON.stringify('secreto'), 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const payload = { __wsonEncrypted: true, iv: iv.toString('base64'), ciphertext: ciphertext.toString('base64'), authTag: authTag.toString('base64') };
+
+    return Promise.all([
+      state.f(payload, {}, {}).then(r => assert.equal(r, 'secreto', 'clave correcta debe descifrar bien')),
+      state.f('texto plano', {}, {}).then(r => assert.equal(r, 'texto plano', 'no cifrado se devuelve tal cual')),
+      state.f({ ...payload, ciphertext: payload.ciphertext.slice(0, -4) + 'AAAA' }, {}, {}).then(r => assert.equal(r, null, 'manipulado debe dar null')),
+    ]).finally(() => fs2.rmSync(tmpFile, { force: true }));
+  });
+});
+
+describe('WSON, tercera vuelta: varios destinos, "from" viaja, WSON.parse(), historial global', () => {
+  test('"to" como array: manda a todos en paralelo, un fallo no tumba a los demás', withServer(
+    { 'api.ws': `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({ to: args.destinos, content: "difusión" })
+    return { resultados: r }
+` },
+    async (base) => {
+      const http2 = require('http');
+      const crearReceptor = () => http2.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ recibido: true }));
+      });
+      const r1 = crearReceptor();
+      const r2 = crearReceptor();
+      await Promise.all([
+        new Promise(resolve => r1.listen(0, resolve)),
+        new Promise(resolve => r2.listen(0, resolve)),
+      ]);
+      try {
+        const p1 = r1.address().port;
+        const p2 = r2.address().port;
+        const res = await fetch(`${base}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destinos: [`http://localhost:${p1}/x`, `http://localhost:${p2}/x`, 'http://localhost:1/x'] }),
+        });
+        const data = await res.json();
+        assert.deepEqual(data.resultados[0], { recibido: true });
+        assert.deepEqual(data.resultados[1], { recibido: true });
+        assert.equal(data.resultados[2].error, true, 'el tercer destino inválido debe fallar de forma aislada, sin tumbar los otros dos');
+      } finally {
+        r1.close();
+        r2.close();
+      }
+    }
+  ));
+
+  test('"to" como string sigue devolviendo un único resultado (no un array) -- retrocompatibilidad', withServer(
+    { 'api.ws': `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({ to: args.destino, content: "x" })
+    return { esArray: Array.isArray(r), resultado: r }
+` },
+    async (base) => {
+      const http2 = require('http');
+      const receptor = http2.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      await new Promise(resolve => receptor.listen(0, resolve));
+      try {
+        const puerto = receptor.address().port;
+        const res = await fetch(`${base}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destino: `http://localhost:${puerto}/x` }),
+        });
+        const data = await res.json();
+        assert.equal(data.esArray, false);
+        assert.deepEqual(data.resultado, { ok: true });
+      } finally {
+        receptor.close();
+      }
+    }
+  ));
+
+  test('"from" viaja como cabecera X-WSON-From -- WSON.parse() lo recupera de verdad en otro proceso', withServer(
+    { 'api.ws': `route("/recibir")
+
+post function recibir(args, query, headers)
+    var msg = WSON.parse(args, headers, "clave-parse-test")
+    return { from: msg.from, content: msg.content, signatureValid: msg.signatureValid, tieneId: msg.id !== undefined }
+` },
+    async (receptorBase) => {
+      const fs2 = require('fs');
+      const os2 = require('os');
+      const path2 = require('path');
+      const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+      const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-parse-'));
+      const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-parse-out-'));
+      fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/enviar")
+
+server wson sender =
+    -> from: "servicio-de-pagos"
+    -> to: "${receptorBase}/recibir"
+    -> content: "pago confirmado"
+    -> secret: "clave-parse-test"
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+`);
+      const { table } = build2(srcDir, outDir);
+      const emisor = start2(table, outDir, 0);
+      await new Promise(resolve => emisor.on('listening', resolve));
+      const emisorPort = emisor.address().port;
+      try {
+        const r = await fetch(`http://localhost:${emisorPort}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const data = await r.json();
+        assert.deepEqual(data, {
+          respuesta: { from: 'servicio-de-pagos', content: 'pago confirmado', signatureValid: true, tieneId: true },
+        });
+      } finally {
+        emisor.close();
+        fs2.rmSync(srcDir, { recursive: true, force: true });
+        fs2.rmSync(outDir, { recursive: true, force: true });
+      }
+    }
+  ));
+
+  test('WSON.history() es GLOBAL al proceso -- una sesión que nunca envió nada ve el historial de otras sesiones', withServer(
+    { 'api.ws': `route("/api/x")
+
+server wson sender =
+    -> from: "yo"
+    -> to: "http://ejemplo-inalcanzable.invalido/recibir"
+    -> content: "mensaje"
+
+post function enviarUno(args)
+    try {
+        await WSON.send(sender)
+    } catch (e) {
+    }
+    return { ok: true }
+
+get function estado(query)
+    return { total: WSON.history().length, soloEnviados: WSON.history({ direction: "sent" }).length }
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const cookie1 = r1.headers.get('set-cookie');
+      const r2 = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const cookie2 = r2.headers.get('set-cookie');
+      assert.notEqual(cookie1, cookie2, 'deben ser sesiones distintas de verdad, para que la prueba tenga sentido');
+
+      // tercera sesión, SIN cookie -- nunca envió nada ella misma
+      const r3 = await fetch(`${base}/api/x`);
+      assert.deepEqual(await r3.json(), { total: 2, soloEnviados: 2 });
+    }
+  ));
+});
+
+describe('WSON, cuarta vuelta: reintentos con backoff, dead letter, WSON.enqueue()', () => {
+  test('un servidor que falla dos veces y responde bien a la tercera SÍ se recupera con retries', withServer(
+    { 'api.ws': `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({ to: args.destino, content: "mensaje", retries: 3, retryDelayMs: 50 })
+    return { respuesta: r }
+` },
+    async (base) => {
+      const http2 = require('http');
+      let intentos = 0;
+      const receptorInestable = http2.createServer((req, res) => {
+        intentos++;
+        if (intentos < 3) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'inestable' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ recibido: true, intento: intentos }));
+      });
+      await new Promise(resolve => receptorInestable.listen(0, resolve));
+      try {
+        const puerto = receptorInestable.address().port;
+        const r = await fetch(`${base}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destino: `http://localhost:${puerto}/x` }),
+        });
+        const data = await r.json();
+        assert.deepEqual(data, { respuesta: { recibido: true, intento: 3 } });
+        assert.equal(intentos, 3, 'debe haber reintentado hasta la tercera vez');
+      } finally {
+        receptorInestable.close();
+      }
+    }
+  ));
+
+  test('tras agotar los reintentos, queda marcado deadLetter: true en el historial, con el número de intentos', withServer(
+    { 'api.ws': `route("/api/x")
+
+post function disparar(args)
+    try {
+        await WSON.send({ to: "http://localhost:1/x", content: "nunca llega", retries: 2, retryDelayMs: 20 })
+    } catch (e) {
+    }
+    return { ok: true }
+
+get function estado(query)
+    return { deadLetters: WSON.history({ deadLetter: true }).length, intentos: WSON.history({ deadLetter: true })[0].attempts }
+` },
+    async (base) => {
+      await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const r = await fetch(`${base}/api/x`);
+      assert.deepEqual(await r.json(), { deadLetters: 1, intentos: 3 });
+    }
+  ));
+
+  test('WSON.enqueue() devuelve al instante, sin esperar al envío real, y el resultado aparece después en el historial con el mismo id', withServer(
+    { 'api.ws': `route("/api/x")
+
+post function disparar(args)
+    var id = WSON.enqueue({ to: args.destino, content: "en segundo plano" })
+    return { idCorrelacion: id }
+
+get function estado(query)
+    return { historial: WSON.history() }
+` },
+    async (base) => {
+      const http2 = require('http');
+      const receptorLento = http2.createServer((req, res) => {
+        setTimeout(() => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ recibido: true }));
+        }, 500);
+      });
+      await new Promise(resolve => receptorLento.listen(0, resolve));
+      try {
+        const puerto = receptorLento.address().port;
+        const inicio = Date.now();
+        const r = await fetch(`${base}/api/x`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destino: `http://localhost:${puerto}/x` }),
+        });
+        const tardo = Date.now() - inicio;
+        assert.ok(tardo < 300, `debe responder mucho antes de los 500ms que tarda el receptor -- tardó ${tardo}ms`);
+        const data = await r.json();
+        assert.ok(data.idCorrelacion, 'debe devolver un id de correlación al instante');
+
+        await new Promise(resolve => setTimeout(resolve, 700));
+        const r2 = await fetch(`${base}/api/x`);
+        const historial = (await r2.json()).historial;
+        assert.equal(historial.length, 1);
+        assert.equal(historial[0].id, data.idCorrelacion, 'el envío de fondo debe usar el MISMO id devuelto al instante');
+      } finally {
+        receptorLento.close();
+      }
+    }
+  ));
 });

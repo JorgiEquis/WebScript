@@ -12,12 +12,9 @@ visual panel =
 </div>
 
 visual subirPrecio =
-<button>
+<button class={boton} onclick={precioBase = precioBase + 10}>
     Subir precio +10
 </button>
-    -> style: boton
-    -> onclick:
-        precioBase = precioBase + 10
 
 render(
     panel,

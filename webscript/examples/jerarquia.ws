@@ -11,19 +11,15 @@ style tarjeta =
     -> border-radius: 8px
 
 visual contadorBtn =
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 
 visual panelTarjeta =
-<div>
+<div class={tarjeta}>
     <h3>{props.titulo}</h3>
     <slot />
 </div>
-    -> style: tarjeta
 
 visual app =
 <panelTarjeta titulo="Panel de control">

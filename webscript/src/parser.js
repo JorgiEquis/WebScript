@@ -106,6 +106,10 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parseServerFunction(lines, i, false);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('server wson ')) {
+      const r = parseWson(lines, i, true);
+      body.push(r.node);
+      i = r.next;
     } else if (trimmed.startsWith('server ')) {
       const r = parseServerDecl(lines, i);
       body.push(r.node);
@@ -128,6 +132,10 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       i = r.next;
     } else if (trimmed.startsWith('function ')) {
       const r = parseFunctionDecl(lines, i, false);
+      body.push(r.node);
+      i = r.next;
+    } else if (trimmed.startsWith('wson ')) {
+      const r = parseWson(lines, i, false);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('style ')) {
@@ -297,7 +305,48 @@ function parseRoute(lines, i) {
 // reactive [tipo] NAME = EXPR -- el tipo (string/number/boolean) es OPCIONAL, y solo
 // se comprueba de forma superficial (ver validate.js): si el valor inicial es un
 // literal simple y no coincide, error; si es una expresión compleja, no se valida.
+// Intenta reconocer un bloque WSON: "NOMBRE =" (sin nada más en esa línea) seguido de
+// líneas indentadas "-> clave: valor". A diferencia de "style" (cuyas propiedades son
+// texto CSS literal, sin sustitución), aquí cada "valor" es una expresión JS de verdad
+// -- pasa por el mismo motor de sustitución que cualquier otra expresión del lenguaje.
+// Se compila sintetizando un objeto literal ("{ clave: valor, ... }") como si fuera el
+// valor inicial normal de un reactive/var -- no hace falta ningún nodo de AST nuevo,
+// ni tratamiento especial en el compilador: para todo lo demás, es una reactive/var
+// cualquiera cuyo valor inicial resulta ser un objeto.
+// Devuelve null si esta línea no es un bloque WSON (para que el llamador siga con el
+// parseo normal de una sola línea).
+function tryParseWsonBlock(lines, i, headerRe) {
+  const header = lines[i].text.trim().match(headerRe);
+  if (!header) return null;
+  const baseIndent = lines[i].indent;
+
+  let j = i + 1;
+  const props = [];
+  while (j < lines.length) {
+    if (isBlank(lines[j])) { j++; continue; }
+    if (lines[j].indent <= baseIndent) break;
+    const t = lines[j].text.trim();
+    if (!t.startsWith('->')) break;
+    const propMatch = t.slice(2).trim().match(/^([A-Za-z_$][\w$]*)\s*:\s*(.+)$/);
+    if (!propMatch) throw new SyntaxError(`Línea ${lines[j].num}: propiedad WSON inválida -> "${t}"`);
+    props.push(`${propMatch[1].trim()}: ${propMatch[2].trim()}`);
+    j++;
+  }
+
+  if (props.length === 0) return null; // "NOMBRE =" sin nada detrás NI -> debajo -- no es WSON, es un error normal de "falta el valor"
+
+  return { header, init: `{ ${props.join(', ')} }`, next: j };
+}
+
 function parseReactive(lines, i) {
+  const headerRe = /^reactive\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*$/;
+  const wson = tryParseWsonBlock(lines, i, headerRe);
+  if (wson) {
+    return {
+      node: { type: 'ReactiveDecl', name: wson.header[2], init: wson.init, varType: wson.header[1] || null, line: lines[i].num },
+      next: wson.next,
+    };
+  }
   const m = lines[i].text.trim().match(/^reactive\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+)$/);
   if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "reactive [tipo] NOMBRE = valor"`);
   return {
@@ -309,6 +358,14 @@ function parseReactive(lines, i) {
 // var [tipo] NAME = EXPR -- NO reactivo: se calcula una sola vez, no re-renderiza nada
 // al cambiar. Mismo tipado opcional que "reactive".
 function parseVarDecl(lines, i) {
+  const headerRe = /^var\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*$/;
+  const wson = tryParseWsonBlock(lines, i, headerRe);
+  if (wson) {
+    return {
+      node: { type: 'VarDecl', name: wson.header[2], init: wson.init, varType: wson.header[1] || null, line: lines[i].num },
+      next: wson.next,
+    };
+  }
   const m = lines[i].text.trim().match(/^var\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+)$/);
   if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "var [tipo] NOMBRE = valor"`);
   return {
@@ -421,6 +478,24 @@ function parseServerFunction(lines, i, isAsync) {
 // declaradas "reactive" pueden observarse.)
 function parseServerDecl(lines, i) {
   const t = lines[i].text.trim();
+
+  const reactiveWsonRe = /^server\s+reactive\s+([A-Za-z_$][\w$]*)\s*=\s*$/;
+  const wsonReactive = tryParseWsonBlock(lines, i, reactiveWsonRe);
+  if (wsonReactive) {
+    return {
+      node: { type: 'ServerReactiveDecl', name: wsonReactive.header[1], init: wsonReactive.init, line: lines[i].num },
+      next: wsonReactive.next,
+    };
+  }
+  const varWsonRe = /^server\s+var\s+([A-Za-z_$][\w$]*)\s*=\s*$/;
+  const wsonVar = tryParseWsonBlock(lines, i, varWsonRe);
+  if (wsonVar) {
+    return {
+      node: { type: 'ServerVarDecl', name: wsonVar.header[1], init: wsonVar.init, line: lines[i].num },
+      next: wsonVar.next,
+    };
+  }
+
   const reactiveMatch = t.match(/^server\s+reactive\s+([A-Za-z_$][\w$]*)\s*(?:=\s*(.+))?$/);
   if (reactiveMatch) {
     const [, name, init] = reactiveMatch;
@@ -493,6 +568,58 @@ function parseStyle(lines, i) {
   return { node: { type: 'StyleDecl', name, props, line: lines[i].num }, next: j };
 }
 
+// wson NOMBRE = / server wson NOMBRE =
+//     -> from: expr        (opcional -- mensaje anónimo si se omite)
+//     -> to: expr           (obligatorio -- URL, o más adelante email/teléfono)
+//     -> via: expr          (opcional -- "POST" por defecto; también admite "PUT"/"DELETE")
+//     -> content: expr      (obligatorio -- el payload del mensaje)
+// WSON es solo una ESTRUCTURA DE DATOS -- declararla nunca envía nada por sí sola, hace
+// falta llamar a WSON.send(nombre) explícitamente. Mismo patrón exacto que "style"
+// (cabecera con "=" vacío, bindings "->" indentados debajo), reutilizado a propósito
+// para quedar consistente con el resto del lenguaje -- no una sintaxis nueva de cero.
+function parseWson(lines, i, isServer) {
+  const keyword = isServer ? 'server\\s+wson' : 'wson';
+  const header = lines[i].text.trim().match(new RegExp(`^${keyword}\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*$`));
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${isServer ? 'server ' : ''}wson NOMBRE ="`);
+  const baseIndent = lines[i].indent;
+  const name = header[1];
+  const fields = [];
+
+  let j = i + 1;
+  while (j < lines.length) {
+    if (isBlank(lines[j])) { j++; continue; }
+    if (lines[j].indent <= baseIndent) break;
+    const t = lines[j].text.trim();
+    if (!t.startsWith('->')) break;
+    const fieldMatch = t.slice(2).trim().match(/^(from|to|via|content|secret|encrypt|id|retries|retryDelayMs)\s*:\s*(.+)$/);
+    if (!fieldMatch) {
+      throw new SyntaxError(
+        `Línea ${lines[j].num}: campo de WSON inválido -> "${t}" -- las únicas claves ` +
+        `válidas son "from", "to", "via", "content", "secret", "encrypt", "id", "retries" y "retryDelayMs".`
+      );
+    }
+    fields.push({ key: fieldMatch[1].trim(), value: fieldMatch[2].trim(), fieldLine: lines[j].num });
+    j++;
+  }
+
+  const keys = fields.map(f => f.key);
+  if (!keys.includes('to')) {
+    throw new SyntaxError(`"${isServer ? 'server ' : ''}wson ${name}" (línea ${lines[i].num}) necesita "-> to: ..." -- es el único campo obligatorio junto con "content" (todo mensaje necesita saber a dónde va).`);
+  }
+  if (!keys.includes('content')) {
+    throw new SyntaxError(`"${isServer ? 'server ' : ''}wson ${name}" (línea ${lines[i].num}) necesita "-> content: ..." -- un mensaje sin contenido no tiene sentido.`);
+  }
+  const dup = keys.find((k, idx) => keys.indexOf(k) !== idx);
+  if (dup) {
+    throw new SyntaxError(`"${isServer ? 'server ' : ''}wson ${name}" (línea ${lines[i].num}) repite el campo "${dup}" -- cada campo (from/to/via/content) solo puede aparecer una vez.`);
+  }
+
+  return {
+    node: { type: isServer ? 'ServerWsonDecl' : 'WsonDecl', name, fields, line: lines[i].num },
+    next: j,
+  };
+}
+
 // visual NAME =
 // <html template...>
 //   -> key: value
@@ -533,37 +660,21 @@ function parseVisual(lines, i) {
   const template = templateResult.template;
   j = templateResult.next;
 
-  // 2. Recolectar bindings "-> key: value" o "-> key:" seguido de bloque
-  const bindings = [];
-  while (j < lines.length) {
-    if (isBlank(lines[j])) { j++; continue; }
-    if (lines[j].indent <= baseIndent) break;
-    const t = lines[j].text.trim();
-    if (!t.startsWith('->')) break;
-    const bindingIndent = lines[j].indent;
-    const rest = t.slice(2).trim();
-    const colonIdx = rest.indexOf(':');
-    if (colonIdx === -1) throw new SyntaxError(`Línea ${lines[j].num}: binding inválido -> "${t}"`);
-    const key = rest.slice(0, colonIdx).trim();
-    const inlineValue = rest.slice(colonIdx + 1).trim();
-    j++;
-
-    if (inlineValue !== '') {
-      bindings.push({ key, kind: 'value', value: inlineValue });
-    } else {
-      // bloque de código indentado
-      const codeLines = [];
-      while (j < lines.length) {
-        if (isBlank(lines[j])) { j++; continue; }
-        if (lines[j].indent <= bindingIndent) break;
-        codeLines.push(lines[j].text.trim());
-        j++;
-      }
-      bindings.push({ key, kind: 'block', code: codeLines.join('\n') });
-    }
+  // Sintaxis "-> key: value" ELIMINADA -- sustituida por atributos en línea, directamente
+  // en cualquier nodo de la plantilla (no solo la raíz): "onclick={código}" en vez de
+  // "-> onclick:", "class={expr}" en vez de "-> style: nombre". Se detecta aquí para dar
+  // un error de migración claro, en vez de dejar que "->" quede como texto suelto sin
+  // reconocer tras la plantilla.
+  if (j < lines.length && !isBlank(lines[j]) && lines[j].indent > baseIndent && lines[j].text.trim().startsWith('->')) {
+    throw new SyntaxError(
+      `Línea ${lines[j].num}: la sintaxis "-> clave: valor" después de la plantilla ya no existe -- ` +
+      `ahora los bindings van en línea, dentro de la propia etiqueta, en cualquier nodo (no solo la raíz). ` +
+      `"-> onclick: codigo" se escribe "onclick={codigo}" directamente en el elemento; ` +
+      `"-> style: nombre" se escribe "class={nombre}" (el nombre de un "style" ya es literalmente su clase CSS).`
+    );
   }
 
-  return { node: { type: 'VisualDecl', name, localReactives, localVars, template, bindings, line: declLine }, next: j };
+  return { node: { type: 'VisualDecl', name, localReactives, localVars, template, line: declLine }, next: j };
 }
 
 // render( a, b, c )  -- puede ocupar varias líneas hasta el ")"

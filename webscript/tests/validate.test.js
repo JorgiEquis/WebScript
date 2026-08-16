@@ -17,7 +17,7 @@ describe('validate: nombres duplicados', () => {
   });
 
   test('style SÍ puede compartir nombre con visual (espacio separado)', () => {
-    const src = 'style boton =\n    -> color: red\n\nvisual boton =\n<p>x</p>\n    -> style: boton\n\nrender(\n    boton\n)';
+    const src = 'style boton =\n    -> color: red\n\nvisual boton =\n<p class={boton}>x</p>\n\nrender(\n    boton\n)';
     assert.doesNotThrow(() => parseSource(src));
   });
 
@@ -93,7 +93,7 @@ describe('validate: server var / server function prohibidas en visuales', () => 
   });
 
   test('post function SÍ puede llamarse desde un visual (es la excepción)', () => {
-    const src = 'post function postController(args)\n    return { ok: true }\n\nvisual v =\n<button>\n    x\n</button>\n    -> onclick:\n        postController({})\n\nrender(\n    v\n)';
+    const src = 'post function postController(args)\n    return { ok: true }\n\nvisual v =\n<button onclick={postController({})}>\n    x\n</button>\n\nrender(\n    v\n)';
     assert.doesNotThrow(() => parseSource(src));
   });
 

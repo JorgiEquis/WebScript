@@ -6,12 +6,9 @@ style boton =
     -> border: none
 
 visual contadorBtn =
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 
 render(
     contadorBtn

@@ -8,6 +8,7 @@ function compile(ast, options = {}) {
   const reactives = ast.body.filter(n => n.type === 'ReactiveDecl');
   const globalVars = ast.body.filter(n => n.type === 'VarDecl');
   const functions = ast.body.filter(n => n.type === 'FunctionDecl');
+  const wsons = ast.body.filter(n => n.type === 'WsonDecl');
   const styles = ast.body.filter(n => n.type === 'StyleDecl');
   const visuals = ast.body.filter(n => n.type === 'VisualDecl');
   const renderCall = ast.body.find(n => n.type === 'RenderCall');
@@ -15,6 +16,7 @@ function compile(ast, options = {}) {
   const serverReactives = ast.body.filter(n => n.type === 'ServerReactiveDecl');
   const watchDecls = ast.body.filter(n => n.type === 'WatchDecl');
   const serverFunctions = ast.body.filter(n => n.type === 'ServerFunctionDecl');
+  const serverWsons = ast.body.filter(n => n.type === 'ServerWsonDecl');
   const postFn = ast.body.find(n => n.type === 'PostFunctionDecl') || null;
   const putFn = ast.body.find(n => n.type === 'PutFunctionDecl') || null;
   const deleteFn = ast.body.find(n => n.type === 'DeleteFunctionDecl') || null;
@@ -30,9 +32,9 @@ function compile(ast, options = {}) {
   const visualNames = new Set(visuals.map(v => v.name));
 
   const css = compileCSS(styles);
-  const js = compileJS(reactives, globalVars, functions, visuals, renderCall, globalNames, visualNames, serverDataUrl, httpFns, routePath);
+  const js = compileJS(reactives, globalVars, functions, wsons, visuals, renderCall, globalNames, visualNames, serverDataUrl, httpFns, routePath, styles.map(s => s.name));
   const html = compileHTML(cssFilename, jsFilename);
-  const server = compileServerJS(serverVars, serverFunctions, serverHttpFns, serverReactives, watchDecls);
+  const server = compileServerJS(serverVars, serverFunctions, serverHttpFns, serverReactives, watchDecls, serverWsons);
 
   return { html, css, js, server };
 }
@@ -45,10 +47,10 @@ function usesServerData(ast) {
   for (const n of ast.body) {
     if (n.type === 'ReactiveDecl' || n.type === 'VarDecl') exprs.push(n.init);
     if (n.type === 'FunctionDecl') exprs.push(n.body);
+    if (n.type === 'WsonDecl') { for (const f of n.fields) exprs.push(f.value); }
     if (n.type === 'VisualDecl') {
       for (const r of n.localReactives) exprs.push(r.init);
       for (const v of n.localVars) exprs.push(v.init);
-      for (const b of n.bindings) exprs.push(b.kind === 'value' ? b.value : b.code);
       collectAllTemplateExprs(n.template, exprs);
     }
   }
@@ -82,7 +84,7 @@ function collectAllTemplateExprs(node, exprs) {
 // a nivel de módulo. Cada sesión (identificada por cookie en el servidor HTTP) llama a
 // createSessionState() UNA vez y se queda con su propia instancia -- así dos visitantes
 // nunca comparten el mismo "let totalConIva", cada uno tiene la suya.
-function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverReactives = [], watchDecls = []) {
+function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverReactives = [], watchDecls = [], serverWsons = []) {
   const { post: postFn = null, put: putFn = null, delete: deleteFn = null, get: getFn = null } = httpFns;
   const allHttpFns = [
     ['get', 'GET', getFn],
@@ -91,7 +93,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     ['delete', 'DELETE', deleteFn],
   ].filter(([, , fn]) => fn);
 
-  if (serverVars.length === 0 && serverFunctions.length === 0 && allHttpFns.length === 0 && serverReactives.length === 0) return null;
+  if (serverVars.length === 0 && serverFunctions.length === 0 && allHttpFns.length === 0 && serverReactives.length === 0 && serverWsons.length === 0) return null;
 
   const serverReactiveNames = serverReactives.map(d => d.name);
 
@@ -107,6 +109,14 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
   const inner = [];
   for (const v of serverVars) {
     inner.push(`  let ${v.name} = ${v.init}; // server var`);
+  }
+
+  if (serverWsons.length > 0) {
+    inner.push('', '  // wson -- estructura de datos para describir un mensaje saliente (from/to/via/content). Declararla NO envía nada -- hace falta llamar a WSON.send(NOMBRE) explícitamente.');
+    for (const w of serverWsons) {
+      const objLit = w.fields.map(f => `${f.key}: ${substituteReactiveRefs(f.value)}`).join(', ');
+      inner.push(`  let ${w.name} = { ${objLit} }; // server wson`);
+    }
   }
 
   if (serverReactiveNames.length > 0) {
@@ -176,10 +186,13 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     '  };'
   );
 
-  // Detecta si algún cuerpo (server function, las cuatro HTTP, o los watch) usa "http."
-  // o "whisper(" -- solo se incluye la definición si de verdad se usa, igual que con
-  // los stubs de cliente.
+  // Detecta si algún cuerpo (server function, las cuatro HTTP, o los watch) usa "http.",
+  // "whisper(", o "WSON.send("/"WSON.verify("/"WSON.showContent("/"WSON.parse("/
+  // "WSON.history(" -- solo se incluye la definición si de verdad se usa, igual que con
+  // los stubs de cliente. Cualquiera de los WSON.* también activa "http" aunque el
+  // código del usuario no escriba "http." en ningún sitio -- lo usan por dentro.
   const allBodies = [...serverFunctions, ...allHttpFns.map(([, , fn]) => fn), ...watchDecls].map(fn => fn.body);
+  const usesWson = allBodies.some(body => /\bWSON\.(send|enqueue|verify|showContent|parse|history)\s*\(/.test(body));
   const usesHttpObject = allBodies.some(body => /\bhttp\s*\./.test(body));
   const usesWhisper = allBodies.some(body => /\bwhisper\s*\(/.test(body));
 
@@ -192,6 +205,194 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '',
     ]
     : [];
+
+  const wsonSendDef = usesWson
+    ? [
+      '// WSON.send(wson) -- envía un objeto WSON ({ from?, to, via?, content, secret?,',
+      '// encrypt?, id? }) al sistema (o SISTEMAS, si "to" es un array) que indique "to".',
+      '// Es SOLO envío -- construir el WSON (server wson NOMBRE = ...) nunca envía nada por',
+      '// sí solo, siempre hace falta llamar a WSON.send() explícitamente. "via" es opcional',
+      '// (por defecto POST); "from" es opcional (mensajes anónimos, y viaja como cabecera',
+      '// "X-WSON-From" para que el receptor sepa quién lo mandó). De momento SOLO admite "to"',
+      '// como URL (o array de URLs) con via POST/PUT/DELETE -- enviar a un email o número de',
+      '// teléfono está pensado pero no implementado todavía (necesita conectar un servicio',
+      '// real de correo/SMS, algo que no se puede montar ni probar sin credenciales reales).',
+      '//',
+      '// VARIOS DESTINOS: si "to" es un array, se manda a todos EN PARALELO y se devuelve un',
+      '// array de resultados en el mismo orden -- el fallo de UNO no tumba a los demás (cada',
+      '// entrada del array indica su propio éxito/error). Con "to" como string de siempre,',
+      '// se sigue devolviendo un único resultado, sin cambios.',
+      '//',
+      '// FIRMA: si el WSON tiene "secret", se firma automáticamente (HMAC-SHA256 de lo que',
+      '// de verdad se manda -- el content cifrado, si lo está, o el content tal cual si no)',
+      '// y se manda como cabecera "X-WSON-Signature: sha256=<hex>". El secreto en sí nunca',
+      '// viaja por la red. WSON.verify(payload, cabeceraFirma, secreto), en el receptor, hace',
+      '// la comprobación inversa -- con comparación en tiempo constante',
+      '// (crypto.timingSafeEqual), para no filtrar el secreto por temporización.',
+      '//',
+      '// CIFRADO OPCIONAL: con "encrypt: true" (necesita "secret" también, como clave), el',
+      '// "content" se cifra con AES-256-GCM (cifrado AUTENTICADO -- confidencialidad y',
+      '// detección de manipulación en un solo paso, no dos por separado) antes de mandarlo.',
+      '// La clave de cifrado se deriva del secreto con una sal distinta a la que usa la',
+      '// firma, para no reutilizar la misma clave cruda en dos construcciones criptográficas',
+      '// distintas. Sistemas que NO son WebScript nunca podrán descifrarlo sin conocer el',
+      '// secreto -- por diseño, ya que es justo el punto de cifrarlo. WSON.showContent(',
+      '// payload, secreto), en el receptor, descifra -- o si el mensaje no estaba cifrado,',
+      '// lo devuelve tal cual, para no obligar al receptor a ramificar su propio código según',
+      '// si el emisor cifró o no. Si el descifrado falla (clave equivocada, o manipulado),',
+      '// devuelve null -- comprobable con "if (!resultado)", sin necesitar try/catch.',
+      '//',
+      '// ID DE CORRELACIÓN: automático por envío (no se guarda en el objeto "wson" -- si lo',
+      '// hiciera, reenviar el MISMO objeto reutilizaría el mismo id, que sería incorrecto),',
+      '// mandado como cabecera "X-WSON-Correlation-Id". Si el propio wson ya trae "id", se',
+      '// respeta ese en vez de generar uno nuevo.',
+      '//',
+      '// WSON.parse(payload, headers, secreto?) -- en el receptor, hace de una vez lo que si',
+      '// no serían tres pasos sueltos (leer "from"/"id" de las cabeceras + WSON.verify() +',
+      '// WSON.showContent()): devuelve { from, id, content, signatureValid }. Sin "secreto",',
+      '// no intenta verificar ni descifrar -- "content" es el payload tal cual, "signatureValid"',
+      '// queda "undefined" (ni verdadero ni falso: sencillamente no se comprobó).',
+      '//',
+      '// WSON.history(filtros?) -- almacén EN MEMORIA, compartido por TODO EL PROCESO (no por',
+      '// sesión -- es un registro de comunicación entre sistemas, no estado de un visitante',
+      '// concreto). WSON.send() registra cada envío, WSON.parse() registra cada recepción,',
+      '// automáticamente. Con límite de 1000 entradas (las más viejas se descartan) para no',
+      '// crecer sin límite en memoria. Se pierde al reiniciar el proceso -- no hay persistencia',
+      '// real (necesitaría una base de datos de verdad, fuera del alcance de lo que se puede',
+      '// montar y probar en este entorno).',
+      'function __wsonDeriveKey(secret, salt) {',
+      "  return require('crypto').createHash('sha256').update(secret + ':' + salt).digest();",
+      '}',
+      'const __wsonHistory = [];',
+      'function __wsonRecord(entry) {',
+      '  __wsonHistory.push(Object.assign({ timestamp: Date.now() }, entry));',
+      '  if (__wsonHistory.length > 1000) __wsonHistory.shift();',
+      '}',
+      'const WSON = {',
+      '  send: async (wson) => {',
+      "    const via = (wson.via || 'POST').toUpperCase();",
+      "    if (via !== 'POST' && via !== 'PUT' && via !== 'DELETE') {",
+      "      throw new Error('WSON.send(): via \"' + wson.via + '\" no soportado todavía -- solo POST/PUT/DELETE por ahora (email y teléfono, pendientes de conectar un servicio real).');",
+      '    }',
+      '    const crypto_ = require(\'crypto\');',
+      '    let payload = wson.content;',
+      '    if (wson.encrypt) {',
+      "      const key = __wsonDeriveKey(wson.secret, 'wson-encrypt');",
+      '      const iv = crypto_.randomBytes(12);',
+      "      const cipher = crypto_.createCipheriv('aes-256-gcm', key, iv);",
+      "      const ciphertext = Buffer.concat([cipher.update(JSON.stringify(wson.content), 'utf8'), cipher.final()]);",
+      '      const authTag = cipher.getAuthTag();',
+      '      payload = {',
+      '        __wsonEncrypted: true,',
+      "        iv: iv.toString('base64'),",
+      "        ciphertext: ciphertext.toString('base64'),",
+      "        authTag: authTag.toString('base64'),",
+      '      };',
+      '    }',
+      "    const correlationId = wson.id || crypto_.randomUUID();",
+      "    const headers = { 'X-WSON-Correlation-Id': correlationId };",
+      "    if (wson.from) headers['X-WSON-From'] = wson.from;",
+      '    if (wson.secret) {',
+      "      const sig = crypto_.createHmac('sha256', wson.secret).update(JSON.stringify(payload)).digest('hex');",
+      "      headers['X-WSON-Signature'] = 'sha256=' + sig;",
+      '    }',
+      '    async function __wsonFetchOnce(url) {',
+      "      const opts = { method: via, headers: Object.assign({}, headers) };",
+      "      if (payload !== undefined) {",
+      "        if (!opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';",
+      '        opts.body = JSON.stringify(payload);',
+      '      }',
+      '      const res = await fetch(url, opts);',
+      '      const text = await res.text();',
+      "      let parsed; try { parsed = JSON.parse(text); } catch (e) { parsed = text; }",
+      '      if (!res.ok) {',
+      "        const err = new Error('WSON.send(): el destino respondió ' + res.status + (res.statusText ? (' ' + res.statusText) : ''));",
+      '        err.status = res.status;',
+      '        err.body = parsed;',
+      '        throw err;',
+      '      }',
+      '      return parsed;',
+      '    }',
+      '    async function __sendOne(destino) {',
+      '      const maxAttempts = 1 + (wson.retries || 0);',
+      '      const baseDelay = wson.retryDelayMs || 500;',
+      '      let lastError;',
+      '      for (let attempt = 1; attempt <= maxAttempts; attempt++) {',
+      '        try {',
+      '          const result = await __wsonFetchOnce(destino);',
+      "          __wsonRecord({ direction: 'sent', from: wson.from, to: destino, via: via, content: wson.content, id: correlationId, attempts: attempt });",
+      '          return result;',
+      '        } catch (e) {',
+      '          lastError = e;',
+      '          if (attempt < maxAttempts) {',
+      '            await new Promise((resolve) => setTimeout(resolve, baseDelay * Math.pow(2, attempt - 1)));',
+      '          }',
+      '        }',
+      '      }',
+      "      __wsonRecord({ direction: 'sent', from: wson.from, to: destino, via: via, content: wson.content, id: correlationId, error: lastError.message, attempts: maxAttempts, deadLetter: true });",
+      '      throw lastError;',
+      '    }',
+      '    if (Array.isArray(wson.to)) {',
+      '      const results = await Promise.allSettled(wson.to.map((destino) => __sendOne(destino)));',
+      "      return results.map((r) => (r.status === 'fulfilled' ? r.value : { error: true, message: r.reason.message }));",
+      '    }',
+      '    return await __sendOne(wson.to);',
+      '  },',
+      '  enqueue: (wson) => {',
+      "    const correlationId = wson.id || require('crypto').randomUUID();",
+      '    WSON.send(Object.assign({}, wson, { id: correlationId })).catch(() => {});',
+      '    return correlationId;',
+      '  },',
+      '  verify: (payload, signatureHeader, secret) => {',
+      '    if (!signatureHeader) return false;',
+      "    const expected = 'sha256=' + require('crypto').createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');",
+      '    const a = Buffer.from(signatureHeader);',
+      '    const b = Buffer.from(expected);',
+      '    if (a.length !== b.length) return false;',
+      "    return require('crypto').timingSafeEqual(a, b);",
+      '  },',
+      '  showContent: (payload, secret) => {',
+      "    if (!payload || typeof payload !== 'object' || !payload.__wsonEncrypted) return payload;",
+      '    try {',
+      "      const key = __wsonDeriveKey(secret, 'wson-encrypt');",
+      "      const crypto_ = require('crypto');",
+      "      const iv = Buffer.from(payload.iv, 'base64');",
+      "      const authTag = Buffer.from(payload.authTag, 'base64');",
+      "      const decipher = crypto_.createDecipheriv('aes-256-gcm', key, iv);",
+      '      decipher.setAuthTag(authTag);',
+      "      const decrypted = Buffer.concat([decipher.update(Buffer.from(payload.ciphertext, 'base64')), decipher.final()]);",
+      "      return JSON.parse(decrypted.toString('utf8'));",
+      '    } catch (e) {',
+      '      return null;',
+      '    }',
+      '  },',
+      '  parse: (payload, headers, secret) => {',
+      "    const from = headers ? headers['x-wson-from'] : undefined;",
+      "    const id = headers ? headers['x-wson-correlation-id'] : undefined;",
+      '    let content = payload;',
+      '    let signatureValid;',
+      '    if (secret) {',
+      "      signatureValid = WSON.verify(payload, headers ? headers['x-wson-signature'] : undefined, secret);",
+      '      content = WSON.showContent(payload, secret);',
+      '    }',
+      "    __wsonRecord({ direction: 'received', from: from, content: content, id: id, signatureValid: signatureValid });",
+      '    return { from: from, id: id, content: content, signatureValid: signatureValid };',
+      '  },',
+      '  history: (filtros) => {',
+      '    let results = __wsonHistory;',
+      '    if (filtros) {',
+      "      if (filtros.direction) results = results.filter((e) => e.direction === filtros.direction);",
+      "      if (filtros.from) results = results.filter((e) => e.from === filtros.from);",
+      "      if (filtros.to) results = results.filter((e) => e.to === filtros.to);",
+      "      if (filtros.id) results = results.filter((e) => e.id === filtros.id);",
+      '    }',
+      '    return results.slice();',
+      '  },',
+      '};',
+      '',
+    ]
+    : [];
+
 
   const httpObjectDef = usesHttpObject
     ? [
@@ -237,6 +438,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     '',
     ...whisperDef,
     ...httpObjectDef,
+    ...wsonSendDef,
     'function createSessionState() {',
     ...inner,
     '}',
@@ -458,8 +660,29 @@ function injectVarsAsLocals(expr, names, prefix) {
   return out;
 }
 
+// Igual que injectVars, pero sustituye a un LITERAL DE TEXTO (JSON.stringify(nombre),
+// que para un identificador simple es solo el mismo nombre entre comillas) en vez de a
+// un acceso de propiedad -- para "class={estilo}", donde "estilo" es el nombre de un
+// "style" declarado. Ese "style" nunca existe como variable JS (se compila SOLO a CSS),
+// así que referenciarlo tal cual en una expresión daría ReferenceError -- aquí se
+// convierte "estilo" en el string "estilo" directamente, que es literalmente el nombre
+// de la clase CSS que "style estilo = ..." genera.
+function injectVarsAsStringLiterals(expr, names) {
+  let out = expr;
+  for (const name of names) {
+    const matches = findIdentifierMatches(out, name);
+    for (let k = matches.length - 1; k >= 0; k--) {
+      const m = matches[k];
+      if (m.expand) continue; // un nombre de style en posición de atajo de objeto no tiene sentido, se deja tal cual
+      const replacement = JSON.stringify(name);
+      out = out.slice(0, m.index) + replacement + out.slice(m.index + name.length);
+    }
+  }
+  return out;
+}
+
 // -------- JS: genera funciones create_NAME(state, effect, props) para cada visual --------
-function compileJS(reactives, globalVars, functions, visuals, renderCall, globalNames, visualNames, serverDataUrl = null, httpFns = {}, routePath = null) {
+function compileJS(reactives, globalVars, functions, wsons, visuals, renderCall, globalNames, visualNames, serverDataUrl = null, httpFns = {}, routePath = null, styleNames = []) {
   const { post: postFn = null, put: putFn = null, delete: deleteFn = null } = httpFns;
   const allHttpFns = [
     ['post', 'POST', postFn],
@@ -718,11 +941,25 @@ function compileJS(reactives, globalVars, functions, visuals, renderCall, global
       const tag = node.tag === '__root__' ? 'div' : node.tag;
       lines.push(`  const ${varName} = document.createElement(${JSON.stringify(tag)});`);
       for (const [attr, value] of Object.entries(node.attrs || {})) {
-        if (value === true) {
+        const isInterpolated = typeof value === 'string' && value.startsWith('{') && value.endsWith('}');
+        const isEventAttr = /^on[a-z]+$/.test(attr);
+
+        if (isEventAttr && isInterpolated) {
+          // onclick={código} / onXXX={código} -- evento en línea, en CUALQUIER nodo
+          // (no solo la raíz). Reutiliza exactamente la misma detección de async/await
+          // que ya usábamos para los bindings "-> onXXX:" -- un solo motor, dos formas
+          // de invocarlo, para no duplicar la lógica de RPC/await.
+          emitEventListener(lines, varName, attr.slice(2).toLowerCase(), value.slice(1, -1).trim(), ctx);
+        } else if (value === true) {
           lines.push(`  ${varName}.setAttribute(${JSON.stringify(attr)}, "");`);
-        } else if (typeof value === 'string' && value.startsWith('{') && value.endsWith('}')) {
+        } else if (isInterpolated) {
+          // "class={expr}" incluido aquí -- sin caso especial: si "expr" referencia el
+          // nombre de un "style" declarado, se sustituye antes por su clase CSS (que es
+          // literalmente el mismo nombre); cualquier otra expresión (reactive, ternario,
+          // combinación de ambas) sigue el camino normal de interpolación reactiva.
           const raw = value.slice(1, -1).trim();
-          emitReactive(lines, raw, ctx, (compiled) => `${varName}.setAttribute(${JSON.stringify(attr)}, ${compiled});`);
+          const withStyleNames = attr === 'class' ? injectVarsAsStringLiterals(raw, styleNames) : raw;
+          emitReactive(lines, withStyleNames, ctx, (compiled) => `${varName}.setAttribute(${JSON.stringify(attr)}, ${compiled});`);
         } else {
           lines.push(`  ${varName}.setAttribute(${JSON.stringify(attr)}, ${JSON.stringify(value)});`);
         }
@@ -734,6 +971,27 @@ function compileJS(reactives, globalVars, functions, visuals, renderCall, global
       return varName;
     }
     throw new Error(`Nodo de plantilla desconocido: ${node.type}`);
+  }
+
+  // Genera un addEventListener para CUALQUIER nodo (no solo la raíz) -- detecta si el
+  // cuerpo necesita ser async (llama a un post/put/delete function, o ya tiene un
+  // "await" explícito -- ej. WSON.send()) e inyecta "await" delante de las llamadas a
+  // RPC que el usuario no haya puesto ya.
+  function emitEventListener(lines, varName, eventName, body, ctx) {
+    const rpcNames = allHttpFns.map(([, , fn]) => fn.name);
+    const rpcPattern = rpcNames.length > 0 ? rpcNames.map(n => `\\b${n}\\s*\\(`).join('|') : null;
+    const usesRpc = rpcPattern ? new RegExp(rpcPattern).test(body) : false;
+    const usesExplicitAwait = /\bawait\b/.test(body);
+    const needsAsync = usesRpc || usesExplicitAwait;
+    const injected = transform(body, ctx)
+      .split('\n')
+      .map(l => '    ' + l)
+      .join('\n');
+    const asyncKw = needsAsync ? 'async ' : '';
+    const awaitedInjected = usesRpc
+      ? injected.replace(new RegExp(`(?<!await\\s)(${rpcPattern})`, 'g'), 'await $1')
+      : injected;
+    lines.push(`  ${varName}.addEventListener(${JSON.stringify(eventName)}, ${asyncKw}(event) => {\n${awaitedInjected}\n  });`);
   }
 
   const visualFns = visuals.map(v => {
@@ -754,30 +1012,6 @@ function compileJS(reactives, globalVars, functions, visuals, renderCall, global
     }
 
     const rootVar = emitNode(v.template, lines, ctx);
-
-    for (const b of v.bindings) {
-      if (b.key === 'style') {
-        lines.push(`  ${rootVar}.classList.add(${JSON.stringify(b.value)});`);
-      } else if (b.key.startsWith('on')) {
-        const eventName = b.key.slice(2).toLowerCase();
-        const body = b.kind === 'block' ? b.code : b.value;
-        const rpcNames = allHttpFns.map(([, , fn]) => fn.name);
-        const rpcPattern = rpcNames.length > 0 ? rpcNames.map(n => `\\b${n}\\s*\\(`).join('|') : null;
-        const usesRpc = rpcPattern ? new RegExp(rpcPattern).test(body) : false;
-        const injected = transform(body, ctx)
-          .split('\n')
-          .map(l => '    ' + l)
-          .join('\n');
-        const asyncKw = usesRpc ? 'async ' : '';
-        const awaitedInjected = usesRpc
-          ? injected.replace(new RegExp(`(?<!await\\s)(${rpcPattern})`, 'g'), 'await $1')
-          : injected;
-        lines.push(`  ${rootVar}.addEventListener(${JSON.stringify(eventName)}, ${asyncKw}(event) => {\n${awaitedInjected}\n  });`);
-      } else {
-        const val = b.kind === 'value' ? b.value : b.code;
-        lines.push(`  ${rootVar}.setAttribute(${JSON.stringify(b.key)}, ${JSON.stringify(val)});`);
-      }
-    }
 
     lines.push(`  return ${rootVar};`);
     return `function create_${v.name}(state, effect, props = {}) {\n${lines.join('\n')}\n}`;
@@ -800,15 +1034,102 @@ function compileJS(reactives, globalVars, functions, visuals, renderCall, global
     .map(fn => `${fn.isAsync ? 'async ' : ''}function ${fn.name}(${fn.params}) {\n${transform(fn.body, { localNames: [] }).split('\n').map(l => '  ' + l).join('\n')}\n}`)
     .join('\n\n');
 
-  // ¿Se llama a cada función (post/put/delete) desde algún handler? Si nadie la usa,
-  // no generamos su stub de cliente -- no tiene sentido exponerla si nadie la llama.
+  // "wson NOMBRE = -> ..." de cliente -- estructura de datos (from/to/via/content).
+  // Declararla nunca envía nada, solo WSON.send(NOMBRE) lo hace.
+  const wsonLines = wsons
+    .map(w => `let ${w.name} = { ${w.fields.map(f => `${f.key}: ${transform(f.value, { localNames: [] })}`).join(', ')} }; // wson`)
+    .join('\n');
+
+  // ¿Se usa WSON.send( en algún sitio de cliente (reactive/var/function/wson/plantillas,
+  // incluyendo atributos en línea como onclick={...})? Solo se genera el objeto WSON si
+  // de verdad se usa, igual que el resto de helpers condicionales del proyecto.
+  const clientBodiesForWsonCheck = [
+    ...globalVars.map(v => v.init),
+    ...functions.map(fn => fn.body),
+    ...visuals.flatMap(v => {
+      const exprs = [];
+      collectAllTemplateExprs(v.template, exprs);
+      return exprs;
+    }),
+  ];
+  const usesWsonSendClient = clientBodiesForWsonCheck.some(body => /\bWSON\.(send|enqueue)\s*\(/.test(body));
+  const wsonSendClientDef = usesWsonSendClient
+    ? [
+      '// WSON.send(wson) -- envía un objeto WSON ({ from?, to, via?, content, retries?,',
+      '// retryDelayMs?, id? }) al sistema que indique "to" (o a VARIOS, si "to" es un array',
+      '// -- en paralelo, cada uno con su propio éxito/error, sin que el fallo de uno tumbe a',
+      '// los demás), directamente desde el navegador (fetch). Declarar el wson nunca envía',
+      '// nada por sí solo -- siempre hace falta llamar a WSON.send() explícitamente. "from"',
+      '// viaja como cabecera "X-WSON-From". Con "retries", reintenta con espera creciente',
+      '// (backoff exponencial) si el destino falla o responde con un código de error --',
+      '// tanto fallo de red como un 4xx/5xx cuentan como fallo reintentable. De momento SOLO',
+      '// admite "to" como URL con via POST/PUT/DELETE. Sin firma ni cifrado en el cliente --',
+      '// eso es exclusivo del servidor (ver WSON.send() de server.js).',
+      '//',
+      '// WSON.enqueue(wson) -- versión NO bloqueante: devuelve el id de correlación al',
+      '// instante, sin esperar a que el envío (con sus reintentos) termine -- pasa en',
+      '// segundo plano. Útil para no bloquear la interfaz esperando una confirmación que',
+      '// al usuario no le hace falta ver.',
+      'const WSON = {',
+      '  send: async (wson) => {',
+      "    const via = (wson.via || 'POST').toUpperCase();",
+      "    if (via !== 'POST' && via !== 'PUT' && via !== 'DELETE') {",
+      "      throw new Error('WSON.send(): via \"' + wson.via + '\" no soportado todavía -- solo POST/PUT/DELETE por ahora.');",
+      '    }',
+      "    const headers = { 'Content-Type': 'application/json' };",
+      "    if (wson.from) headers['X-WSON-From'] = wson.from;",
+      '    async function __wsonFetchOnce(destino) {',
+      '      const res = await fetch(destino, { method: via, headers: headers, body: JSON.stringify(wson.content) });',
+      '      const text = await res.text();',
+      "      let parsed; try { parsed = JSON.parse(text); } catch (e) { parsed = text; }",
+      '      if (!res.ok) {',
+      "        const err = new Error('WSON.send(): el destino respondió ' + res.status);",
+      '        err.status = res.status;',
+      '        throw err;',
+      '      }',
+      '      return parsed;',
+      '    }',
+      '    async function __sendOne(destino) {',
+      '      const maxAttempts = 1 + (wson.retries || 0);',
+      '      const baseDelay = wson.retryDelayMs || 500;',
+      '      let lastError;',
+      '      for (let attempt = 1; attempt <= maxAttempts; attempt++) {',
+      '        try {',
+      '          return await __wsonFetchOnce(destino);',
+      '        } catch (e) {',
+      '          lastError = e;',
+      '          if (attempt < maxAttempts) {',
+      '            await new Promise((resolve) => setTimeout(resolve, baseDelay * Math.pow(2, attempt - 1)));',
+      '          }',
+      '        }',
+      '      }',
+      '      throw lastError;',
+      '    }',
+      '    if (Array.isArray(wson.to)) {',
+      '      const results = await Promise.allSettled(wson.to.map((destino) => __sendOne(destino)));',
+      "      return results.map((r) => (r.status === 'fulfilled' ? r.value : { error: true, message: r.reason.message }));",
+      '    }',
+      '    return await __sendOne(wson.to);',
+      '  },',
+      '  enqueue: (wson) => {',
+      "    const correlationId = wson.id || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());",
+      '    WSON.send(Object.assign({}, wson, { id: correlationId })).catch(() => {});',
+      '    return correlationId;',
+      '  },',
+      '};',
+      '',
+    ].join('\n')
+    : '';
+
+  // ¿Se llama a cada función (post/put/delete) desde algún handler (incluyendo atributos
+  // en línea como onclick={...})? Si nadie la usa, no generamos su stub de cliente -- no
+  // tiene sentido exponerla si nadie la llama.
   const stubs = allHttpFns
-    .filter(([, , fn]) => visuals.some(v =>
-      v.bindings.some(b => {
-        const body = b.kind === 'block' ? b.code : b.value;
-        return new RegExp(`\\b${fn.name}\\s*\\(`).test(body);
-      })
-    ))
+    .filter(([, , fn]) => visuals.some(v => {
+      const exprs = [];
+      collectAllTemplateExprs(v.template, exprs);
+      return exprs.some(body => new RegExp(`\\b${fn.name}\\s*\\(`).test(body));
+    }))
     .map(([verb, method, fn]) => {
       // El cliente manda el primer parámetro (el "body") y, si la función declara un
       // segundo parámetro, también ese (la query string) -- a diferencia de las
@@ -872,6 +1193,7 @@ ${initialGlobalState}
   effect = store.effect;
 
 ${globalVarLines.split('\n').filter(Boolean).map(l => '  ' + l).join('\n')}
+${wsonLines ? '\n' + wsonLines.split('\n').map(l => '  ' + l).join('\n') : ''}
 
   const app = document.getElementById('app');
   ${mountCalls}
@@ -888,6 +1210,7 @@ ${initialGlobalState}
 
 // ---- variables NO reactivas globales (se calculan una vez, no re-renderizan nada) ----
 ${globalVarLines}
+${wsonLines}
 ${postFnStub}
 // ---- montaje ----
 document.addEventListener('DOMContentLoaded', () => {
@@ -900,6 +1223,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // ---- visuales compilados (cada uno crea su propio estado LOCAL si declara "reactive" interno) ----
 ${visualFns}
 ${functionLines ? `\n// ---- funciones de cliente ("function NOMBRE(params)") -- disponibles en todo el archivo, sin importar el orden de declaración ----\n${functionLines}\n` : ''}
+${wsonSendClientDef}
 ${mountBlock}`;
 }
 

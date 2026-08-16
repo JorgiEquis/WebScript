@@ -9,7 +9,7 @@ style boton =
     -> padding: 8px 16px
 
 visual paginaEstatica =
-<div>
+<div class={boton} onclick={contador++}>
     <h1>Ruta estática</h1>
     <p>Contador: {contador}</p>
     if (contador == 0)
@@ -19,9 +19,6 @@ visual paginaEstatica =
     else
         <p>Ya llevas unos cuantos</p>
 </div>
-    -> style: boton
-    -> onclick:
-        contador++
 
 render(
     paginaEstatica

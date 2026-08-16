@@ -5,12 +5,9 @@ style boton =
     -> color: white
 
 visual quitarPrimero =
-<button>
+<button class={boton} onclick={personas = personas.slice(1)}>
     Quitar primero
 </button>
-    -> style: boton
-    -> onclick:
-        personas = personas.slice(1)
 
 visual lista =
 <ul>

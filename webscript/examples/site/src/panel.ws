@@ -13,14 +13,13 @@ style boton =
     -> color: white
 
 visual panelServidor =
-<div>
+<div class={boton} onclick={
+    var r = await incrementar({ cantidad: 1 })
+    contadorCliente = r.visitas
+}>
     <h1>Panel</h1>
     <p>Visitas (servidor): {contadorCliente}</p>
 </div>
-    -> style: boton
-    -> onclick:
-        var r = await incrementar({ cantidad: 1 })
-        contadorCliente = r.visitas
 
 render(
     panelServidor

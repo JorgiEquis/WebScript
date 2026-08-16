@@ -5,12 +5,9 @@ style boton =
 
 visual contadorLocal =
     reactive contador = 0
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 
 visual app =
 <div>

@@ -42,12 +42,12 @@
   "visual": {
     "prefix": "visual",
     "body": "visual ${1:nombre} =\n<${2:div}>\n    ${3}\n</${2:div}>\n",
-    "description": "Componente de UI (plantilla + bindings)"
+    "description": "Componente de UI (plantilla HTML)"
   },
   "visual con binding": {
     "prefix": "visualb",
-    "body": "visual ${1:nombre} =\n<${2:div}>\n    ${3}\n</${2:div}>\n    -> style: ${4:miEstilo}\n    -> onclick:\n        ${5}\n",
-    "description": "Componente de UI con style y onclick"
+    "body": "visual ${1:nombre} =\n<${2:div} class={${3:miEstilo}} onclick={${4}}>\n    ${5}\n</${2:div}>\n",
+    "description": "Componente de UI con class y onclick en línea"
   },
   "if": {
     "prefix": "if",
@@ -88,6 +88,61 @@
     "prefix": "watch",
     "body": "watch(${1:nombre})\n    ${2}",
     "description": "Corre en el servidor SOLO en cambios posteriores de una server reactive (nunca con el valor inicial)"
+  },
+  "wson": {
+    "prefix": "wson",
+    "body": "wson ${1:nombre} =\n    -> to: ${2:\"/ruta\"}\n    -> content: ${3:valor}",
+    "description": "Estructura de datos (from?/to/via?/content) para describir un mensaje saliente -- declararlo NO envía nada, hace falta WSON.send(nombre)"
+  },
+  "server wson": {
+    "prefix": "serverwson",
+    "body": "server wson ${1:nombre} =\n    -> to: ${2:\"http://...\"}\n    -> via: ${3:\"POST\"}\n    -> content: ${4:valor}",
+    "description": "Como wson, pero solo existe en el servidor -- ni se compila al cliente ni se puede referenciar en un visual"
+  },
+  "WSON.send": {
+    "prefix": "wsonsend",
+    "body": "await WSON.send(${1:nombre})",
+    "description": "Envía un WSON de verdad -- construirlo nunca envía nada por sí solo, esto es lo que dispara la llamada de red (solo destinos URL, POST/PUT/DELETE, por ahora)"
+  },
+  "WSON.enqueue": {
+    "prefix": "wsonenqueue",
+    "body": "var ${1:id} = WSON.enqueue(${2:nombre})",
+    "description": "Versión NO bloqueante de WSON.send() -- devuelve el id de correlación al instante, el envío (con reintentos) pasa en segundo plano"
+  },
+  "server wson con reintentos": {
+    "prefix": "serverwsonretries",
+    "body": "server wson ${1:nombre} =\n    -> to: ${2:\"http://...\"}\n    -> content: ${3:valor}\n    -> retries: ${4:3}\n    -> retryDelayMs: ${5:500}",
+    "description": "server wson con reintentos y backoff exponencial -- si agota los intentos, queda en el historial con deadLetter: true"
+  },
+  "server wson con secret": {
+    "prefix": "serverwsonsecret",
+    "body": "server wson ${1:nombre} =\n    -> to: ${2:\"http://...\"}\n    -> content: ${3:valor}\n    -> secret: ${4:\"clave-compartida\"}",
+    "description": "server wson con firma HMAC -- WSON.send() firma el content automáticamente, el secreto nunca viaja por la red"
+  },
+  "server wson cifrado": {
+    "prefix": "serverwsonencrypt",
+    "body": "server wson ${1:nombre} =\n    -> to: ${2:\"http://...\"}\n    -> content: ${3:valor}\n    -> secret: ${4:\"clave-compartida\"}\n    -> encrypt: true",
+    "description": "server wson con cifrado AES-256-GCM (necesita secret como clave) -- confidencialidad y detección de manipulación en un solo paso"
+  },
+  "WSON.showContent": {
+    "prefix": "wsonshowcontent",
+    "body": "WSON.showContent(${1:payload}, ${2:\"clave-compartida\"})",
+    "description": "Descifra en el receptor -- si no estaba cifrado, lo devuelve tal cual; si falla (clave equivocada o manipulado), devuelve null"
+  },
+  "WSON.parse": {
+    "prefix": "wsonparse",
+    "body": "var ${1:msg} = WSON.parse(${2:args}, ${3:headers}, ${4:\"clave-compartida\"})",
+    "description": "Punto de entrada del receptor -- from/id de las cabeceras, y con secreto también verifica+descifra, todo en una llamada"
+  },
+  "WSON.history": {
+    "prefix": "wsonhistory",
+    "body": "WSON.history()",
+    "description": "Historial de WSON enviados/recibidos -- GLOBAL a todo el proceso, no por sesión. Admite filtros opcionales: { direction, from, to, id }"
+  },
+  "WSON.verify": {
+    "prefix": "wsonverify",
+    "body": "WSON.verify(${1:content}, ${2:headers['x-wson-signature']}, ${3:\"clave-compartida\"})",
+    "description": "Verifica en el receptor que la firma corresponde al content y al secreto compartido (comparación en tiempo constante)"
   },
   "server function": {
     "prefix": "serverfunction",

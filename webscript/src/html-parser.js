@@ -3,12 +3,52 @@
 
 const VOID_TAGS = new Set(['area','base','br','col','embed','hr','img','input','link','meta','source','track','wbr']);
 
+// Antes esto era una única regex (`<\/?[a-zA-Z][^<>]*>`) que buscaba el primer ">" tras
+// un "<" para cerrar la etiqueta -- rompía si un atributo en línea (ej. onclick={...})
+// contenía un ">" DE VERDAD como operador (ej. "x > 5"), cortando la etiqueta ahí en vez
+// de en su cierre real. Escáner manual: al abrir una etiqueta, salta por encima de
+// cualquier {...} (respetando llaves anidadas y cadenas dentro, vía findInterpolationEnd,
+// la misma función que ya usa parseAttrs) antes de buscar el ">" de cierre real.
 function tokenize(html) {
   const tokens = [];
-  const re = /<!--[\s\S]*?-->|<\/?[a-zA-Z][^<>]*>|[^<]+/g;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    tokens.push(m[0]);
+  let i = 0;
+  while (i < html.length) {
+    if (html.startsWith('<!--', i)) {
+      const end = html.indexOf('-->', i + 4);
+      const closeIdx = end === -1 ? html.length : end + 3;
+      tokens.push(html.slice(i, closeIdx));
+      i = closeIdx;
+      continue;
+    }
+    if (html[i] === '<' && /[a-zA-Z/]/.test(html[i + 1] || '')) {
+      let j = i + 1;
+      let closed = false;
+      while (j < html.length) {
+        const ch = html[j];
+        if (ch === '{') {
+          const end = findInterpolationEnd(html, j + 1);
+          j = end === -1 ? html.length : end + 1;
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          const closeIdx = html.indexOf(ch, j + 1);
+          j = closeIdx === -1 ? html.length : closeIdx + 1;
+          continue;
+        }
+        if (ch === '>') { j++; closed = true; break; }
+        j++;
+      }
+      tokens.push(html.slice(i, j));
+      i = j;
+      continue;
+    }
+    // texto: hasta el siguiente "<" que abra una etiqueta de verdad
+    let j = i;
+    while (j < html.length && html[j] !== '<') j++;
+    if (j > i) { tokens.push(html.slice(i, j)); i = j; continue; }
+    // "<" suelto que no abre una etiqueta (ej. "5 < 10" en texto plano) -> texto literal
+    tokens.push(html[i]);
+    i++;
   }
   return tokens;
 }

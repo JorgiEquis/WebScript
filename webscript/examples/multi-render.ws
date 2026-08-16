@@ -11,12 +11,9 @@ visual encabezado =
 </h1>
 
 visual contadorBtn =
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 
 visual pie =
 <footer>

@@ -9,11 +9,9 @@ describe('compilador: reactividad básica', () => {
 reactive contador = 0
 
 visual test =
-<button>
+<button onclick={contador++}>
     {contador}
 </button>
-    -> onclick:
-        contador++
 
 render(
     test
@@ -34,12 +32,10 @@ reactive base = 100
 var derivado = base * 2
 
 visual test =
-<div>
+<div onclick={base = base + 10}>
     <p>{base}</p>
     <p>{derivado}</p>
 </div>
-    -> onclick:
-        base = base + 10
 
 render(
     test
@@ -61,9 +57,7 @@ render(
 reactive texto = ""
 
 visual test =
-<input>
-    -> oninput:
-        texto = event.target.value
+<input oninput={texto = event.target.value}>
 
 render(
     test
@@ -87,7 +81,7 @@ describe('compilador: if / else if / else', () => {
 reactive x = 0
 
 visual test =
-<div>
+<div onclick={x = x + 10}>
     if (x == 0)
         <p>cero</p>
     else if (x < 5)
@@ -95,8 +89,6 @@ visual test =
     else
         <p>mucho</p>
 </div>
-    -> onclick:
-        x = x + 10
 
 render(
     test
@@ -120,12 +112,10 @@ describe('compilador: for', () => {
 reactive lista = ["a", "b"]
 
 visual test =
-<ul>
+<ul onclick={lista = [...lista, "c"]}>
     for (item in lista)
         <li>{item}</li>
 </ul>
-    -> onclick:
-        lista = [...lista, "c"]
 
 render(
     test
@@ -171,14 +161,12 @@ render(
 reactive personas = [{ id: 1, nombre: "Ana" }, { id: 2, nombre: "Bea" }, { id: 3, nombre: "Carlos" }]
 
 visual test =
-<div>
+<div onclick={personas = personas.slice(1)}>
     <ul>
         for (p in personas by p.id)
             <li>{p.nombre}</li>
     </ul>
 </div>
-    -> onclick:
-        personas = personas.slice(1)
 
 render(
     test
@@ -205,11 +193,9 @@ describe('compilador: estado local vs global', () => {
     const src = `
 visual contadorLocal =
     reactive n = 0
-<button>
+<button onclick={n++}>
     {n}
 </button>
-    -> onclick:
-        n++
 
 visual pagina =
 <div>
@@ -240,13 +226,13 @@ reactive contador = 5
 reactive resultado = 0
 
 visual test =
-<button>
+<button onclick={
+    const obj = { contador: 99 }
+    const { contador } = obj
+    resultado = contador
+}>
     {resultado}
 </button>
-    -> onclick:
-        const obj = { contador: 99 }
-        const { contador } = obj
-        resultado = contador
 
 render(
     test
@@ -279,12 +265,12 @@ reactive contador = 42
 reactive snapshotStr = ""
 
 visual test =
-<button>
+<button onclick={
+    var snapshot = { contador }
+    snapshotStr = JSON.stringify(snapshot)
+}>
     {snapshotStr}
 </button>
-    -> onclick:
-        var snapshot = { contador }
-        snapshotStr = JSON.stringify(snapshot)
 
 render(
     test
@@ -303,7 +289,7 @@ render(
 reactive feed = []
 
 visual test =
-<div>
+<div onclick={feed = [...feed, { tipo: "texto", contenido: "item-" + feed.length }]}>
     <ul>
         for (item in feed)
             if (item.tipo == "texto")
@@ -312,8 +298,6 @@ visual test =
                 <li>desconocido</li>
     </ul>
 </div>
-    -> onclick:
-        feed = [...feed, { tipo: "texto", contenido: "item-" + feed.length }]
 
 render(
     test
@@ -359,12 +343,12 @@ reactive datos = { nombre: "Jorge", hobbies: ["programar", "leer"] }
 reactive salida = ""
 
 visual v =
-<p>{salida}</p>
-    -> onclick:
-        var texto = JSON.stringify(datos)
-        var vuelto = JSON.parse(texto)
-        var largos = datos.hobbies.filter(h => h.length > 5)
-        salida = vuelto.nombre + ":" + largos.join(",") + ":" + Object.keys(datos).join(",")
+<p onclick={
+    var texto = JSON.stringify(datos)
+    var vuelto = JSON.parse(texto)
+    var largos = datos.hobbies.filter(h => h.length > 5)
+    salida = vuelto.nombre + ":" + largos.join(",") + ":" + Object.keys(datos).join(",")
+}>{salida}</p>
 
 render(
     v
@@ -383,9 +367,7 @@ render(
 reactive datos = { edad: 25 }
 
 visual v =
-<p>{datos.edad}</p>
-    -> onclick:
-        datos.edad = 99
+<p onclick={datos.edad = 99}>{datos.edad}</p>
 
 render(
     v
@@ -404,9 +386,7 @@ render(
 reactive datos = { edad: 25 }
 
 visual v =
-<p>{datos.edad}</p>
-    -> onclick:
-        datos = { ...datos, edad: 99 }
+<p onclick={datos = { ...datos, edad: 99 }}>{datos.edad}</p>
 
 render(
     v

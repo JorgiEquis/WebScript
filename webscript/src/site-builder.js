@@ -198,15 +198,68 @@ function buildSingleFileAsSite(filePath, outDir) {
 //
 // SESIONES: cada visitante recibe una cookie ("wsid") la primera vez que llega. El
 // estado de servidor (server var) ya NO se comparte entre visitas -- cada sesión tiene
-// su propia instancia, creada llamando a createSessionState() (ver compiler.js). No hay
-// expiración ni límite de sesiones -- para un servidor de verdad en producción, esto
-// necesitaría persistir a algo compartido (Redis, base de datos) en vez de memoria.
-function startServer(table, outDir, port) {
+// su propia instancia, creada llamando a createSessionState() (ver compiler.js).
+//
+// Expiran por inactividad (TTL) y hay un límite máximo de sesiones simultáneas (con
+// desalojo LRU -- se libera primero la que lleva más tiempo sin usarse) -- las dos
+// limitaciones reales que sí se pueden arreglar sin depender de nada externo. Lo que
+// SIGUE sin resolver, a propósito: compartir este estado entre varias instancias del
+// proceso Node (para escalar horizontalmente) necesitaría un almacén compartido real
+// (Redis, base de datos) -- no hay forma de montar ni probar eso de verdad en este
+// entorno, sin acceso a red. Documentado como limitación conocida, no resuelto aquí.
+function startServer(table, outDir, port, options = {}) {
+  const {
+    sessionTtlMs = 30 * 60 * 1000, // 30 minutos de inactividad -> expira
+    maxSessions = 10000, // por encima de esto, se desaloja la menos usada recientemente (LRU)
+    sessionCleanupIntervalMs = 60 * 1000, // cada cuánto se barre en busca de sesiones caducadas
+  } = options;
+
   const http = require('http');
   const crypto = require('crypto');
   const rawModules = new Map(); // baseName -> require(<baseName>.server.js) (tiene createSessionState)
-  const sessionStates = new Map(); // baseName -> Map<sessionId, instancia de createSessionState()>
+  // baseName -> Map<sessionId, { state, lastAccessed }> -- el timestamp es lo que
+  // permite tanto expirar por inactividad como desalojar la más vieja al llegar al límite.
+  const sessionStates = new Map();
+  let totalSessions = 0;
   const MIME = { '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript', '.json': 'application/json' };
+
+  // Elimina la sesión menos usada recientemente, de TODAS las rutas -- se llama cuando
+  // se alcanza "maxSessions", antes de crear una sesión nueva, para no crecer sin límite.
+  function evictLeastRecentlyUsed() {
+    let oldestBaseName = null;
+    let oldestSessionId = null;
+    let oldestTime = Infinity;
+    for (const [baseName, perRoute] of sessionStates) {
+      for (const [sessionId, entry] of perRoute) {
+        if (entry.lastAccessed < oldestTime) {
+          oldestTime = entry.lastAccessed;
+          oldestBaseName = baseName;
+          oldestSessionId = sessionId;
+        }
+      }
+    }
+    if (oldestBaseName !== null) {
+      sessionStates.get(oldestBaseName).delete(oldestSessionId);
+      totalSessions--;
+    }
+  }
+
+  // Barrido periódico: quita cualquier sesión que lleve más de "sessionTtlMs" sin
+  // usarse. Con "unref()" para no mantener vivo el proceso por sí solo (así un test
+  // puede terminar limpio sin tener que esperar a este timer) -- y se limpia también
+  // explícitamente en el evento "close" del servidor, más abajo, por si acaso.
+  const cleanupInterval = setInterval(() => {
+    const now = Date.now();
+    for (const perRoute of sessionStates.values()) {
+      for (const [sessionId, entry] of perRoute) {
+        if (now - entry.lastAccessed > sessionTtlMs) {
+          perRoute.delete(sessionId);
+          totalSessions--;
+        }
+      }
+    }
+  }, sessionCleanupIntervalMs);
+  cleanupInterval.unref();
 
   // Extrae query string y cabeceras de una petición, para las funciones
   // get/post/put/delete que declaren más de un parámetro (ver README).
@@ -235,9 +288,13 @@ function startServer(table, outDir, port) {
     if (!sessionStates.has(baseName)) sessionStates.set(baseName, new Map());
     const perRoute = sessionStates.get(baseName);
     if (!perRoute.has(sessionId)) {
-      perRoute.set(sessionId, getRawModule(baseName).createSessionState());
+      if (totalSessions >= maxSessions) evictLeastRecentlyUsed();
+      perRoute.set(sessionId, { state: getRawModule(baseName).createSessionState(), lastAccessed: Date.now() });
+      totalSessions++;
+    } else {
+      perRoute.get(sessionId).lastAccessed = Date.now();
     }
-    return perRoute.get(sessionId);
+    return perRoute.get(sessionId).state;
   }
 
   function parseCookies(header) {
@@ -253,12 +310,22 @@ function startServer(table, outDir, port) {
 
   // Lee la cookie "wsid" de la petición; si no existe, genera una nueva y la manda
   // en la respuesta. Devuelve el id de sesión que hay que usar para ESTA petición.
+  //
+  // "Secure" (exige HTTPS para que el navegador la mande de vuelta) se añade SOLO si
+  // hay indicios reales de que la conexión llegó por HTTPS -- nuestro propio servidor
+  // nunca hace terminación TLS (es http.createServer plano), así que el único caso
+  // real es estar detrás de un proxy que sí la termina (nginx, Caddy, un balanceador
+  // de carga...) y manda la cabecera estándar "X-Forwarded-Proto: https". Sin eso,
+  // añadir "Secure" a ciegas rompería cualquier desarrollo local por HTTP normal (el
+  // navegador simplemente descartaría la cookie, silenciosamente).
   function ensureSession(req, res) {
     const cookies = parseCookies(req.headers.cookie);
     let sid = cookies.wsid;
     if (!sid) {
       sid = crypto.randomUUID();
-      res.setHeader('Set-Cookie', `wsid=${sid}; Path=/; HttpOnly; SameSite=Lax`);
+      const isHttps = req.headers['x-forwarded-proto'] === 'https';
+      const secureFlag = isHttps ? '; Secure' : '';
+      res.setHeader('Set-Cookie', `wsid=${sid}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`);
     }
     return sid;
   }
@@ -464,13 +531,22 @@ function startServer(table, outDir, port) {
     });
   });
 
+  server.on('close', () => clearInterval(cleanupInterval));
+
+  // Expuesto para tests/depuración -- no forma parte de la API pública normal.
+  server._webscriptSessionDebug = {
+    getTotalSessions: () => totalSessions,
+    getSessionCount: (baseName) => (sessionStates.get(baseName) || new Map()).size,
+    hasSession: (baseName, sessionId) => (sessionStates.get(baseName) || new Map()).has(sessionId),
+  };
+
   return server;
 }
 
 // Conveniencia: descubre + compila + levanta servidor para un directorio, en un paso.
-function serveSite(srcDir, outDir, port) {
+function serveSite(srcDir, outDir, port, options) {
   const { table } = buildSite(srcDir, outDir);
-  return startServer(table, outDir, port);
+  return startServer(table, outDir, port, options);
 }
 
 module.exports = { buildSite, buildSingleFileAsSite, serveSite, startServer };

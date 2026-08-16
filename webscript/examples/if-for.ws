@@ -23,12 +23,9 @@ visual listaFrutas =
 </ul>
 
 visual boton =
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 
 render(
     estado,

@@ -16,16 +16,15 @@ style boton =
     -> padding: 8px 16px
 
 visual paginaFormulario =
-<div>
+<div class={boton} onclick={
+    var resultado = await postController({ cantidad: 5 })
+    total = resultado.totalPedidos
+    mensaje = resultado.mensaje
+}>
     <h1>Formulario</h1>
     <p>Total acumulado: {total}</p>
     <p>{mensaje}</p>
 </div>
-    -> style: boton
-    -> onclick:
-        var resultado = await postController({ cantidad: 5 })
-        total = resultado.totalPedidos
-        mensaje = resultado.mensaje
 
 render(
     paginaFormulario

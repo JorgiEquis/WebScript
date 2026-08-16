@@ -93,9 +93,7 @@ describe('reactividad profunda: de extremo a extremo en el pipeline completo', (
 reactive datos = { edad: 25 }
 
 visual v =
-<p>{datos.edad}</p>
-    -> onclick:
-        datos.edad = 99
+<p onclick={datos.edad = 99}>{datos.edad}</p>
 
 render(
     v
@@ -114,12 +112,10 @@ render(
 reactive lista = ["a", "b"]
 
 visual v =
-<ul>
+<ul onclick={lista.push("c")}>
     for (item in lista)
         <li>{item}</li>
 </ul>
-    -> onclick:
-        lista.push("c")
 
 render(
     v
@@ -139,14 +135,12 @@ render(
 reactive personas = [{ id: 1, nombre: "Ana" }, { id: 2, nombre: "Bea" }, { id: 3, nombre: "Carlos" }]
 
 visual test =
-<div>
+<div onclick={personas = personas.slice(1)}>
     <ul>
         for (p in personas by p.id)
             <li>{p.nombre}</li>
     </ul>
 </div>
-    -> onclick:
-        personas = personas.slice(1)
 
 render(
     test

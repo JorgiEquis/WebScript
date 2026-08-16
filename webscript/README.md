@@ -143,23 +143,33 @@ Cada `-> propiedad: valor` es una línea CSS literal. Se compila a una clase
 ### `visual` — bloques HTML
 ```
 visual contadorBtn =
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 ```
-- Todo lo que va **antes** de la primera línea `->` es la plantilla HTML
-  (soporta anidamiento, atributos, `{expr}` de interpolación en texto y
-  atributos).
-- Las líneas `->` después de la plantilla son **bindings** sobre el elemento
-  raíz:
-  - `-> style: NOMBRE` añade la clase CSS del `style` correspondiente.
-  - `-> onXXX:` (p. ej. `onclick`, `onchange`, `onkeyup`) seguido de un bloque
-    indentado define el handler; dentro puedes usar directamente las
-    variables `reactive` (se compilan a `state.variable`).
-  - Cualquier otro `-> atributo: valor` se compila a `setAttribute`.
+- Toda la plantilla HTML es la parte tras el `=` (soporta anidamiento,
+  atributos, `{expr}` de interpolación en texto y atributos).
+- **Cualquier nodo del árbol** (no solo la raíz) puede tener sus propios
+  atributos en línea, con `{}`, exactamente igual que cualquier otro
+  atributo interpolado:
+  - `class={expr}` acepta **cualquier expresión** — desde una referencia
+    directa a un `style` (`class={boton}`, ya que el nombre de un
+    `style` es literalmente su clase CSS) hasta algo dinámico según
+    estado: `class={activo ? "resaltado" : "normal"}`.
+  - `onXXX={código}` (p. ej. `onclick`, `onchange`, `onkeyup`, `oninput`)
+    define el handler de ese evento en ese nodo concreto; dentro puedes
+    usar directamente las variables `reactive` (se compilan a
+    `state.variable`). Para varias sentencias, el código puede ocupar
+    varias líneas dentro de las mismas llaves:
+    ```
+    <button onclick={
+        contador++
+        historial = [...historial, contador]
+    }>
+    ```
+  - Cualquier otro atributo (`disabled={cond}`, `value={x}`, etc.) se
+    compila a `setAttribute` normal, reactivo si depende de una
+    `reactive`.
 
 ### Estado local por instancia (lo que separa esto de React de verdad)
 
@@ -170,12 +180,9 @@ llamada concreta a `create_X(...)`:
 ```
 visual contadorLocal =
     reactive contador = 0
-<button>
+<button class={boton} onclick={contador++}>
     Clicks: {contador}
 </button>
-    -> style: boton
-    -> onclick:
-        contador++
 
 visual app =
 <div>
@@ -499,11 +506,10 @@ declarado y, en vez de crear un elemento HTML, llama a su función
 
 ```
 visual panelTarjeta =
-<div>
+<div class={tarjeta}>
     <h3>{props.titulo}</h3>
     <slot />
 </div>
-    -> style: tarjeta
 
 visual app =
 <panelTarjeta titulo="Panel de control">
@@ -594,10 +600,9 @@ route("/")
 import { botonPrimario, encabezado, calcularIva } from "./compartido.ws"
 
 visual paginaPrincipal =
-<div>
+<div class={botonPrimario}>
     <encabezado />
 </div>
-    -> style: botonPrimario
 
 render(
     paginaPrincipal
@@ -875,12 +880,12 @@ post function postController(args)
     return { totalPedidos: totalPedidos, mensaje: "Pedido registrado" }
 
 visual formulario =
-<div>
+<div onclick={
+    var resultado = await postController({ cantidad: 5 })
+    total = resultado.totalPedidos
+}>
     <p>Total: {total}</p>
 </div>
-    -> onclick:
-        var resultado = await postController({ cantidad: 5 })
-        total = resultado.totalPedidos
 ```
 
 - Solo puede haber **una** `post function` por archivo.
@@ -915,16 +920,12 @@ Patrón completo cliente → servidor: dos `visual` distintos (uno con el
 reactive texto = ""
 
 visual campoTexto =
-<input placeholder="Escribe algo">
-    -> oninput:
-        texto = event.target.value
+<input placeholder="Escribe algo" oninput={texto = event.target.value}>
 
 visual botonEnviar =
-<button>
+<button onclick={var r = await postController({ texto: texto })}>
     Enviar
 </button>
-    -> onclick:
-        var r = await postController({ texto: texto })
 
 visual pagina =
 <div>
@@ -971,12 +972,12 @@ post function incrementar(args)
 reactive contadorCliente = server.visitas
 
 visual panel =
-<div>
+<div onclick={
+    var r = await incrementar({ cantidad: 1 })
+    contadorCliente = r.visitas
+}>
     <p>Visitas: {contadorCliente}</p>
 </div>
-    -> onclick:
-        var r = await incrementar({ cantidad: 1 })
-        contadorCliente = r.visitas
 ```
 
 - Si escribes `updateServer(...)` en un handler (por costumbre, o copiando
@@ -1269,9 +1270,10 @@ directamente.
   compone correctamente, y una `reactive` del padre referenciada dentro
   del contenido pasado (`<tarjeta><p>{contador}</p></tarjeta>`) se
   resuelve con el valor del padre, no del hijo.
-- Los `-> onclick:`/handlers no se incluyen en el HTML servido (no hay
-  forma de que un atributo HTML lleve JS de WebScript tal cual) — la
-  interactividad sigue llegando enteramente del `bundle.js`, como siempre.
+- Los atributos `onXXX={...}`/handlers no se incluyen en el HTML servido
+  (no hay forma de que un atributo HTML lleve JS de WebScript tal cual) —
+  la interactividad sigue llegando enteramente del `bundle.js`, como
+  siempre.
 
 ## WebScript como backend puro: `route()` sin `render()`
 
@@ -1525,9 +1527,10 @@ necesitar reasignar la variable completa:
 ```
 reactive datos = JSON.parse(textoJson)
 
--> onclick:
+onclick={
     datos.edad = 99                // SÍ actualiza la vista (antes no)
     datos = { ...datos, edad: 99 } // SIGUE funcionando también
+}
 ```
 
 ### Bug real encontrado montando esta prueba: referencias cruzadas entre `reactive`
@@ -1585,10 +1588,11 @@ cuando cambia un campo hermano que nunca leyó.
 reactive datos = { nombre: "Ana", edad: 25 }
 reactive lista = [1, 2, 3]
 
--> onclick:
+onclick={
     datos.edad = 99      // ahora SÍ dispara la vista
     lista.push(4)        // ahora SÍ dispara la vista
     lista[0] = 99         // ahora SÍ dispara la vista
+}
 ```
 
 ### El primer diseño estaba mal, y lo descubrí probándolo
@@ -1780,8 +1784,7 @@ la URL con `new URLSearchParams(query).toString()` antes de hacer el
 del razonamiento original sí era correcta.
 
 ```
--> onclick:
-    var r = await crear({ texto: "nueva" }, { prioridad: "alta" })
+onclick={var r = await crear({ texto: "nueva" }, { prioridad: "alta" })}
 ```
 
 Verificado en las dos puntas: el `server.js` generado recibe
@@ -1898,6 +1901,638 @@ correcto — en vez de un `ReferenceError` críptico en el navegador de
 quien use la página. Verificado que la forma correcta
 (`reactive x = server.contador`) sigue compilando sin ningún falso
 positivo, tanto local como importada.
+
+## WSON: mensajes estructurados para comunicación entre sistemas
+
+Idea propuesta a partir de un concepto tuyo: un formato pensado para
+describir "un mensaje que sale hacia otro sistema" de forma legible,
+reutilizando la sintaxis `-> clave: valor` que ya existía para `style`,
+pero aplicada al valor inicial de una variable en vez de a un bloque CSS.
+
+```
+server var message = "Hola"
+
+server var sender =
+    -> from: "yo"
+    -> to: "/comunicaciones"
+    -> via: "POST"
+    -> content: message
+```
+
+**Dos decisiones de diseño que se resolvieron discutiéndolas antes de
+tocar código:**
+
+1. **Es solo estructura de datos — declararlo NO envía nada.** `sender`
+   es un objeto normal, construido una vez, sin ningún efecto secundario.
+   Hace falta una llamada explícita a `send(sender)` para que de verdad
+   salga algo. Verificado con un servidor real: construir un WSON con un
+   dominio inválido en `to` no revienta ni intenta conectar a ningún
+   sitio — solo `send()` lo intentaría.
+2. **La indentación se adaptó a la convención ya existente** (como
+   `style`, todas las `->` indentadas debajo del `=`, no la primera
+   pegada a la misma línea) — para no inventar un patrón híbrido nuevo
+   dentro de un lenguaje que ya tiene sus propias reglas de indentación.
+
+### Cómo se implementó por debajo (más simple de lo que parece)
+
+`sender` **no es un nodo de AST nuevo** — el *parser* reconoce el bloque
+`-> clave: valor` y sintetiza directamente un objeto literal JS
+(`{ from: "yo", to: "/comunicaciones", ... }`) como si fuera el valor
+inicial normal de la declaración. Para el resto del compilador,
+`sender` es una `reactive`/`var`/`server var`/`server reactive` como
+cualquier otra, cuyo valor inicial resulta ser un objeto — funciona
+automáticamente con la sustitución de identificadores que ya existía
+(`content: message` se resuelve solo, sin necesitar ningún código nuevo).
+
+A diferencia de `style` (cuyas propiedades son texto CSS literal, sin
+sustitución), aquí cada valor **es una expresión JS de verdad** — por
+eso `via: "POST"` necesita comillas (no es un identificador especial,
+es un string como cualquier otro).
+
+### `send(wson)`: el paso explícito que sí envía
+
+Interpretación server-side, generada solo si se usa (mismo criterio que
+`http`/`whisper`): lee `to`/`via`/`content` del objeto y despacha por
+`http.*` — reutiliza por completo lo que ya existía, no un mecanismo de
+red nuevo.
+
+```
+via: "POST"   -- por defecto si no se especifica
+via: "PUT"
+via: "DELETE"
+```
+
+Verificado de extremo a extremo contra un "sistema externo" simulado:
+`send()` transmitió `content` de verdad, el `via` se respetó
+exactamente (probado con `PUT`, confirmando el método HTTP real recibido
+al otro lado), y `from` opcional (para mensajes anónimos) funciona sin
+más porque simplemente no se incluye en el objeto si no se especifica.
+
+**Alcance honesto de esta primera versión**: `to` como email o número de
+teléfono **no está implementado** — mandar un correo o un SMS de verdad
+necesita un servicio externo real (SMTP, o una API tipo
+SendGrid/Twilio) con credenciales, algo que no se puede construir ni
+probar sin red en este entorno. `send()` lo detecta y falla con un
+mensaje explícito y capturable (`try`/`catch`), en vez de fallar en
+silencio o intentar algo que no puede funcionar — verificado
+explícitamente.
+
+**`style` como "WSON especial"**: se planteó, pero no se implementó
+unificado — `style` compila a CSS, un WSON de mensaje compila a una
+llamada de red; son salidas demasiado distintas por debajo para que
+compartir la sintaxis de entrada (`->`) se traduzca en compartir
+implementación. Quedan conceptualmente emparentados (ambos son bloques
+`-> clave: valor`), pero cada uno con su propio significado según el
+contexto donde aparecen. (Nota: esto se escribió cuando los eventos
+también usaban `->` — desde la migración a atributos en línea, `style`
+y `wson` son los dos únicos sitios del lenguaje que siguen usando esta
+sintaxis.)
+
+### Bug real encontrado montando esto: WSON dentro de un cuerpo de función
+
+Al probar `send(sender)` dentro de una `post function`, escribí por
+error el bloque WSON **dentro** del cuerpo de la función en vez de a
+nivel superior del archivo — y compiló "sin error", generando JS
+**roto** (`SyntaxError: Unexpected token '>'`). Causa: los cuerpos de
+función son texto "casi crudo" que nunca se vuelve a analizar, así que
+`->` ahí dentro no se reconoce como WSON, se cuela tal cual. Mismo
+patrón exacto que ya habíamos cerrado con `watch()` anidado — arreglado
+con una validación que lo rechaza en compilación, con un mensaje
+explicando que hay que declarar el WSON aparte, a nivel superior.
+
+## WSON: formato para describir mensajes salientes entre sistemas
+
+Idea original tuya: un formato ligero (parecido a JSON, de ahí el nombre)
+pensado específicamente para comunicación directa entre sistemas — quién
+manda (`from`), a dónde va (`to`), cómo (`via`), y qué lleva
+(`content`).
+
+```
+server wson sender =
+    -> from: "sistema-a"
+    -> to: "http://otro-sistema/recibir"
+    -> via: "POST"
+    -> content: mensajeTexto
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuestaDelOtroSistema: r }
+```
+
+### Decisiones tomadas antes de escribir código, no después
+
+- **WSON es solo una estructura de datos** — declararla nunca envía nada
+  por sí sola (confirmado explícitamente que esto sería un comportamiento
+  nuevo y raro para el lenguaje: ninguna otra declaración de nivel
+  superior "hace" algo por el hecho de declararse). El envío es siempre
+  una acción explícita: `WSON.send(nombre)`.
+- **Alcance recortado a propósito**: por ahora solo destinos URL
+  (`via: "POST"/"PUT"/"DELETE"`). Enviar a un email o número de teléfono
+  quedó **documentado como pendiente, no implementado** — necesitaría
+  conectar un servicio real (SMTP, o una API tipo Twilio/SendGrid), algo
+  que no se puede construir ni probar sin credenciales reales. `via`
+  rechaza en compilación cualquier otro valor, con el mensaje explicando
+  exactamente esto.
+- **Sintaxis ajustada, no calcada literal**: la propuesta original ponía
+  el primer `->` en la misma línea que el `=`, y el resto a la misma
+  indentación que la declaración. Se cambió a exactamente el mismo
+  patrón que ya usa `style` (cabecera con `=` vacío, `->` indentados
+  debajo) — por consistencia con el resto del lenguaje, no por
+  capricho.
+- **`style` se planteó como "quizá WSON especial"** — se descartó
+  unificarlas de verdad: `style` compila a CSS, un WSON de mensaje
+  compila a una llamada de red. Comparten la sintaxis `-> clave: valor`
+  (reutilizada a propósito, mismo parser), pero no tiene sentido
+  unificar su significado.
+
+### Bug real encontrado construyendo esto: `await` explícito en un handler no forzaba `async`
+
+Probando `WSON.send()` desde un `onclick` (`var r = await WSON.send(sender)`),
+el `bundle.js` generado tenía un `SyntaxError` real: la función flecha del
+handler se generaba **sin** `async`, aunque su cuerpo tuviera un `await`
+de verdad dentro. Causa: la detección de "¿este handler necesita ser
+`async`?" solo miraba si llamaba a un `post`/`put`/`delete function`
+(vía sus *stubs* generados) — nunca si el propio código ya tenía un
+`await` escrito a mano (`await WSON.send(...)`, `await fetch(...)`, o
+cualquier otro). Arreglado de forma general, no solo para WSON: ahora
+cualquier `await` explícito en el cuerpo de un handler también fuerza
+`async`. Verificado con tres casos: `WSON.send()` con `await`, un
+`fetch()` cualquiera con `await`, y confirmando que un handler **sin**
+ningún `await` sigue generándose igual que siempre (sin `async`, sin
+coste añadido).
+
+### Verificado de extremo a extremo, en las dos direcciones
+
+- **Lado servidor**: `server wson` + `WSON.send()` reutilizando el
+  objeto `http` interno — probado contra un receptor HTTP real
+  (simulando "otro sistema"), confirmando que el mensaje llega y la
+  respuesta vuelve correctamente.
+- **Lado cliente**: `wson` + `WSON.send()` en un `onclick`, ejecutando
+  el `click` de verdad sobre el `bundle.js` compilado (no solo revisando
+  el código generado) — el receptor externo recibió el `content`, y la
+  `reactive` de la página se actualizó con la respuesta real.
+- **Construir sin enviar**: confirmado que declarar un `wson` con un
+  dominio inválido a propósito **no** intenta ninguna petición — solo al
+  llamar `WSON.send()` explícitamente se dispara la llamada de red.
+
+## WSON evoluciona: firma HMAC (`secret`) y `WSON.verify()` — confianza entre sistemas
+
+Pregunta que lo motivó: si WSON es "la evolución de JSON para comunicación
+entre sistemas", ¿qué le falta a JSON que WSON sí podría dar? La
+respuesta que más convenció, de varias sobre la mesa (más destinos,
+reintentos, validación de forma, un lado receptor completo): JSON nunca
+tuvo noción de **autenticidad** — normalmente hace falta algo aparte por
+encima (JWT, firmas HTTP hechas a mano). Elegido explícitamente sobre
+las demás por ser lo más diferenciador frente a JSON puro, y lo más
+construible y verificable sin depender de ningún servicio externo real.
+
+```
+server wson sender =
+    -> to: "http://otro-sistema/recibir"
+    -> content: mensajeTexto
+    -> secret: "clave-compartida-entre-los-dos-sistemas"
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+```
+
+En el receptor:
+```
+post function recibir(args, query, headers)
+    var firmaValida = WSON.verify(args, headers['x-wson-signature'], "clave-compartida-entre-los-dos-sistemas")
+    return { firmaValida: firmaValida }
+```
+
+- **`secret` es un campo más de `wson`/`server wson`**, junto a
+  `from`/`to`/`via`/`content`.
+- **Solo permitido en `server wson`, rechazado en compilación si aparece
+  en un `wson` de cliente** — firmar en el navegador sería un error de
+  seguridad real: el secreto quedaría en texto plano en el `bundle.js`,
+  visible para cualquiera que abra las herramientas de desarrollador. No
+  se documentó como mala práctica y ya está — se **rechaza**, con el
+  mismo criterio que ya aplicamos en todo este proyecto ("si no puede
+  funcionar bien, no compila").
+- **`WSON.send()` firma automáticamente si hay `secret`** —
+  `HMAC-SHA256` del `content`, mandado como cabecera
+  `X-WSON-Signature: sha256=<hex>`. El secreto en sí **nunca viaja por
+  la red** — solo se usa localmente para calcular la firma.
+- **`WSON.verify(content, cabeceraFirma, secreto)`**, el complemento en
+  el receptor — con comparación en **tiempo constante**
+  (`crypto.timingSafeEqual`), no una comparación de texto normal. Es una
+  sutileza real de seguridad, no cosmética: comparar cadena por cadena
+  con `===` filtraría el secreto poco a poco por cuánto tarda en
+  responder "no coincide" (un ataque de temporización real, documentado,
+  no teórico).
+
+### Verificado con dos servidores reales, no simulado
+
+Montados un emisor y un receptor por separado (procesos Node
+independientes, cada uno con su propio `server.js`), con el mismo
+secreto compartido: el emisor firma y manda, el receptor recibe y
+verifica — `firmaValida: true`. Y el caso negativo, con los dos
+sub-casos por separado: un mensaje **sin** cabecera de firma, y un
+mensaje con una firma calculada con un **secreto distinto** — los dos
+detectados correctamente como `firmaValida: false`.
+
+### Lo que queda para más adelante, con el motivo explícito
+
+De las ideas que se pusieron sobre la mesa para "evolucionar WSON", esta
+fue la elegida para empezar — quedan pendientes, no descartadas: más
+destinos para `via` (necesitarían un servicio externo real, igual que
+email/SMS), el lado receptor completo y automático (que WebScript
+reconozca y verifique un WSON entrante sin que el desarrollador tenga
+que llamar a `WSON.verify()` a mano), reintentos con idempotencia, y
+validación de forma del `content`.
+
+## WSON, cuarta vuelta: reintentos con backoff, cola muerta, y `WSON.enqueue()` — más cerca de una cola de mensajes
+
+Pregunta que lo motivó: "¿qué verías para que WSON se acerque más a una
+cola de mensajes de verdad?" Se pusieron cuatro ideas sobre la mesa
+(reintentos, envío desacoplado, cola muerta, publicación/suscripción
+dentro del proceso) — elegidas las dos primeras juntas, porque se
+complementan de forma natural: los reintentos hacen que un envío
+individual sea fiable, `enqueue()` hace que no haga falta esperar a que
+termine para seguir con lo tuyo.
+
+```
+server wson sender =
+    -> to: "http://sistema-inestable/recibir"
+    -> content: mensaje
+    -> retries: 3
+    -> retryDelayMs: 500
+
+var id = WSON.enqueue(sender)  // vuelve al instante, sin esperar
+```
+
+### Un detalle que había que resolver antes de que los reintentos sirvieran de algo
+
+`http.post`/`put`/`delete` (el objeto interno que `WSON.send()` ya
+reutilizaba) **nunca lanza** en una respuesta `4xx`/`5xx` — solo en
+fallos de red reales (dominio inexistente, conexión rechazada). Con eso
+tal cual, reintentar contra un "sistema inestable" que responde `500` no
+habría servido de nada, porque nunca se habría detectado como fallo.
+Arreglado dándole a `WSON.send()` su **propio** *fetch* interno,
+consciente del código de estado — sin tocar `http.*`, del que ya
+dependían tests existentes con su comportamiento actual.
+
+### Reintentos con *backoff* exponencial
+
+`retries: 3` significa hasta 3 intentos **adicionales** al primero (4 en
+total como máximo), con espera creciente entre cada uno
+(`retryDelayMs`, doblándose cada vez). Verificado con un receptor real
+que falla las dos primeras veces (`500` a propósito) y responde bien a
+la tercera — recuperado sin que el desarrollador tuviera que escribir
+ninguna lógica de reintento a mano, y con el tiempo total medido
+confirmando el patrón de espera creciente (100ms + 200ms, con
+`retryDelayMs: 100`).
+
+### Cola muerta (*dead letter*), conectada con el historial que ya existía
+
+Si se agotan todos los intentos, el mensaje no desaparece — queda
+registrado en `WSON.history()` con `deadLetter: true` y el número de
+intentos que se hicieron, consultable aparte
+(`WSON.history({ deadLetter: true })`) para poder revisarlo o
+reintentarlo a mano más tarde. Verificado con un destino que nunca
+responde: `deadLetters: 1`, `intentos: 3` (1 + 2 reintentos), tal como
+se configuró.
+
+### `WSON.enqueue()` — verificado con temporización real, no solo con la forma del código
+
+Reutiliza `WSON.send()` entero por dentro (con todos sus reintentos),
+simplemente sin `await` — dispara el envío y devuelve el id de
+correlación al instante. Verificado con un receptor que tarda medio
+segundo de verdad en responder: la petición al cliente que llama a
+`WSON.enqueue()` tardó **74ms**, no los 500ms del receptor —
+confirmando que de verdad no bloquea. El historial estaba vacío justo
+después de responder (el envío real seguía en marcha), y tras esperar lo
+suficiente, apareció con el **mismo id** que se había devuelto al
+instante — la forma de encontrar el resultado más tarde.
+
+### Lo que queda pendiente, con el motivo explícito
+
+De las cuatro ideas sobre la mesa, quedan sin construir: publicación/
+suscripción dentro del proceso (estructuralmente lo más parecido a una
+cola de verdad, pero solo funcionaría dentro del mismo proceso, sin
+poder cruzar servidores como sí hace `WSON.send()`), y persistencia real
+entre reinicios — esta última, igual que con Redis para sesiones o los
+destinos email/SMS, necesitaría una base de datos o un *broker* real
+conectado, algo que no se puede montar ni probar de verdad en este
+entorno.
+
+## WSON, tercera vuelta: varios destinos, `WSON.parse()`, e historial global
+
+Tres ideas más sobre la mesa a la vez: un almacén de mensajes
+enviados/recibidos, `to` aceptando varios destinos, y `WSON.parse()`
+para leer un WSON entrante. La tercera traía una pregunta directa
+("¿ves útil esto?") con una implicación real que había que resolver
+antes de construir nada.
+
+### La implicación que había que resolver primero: `from` no viajaba
+
+Revisando el código generado hasta ese momento: `WSON.send()` solo
+mandaba `content` (o el sobre cifrado) en el cuerpo, y `id`/la firma
+como cabeceras — pero **`from` nunca salía del proceso que envía**. Para
+que `WSON.parse()` tuviera sentido de verdad (poder saber "quién mandó
+esto"), `from` necesitaba viajar también. Arreglado añadiendo una
+cabecera nueva, `X-WSON-From`, coherente con cómo ya viajaban el id de
+correlación y la firma.
+
+```
+server wson sender =
+    -> from: "servicio-de-pagos"
+    -> to: "http://otro-sistema/recibir"
+    -> content: "pago confirmado"
+    -> secret: "clave-compartida"
+```
+
+En el receptor, un solo punto de entrada en vez de tres pasos sueltos
+(leer cabeceras a mano + `WSON.verify()` + `WSON.showContent()`):
+```
+post function recibir(args, query, headers)
+    var msg = WSON.parse(args, headers, "clave-compartida")
+    // msg.from, msg.id, msg.content (ya verificado y descifrado si hacía falta), msg.signatureValid
+```
+
+### `to` como array — varios destinos, fallo aislado
+
+```
+server wson difusion =
+    -> to: ["http://sistema-a/recibir", "http://sistema-b/recibir"]
+    -> content: mensaje
+
+var resultados = await WSON.send(difusion) // array, en el mismo orden que "to"
+```
+
+Se manda a todos **en paralelo**, y el fallo de uno **no tumba a los
+demás** — cada posición del array de resultados indica su propio éxito
+o error. Verificado con tres destinos reales, uno de ellos apuntando a
+un puerto cerrado a propósito: los dos válidos respondieron
+correctamente, el tercero devolvió `{ error: true, message: ... }` sin
+afectar a los otros dos. Con `to` como *string* de siempre, sigue
+devolviendo un único resultado — verificado explícitamente que no se
+convierte en un array de uno, para no romper nada de lo que ya
+funcionaba.
+
+### `WSON.history()` — la pregunta de diseño que había que hacer antes de construir
+
+Un almacén de "qué se ha enviado y recibido" no encajaba en el modelo de
+sesión por visitante que ya teníamos (`server var`/`server reactive` son
+por sesión) — es una propiedad del **proceso entero**, no de una visita
+concreta. Confirmado explícitamente contigo antes de escribir código:
+**global al proceso**, no por sesión. `WSON.send()` registra cada envío
+(incluso los que fallan, con el error incluido); `WSON.parse()` registra
+cada recepción; ambos automáticamente, sin llamada aparte. Con un límite
+de 1000 entradas (las más viejas se descartan) para no crecer sin límite
+en memoria — y, como siempre en este proyecto, se pierde al reiniciar el
+proceso (una base de datos real de verdad está fuera de lo que se puede
+montar y probar en este entorno).
+
+**Verificado que de verdad es global, no por sesión, de la forma más
+convincente posible**: tres peticiones con cookies de sesión
+**confirmadas distintas** entre sí — dos que enviaron un mensaje cada
+una, y una tercera que **nunca envió nada por sí misma** — y la tercera
+sesión ve el historial completo de las otras dos. No hay forma de que
+eso pase si el almacén estuviera aislado por sesión.
+
+## WSON, segunda vuelta: cifrado opcional (`encrypt`) e ID de correlación
+
+Motivada por preguntar "qué ventajas tiene la firma HMAC" — la respuesta
+incluyó una limitación honesta: la firma da autenticidad, pero **no**
+confidencialidad (`content` sigue viajando en texto plano). Propuesta
+para cerrar justo ese hueco: cifrado opcional, con un método explícito
+para descifrar (`WSON.showContent`, nombre sugerido tal cual), y de paso
+el ID de correlación que había quedado pendiente en la ronda anterior de
+ideas.
+
+```
+server wson sender =
+    -> to: "http://otro-sistema/recibir"
+    -> content: datosSecretos
+    -> secret: "clave-compartida"
+    -> encrypt: true
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+```
+
+En el receptor:
+```
+post function recibir(args, query, headers)
+    var valido = WSON.verify(args, headers['x-wson-signature'], "clave-compartida")
+    var contenido = WSON.showContent(args, "clave-compartida")
+```
+
+### Un problema real que casi se cuela antes de escribir código
+
+La idea inicial era guardar el ID de correlación **dentro** del propio
+objeto `wson` reutilizable. Al pensarlo antes de implementar: si
+`sender` es un `server wson` declarado una vez y usado en varias
+llamadas a `WSON.send(sender)` (algo perfectamente normal), guardar el
+id ahí dentro haría que la **segunda** llamada reutilizara el mismo id
+de la primera — incorrecto, cada envío necesita el suyo. Arreglado
+generando el id **en cada llamada**, sin mutar el objeto original; si el
+propio `wson` ya trae un `id` puesto a mano, se respeta.
+
+### Decisiones de diseño
+
+- **`encrypt: true` requiere `secret`** (validado en compilación, no en
+  ejecución) — es la clave de cifrado, no solo de firma.
+- **AES-256-GCM, no AES simple** — cifrado *autenticado*: da
+  confidencialidad y detecta manipulación **en el mismo paso**, no como
+  dos mecanismos separados. La clave de cifrado se deriva del `secret`
+  con una sal distinta a la que usa la firma (`'wson-encrypt'` vs. el
+  secreto crudo para HMAC) — para no reutilizar la misma clave en dos
+  construcciones criptográficas distintas.
+- **`encrypt`/`secret` rechazados en un `wson` de cliente**, mismo
+  criterio que ya establecimos con la firma — un secreto en el
+  `bundle.js` es visible para cualquiera con las herramientas de
+  desarrollador.
+- **`WSON.showContent` devuelve el mensaje tal cual si no estaba
+  cifrado** — para que el receptor no tenga que ramificar su propio
+  código según si el emisor cifró o no, simplemente llama siempre a
+  `showContent`.
+- **Si el descifrado falla, `null`, no una excepción** — comprobable con
+  `if (!resultado)`, consistente con cómo el resto del proyecto prefiere
+  fallos comprobables antes que forzar `try`/`catch` en todas partes.
+
+### Verificado con tres capas de prueba, no solo compilación
+
+1. **Que el secreto de verdad no viaja en texto plano** — un receptor
+   HTTP "crudo" (sin descifrar nada) confirmó que el número de tarjeta
+   de prueba **nunca** aparece en el cuerpo recibido, solo
+   `{iv, ciphertext, authTag}`.
+2. **Los tres casos de `WSON.showContent`**: clave correcta descifra
+   bien; clave equivocada da `null`; contenido manipulado a propósito
+   (cambiando unos bytes del `ciphertext`) también da `null` — la
+   autenticación de GCM detecta la manipulación, no solo la
+   confidencialidad falla en silencio.
+3. **De extremo a extremo con dos servidores reales**: emisor cifra y
+   firma, receptor verifica la firma, descifra el contenido, y lee el
+   id de correlación de la cabecera — los tres a la vez, en la misma
+   petición real.
+
+## Sesiones: expiración, límite con desalojo LRU, y cookie `Secure` condicional
+
+De las tres limitaciones documentadas sobre sesiones, se resolvieron dos
+de verdad y la tercera se dejó honestamente sin resolver, con la razón
+explicada:
+
+**1. Expiración por inactividad (TTL) — resuelto.** Cada sesión guarda
+ahora un `lastAccessed` junto a su estado; un barrido periódico
+(`setInterval`, con `unref()` para no mantener vivo el proceso por sí
+solo, y limpiado también explícitamente al cerrar el servidor) quita
+cualquier sesión que lleve más tiempo del configurado sin usarse. Por
+defecto, 30 minutos. Verificado con TTL corto (300ms) en un test real:
+la sesión desaparece tras el TTL, y la **misma cookie** reinicia el
+contador en vez de seguir donde iba — confirmando que de verdad se creó
+una sesión nueva, no que la vieja sobrevivió por error. Verificado
+también el caso contrario: una sesión usada **antes** de que expire su
+TTL no se limpia.
+
+**2. Límite máximo de sesiones simultáneas, con desalojo LRU —
+resuelto.** Por defecto, 10000. Al superarse, se libera la sesión menos
+usada recientemente (comparando `lastAccessed`), nunca una al azar.
+Verificado con un límite bajo (3) y 5 sesiones creadas en orden: el
+total nunca supera 3, la primera (más antigua) se desaloja, la última
+(más reciente) sigue viva.
+
+**3. Cookie `Secure` — resuelto, pero condicional, no automático.**
+Nuestro propio servidor nunca termina TLS (es `http.createServer`
+plano) — añadir `Secure` a ciegas habría roto cualquier desarrollo local
+por HTTP normal, ya que el navegador simplemente descarta en silencio
+una cookie `Secure` que llega por una conexión no cifrada. La única
+situación real en la que tiene sentido es estar detrás de un proxy que
+sí hace terminación TLS (nginx, Caddy, un balanceador de carga) y manda
+la cabecera estándar `X-Forwarded-Proto: https`. Verificado con los dos
+casos, uno al lado del otro: sin la cabecera, sin `Secure`; con
+`X-Forwarded-Proto: https`, `Secure` se añade.
+
+**Lo que sigue sin resolver, a propósito, con el motivo explicado**:
+compartir este estado entre varias instancias del proceso Node (para
+escalar horizontalmente) necesitaría un almacén compartido real (Redis,
+base de datos) — no hay forma de montar ni probar eso de verdad en este
+entorno, sin acceso a red. Mismo criterio que ya aplicamos con el
+email/SMS de WSON: mejor dejarlo documentado como pendiente que fingir
+una implementación sin poder verificarla contra un servicio real.
+
+```
+startServer(table, outDir, port, {
+  sessionTtlMs: 30 * 60 * 1000,   // 30 min por defecto
+  maxSessions: 10000,              // por defecto
+  sessionCleanupIntervalMs: 60000, // cada cuánto se barre, por defecto
+})
+```
+
+Las tres opciones son... opcionales, con los valores de arriba por
+defecto — todo el código existente que llama a `startServer(table,
+outDir, port)` sin el cuarto argumento sigue funcionando exactamente
+igual que antes.
+
+## Rediseño de fondo: atributos en línea sustituyen a `->` por completo
+
+Propuesta original (parafraseada): que `class` y `onclick` pudieran ir
+**directamente en la etiqueta**, como en JSX, para que **cualquier nodo**
+de la plantilla tuviera sus propios *bindings* — no solo el elemento
+raíz del `visual`, que era la limitación real que arrastrábamos desde el
+principio del proyecto (documentada explícitamente en "Limitaciones
+actuales").
+
+```
+visual app =
+<div>
+    <div class={estilo}>
+        <button onclick={clickBoton()}>{texto}</button>
+        <componente />
+    </div>
+</div>
+```
+
+Decisiones tomadas explícitamente antes de tocar código:
+
+- **Sustitución completa**, no convivencia — la sintaxis `-> onclick:`/
+  `-> style:` deja de existir para *bindings* de `visual`. `style` y
+  `wson` siguen usando `->` (son casos distintos, con su propio
+  significado).
+- **`onXXX={código}` con llaves**, consistente con el resto del lenguaje
+  (`value={contador}`) — no sin llaves como en el primer borrador de la
+  propuesta.
+- **`class={...}` admite cualquier expresión**, no solo referencias
+  estáticas a un `style` — confirmado que ya funcionaba así **de fábrica**,
+  sin necesitar código nuevo: `setAttribute('class', ...)` ya era
+  genérico para cualquier atributo interpolado.
+
+### `class={nombreDeStyle}` — por qué no hacía falta resolución en tiempo de ejecución
+
+El nombre de un `style` **ya es** literalmente su clase CSS
+(`style boton = ...` compila a `.boton { ... }`). Así que
+`class={boton}` no necesita ningún mecanismo de *lookup* — solo hace
+falta sustituir la referencia `boton` (que si no, sería
+`ReferenceError`, ya que un `style` nunca existe como variable JS, solo
+como CSS) por el *string* literal `"boton"` antes de la sustitución
+normal de identificadores. Implementado con `injectVarsAsStringLiterals`,
+hermana de las funciones de sustitución que ya existían para casos
+parecidos (`injectVars`, `injectVarsAsLocals`).
+
+### Tres bugs reales encontrados construyendo esto, ninguno cosmético
+
+**1. El manejador de eventos por nodo, mal ubicado, rompía la seguridad
+del SSR.** Al mover la generación de eventos de "solo la raíz" a
+"cualquier nodo", el renderizador SSR seguía usando su mecanismo viejo
+(`extraClasses`/`extraAttrs`, aplicado solo a la raíz) para **excluir**
+los `onXXX` del HTML servido. Al quitar ese mecanismo, el bucle genérico
+de atributos de SSR **no saltaba** los `onXXX` — habría intentado
+evaluar el código de un manejador de eventos como si fuera el valor de
+un atributo HTML normal, generando HTML roto o un fallo real. Arreglado
+añadiendo el salto explícito (`/^on[a-z]+$/`) en el bucle genérico,
+verificado que sigue funcionando para cualquier nodo, no solo la raíz.
+
+**2. `class={estilo}` en SSR necesitaba su propia resolución,
+independiente de la del cliente.** La sustitución de nombres de `style`
+a *string* literal (`injectVarsAsStringLiterals`) es una transformación
+de **texto**, específica del compilador de cliente — SSR evalúa
+expresiones contra un `scope` en tiempo real, no genera texto JS. Sin
+nada especial, `class={estilo}` en SSR habría fallado (`estilo` no
+existe en el `scope`), cayendo innecesariamente al *fallback* de concha
+vacía para una situación perfectamente resoluble. Arreglado añadiendo
+cada nombre de `style` al `scope` de SSR como una cadena que se
+referencia a sí misma (`scope.boton = "boton"`) — mismo resultado,
+mecanismo apropiado para cada lado.
+
+**3. El *tokenizer* de HTML no entendía llaves anidadas al buscar el
+cierre de una etiqueta.** Este es el más serio de los tres, porque no es
+exclusivo de esta función — afecta a **cualquier** atributo en línea con
+un `>` de verdad dentro de la expresión (un operador de comparación como
+`h.length > 5`, o incluso una función flecha `=>`). El *tokenizer*
+original era una única expresión regular que buscaba el primer `>` tras
+un `<` para cerrar la etiqueta — si el atributo contenía un `>` que no
+era el cierre real, la etiqueta se cortaba ahí, a mitad, rompiendo el
+resto del *parseo*. Confirmado con un test real que fallaba exactamente
+así (`.filter(h => h.length > 5)` dentro de un `onclick={...}`).
+Arreglado reescribiendo el *tokenizer* como un escáner manual que, al
+abrir una etiqueta, salta por encima de cualquier `{...}` completo
+(respetando llaves anidadas y cadenas dentro, reutilizando
+`findInterpolationEnd`, la misma función que ya protegía los valores de
+atributo individuales) antes de buscar el `>` de cierre real.
+
+### Verificado de extremo a extremo, no solo revisando el código generado
+
+- Un `visual` con **tres niveles de anidamiento**, cada uno con su
+  propio `class`/`onclick` — ejecutado de verdad (no solo compilado):
+  `class={estilo}` resuelto correctamente en un `<div>` interno,
+  `onclick={clickBoton()}` disparado en un `<button>` interno,
+  actualizando **dos** `reactive` distintas, con la composición anidada
+  (`<componente/>`) intacta.
+- Contenido **multilínea** dentro de `onclick={...}` (varias sentencias,
+  incluyendo *destructuring*) — confirmado que preserva exactamente el
+  mismo comportamiento (y la misma limitación documentada del motor sin
+  Acorn) que tenía el bloque `-> onclick:` viejo.
+- Los 18 archivos de ejemplo del proyecto, migrados y recompilados —
+  todos compilan sin ningún `SyntaxError`.
+- Suite completa tras la migración: **188 tests, 0 fallos** (todos los
+  tests que usaban la sintaxis vieja, migrados uno por uno, no
+  reescritos desde cero — cada uno sigue comprobando exactamente lo
+  mismo que comprobaba antes).
 
 ## Las cuatro funciones HTTP deben devolver siempre algo
 
@@ -2356,7 +2991,7 @@ repetidos que de verdad causan bugs en tiempo de ejecución:
   un `style` SÍ puede compartir nombre con un `visual`/`reactive`/`var` sin
   problema — nunca colisionan de verdad (una clase CSS y un identificador
   JS no se confunden). Por ejemplo, `style boton` + `visual boton` que use
-  `-> style: boton` es un patrón normal y sigue funcionando.
+  `class={boton}` es un patrón normal y sigue funcionando.
 - **El *shadowing* de una `reactive` local sobre una global con el mismo
   nombre SÍ está permitido** — son ámbitos distintos y es un patrón legítimo
   en cualquier lenguaje (la local gana dentro de su `visual`). Nota menor:
@@ -2440,15 +3075,15 @@ aún.
   sitio malicioso podría, en teoría, disparar esas peticiones
   aprovechando la cookie de sesión del navegador de la víctima.
 - **Sin límite de tasa** (*rate limiting*) contra abuso o DoS.
-- **Sesiones solo en memoria**: no hay expiración, ni límite de cuántas
-  se guardan — un servidor de producción de verdad necesitaría expirar
-  sesiones viejas o mover el estado a algo compartido (Redis, base de
-  datos) en vez de un `Map` en memoria del proceso Node. Tampoco
-  comparten estado entre varias instancias del proceso (sin *sticky
-  sessions* o un almacén externo, escalar horizontalmente rompería la
-  consistencia).
-- La cookie de sesión es `HttpOnly` pero no `Secure` (no fuerza HTTPS) —
-  pensado para desarrollo local, no para producción tal cual.
+- **Sesiones en memoria del proceso Node** — arreglado en parte (ver
+  sección dedicada "Sesiones: expiración, límite y cookie `Secure`" más
+  abajo): ahora sí expiran por inactividad y hay un límite máximo con
+  desalojo LRU, y la cookie sí puede llevar `Secure` si el servidor está
+  detrás de un proxy con terminación TLS real. Lo que **sigue** sin
+  resolver, a propósito: no comparten estado entre varias instancias del
+  proceso Node — para escalar horizontalmente de verdad haría falta un
+  almacén compartido real (Redis, base de datos), algo que no se puede
+  montar ni probar en este entorno sin acceso a red.
 - `watch()`: el sistema todavía no distingue "leer `datos.edad` como
   valor final" de "leer `datos.edad` de camino a algo más profundo" en
   todos los casos imaginables de identidad tras operaciones que

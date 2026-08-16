@@ -14,15 +14,17 @@ const LABELS = {
   DeleteFunctionDecl: 'delete function',
   GetFunctionDecl: 'get function',
   WatchDecl: 'watch',
+  WsonDecl: 'wson',
+  ServerWsonDecl: 'server wson',
 };
 
-// Espacios de nombres: reactive/var/function/visual/server-var/server-reactive/
-// server-function/get-post-put-delete-function comparten uno -- colisionan de verdad
-// (variable JS muerta, función pisada en silencio, o ambigüedad sobre si un nombre es
-// de cliente o de servidor). "style" tiene el suyo propio. "watch" no declara ningún
-// nombre (solo referencia uno existente), así que no participa en este espacio.
+// Espacios de nombres: reactive/var/function/wson/visual/server-var/server-reactive/
+// server-function/server-wson/get-post-put-delete-function comparten uno -- colisionan
+// de verdad (variable JS muerta, función pisada en silencio, o ambigüedad sobre si un
+// nombre es de cliente o de servidor). "style" tiene el suyo propio. "watch" no declara
+// ningún nombre (solo referencia uno existente), así que no participa en este espacio.
 const SHARED_NAMESPACE = new Set([
-  'ReactiveDecl', 'VarDecl', 'FunctionDecl', 'VisualDecl', 'ServerVarDecl', 'ServerReactiveDecl', 'ServerFunctionDecl',
+  'ReactiveDecl', 'VarDecl', 'FunctionDecl', 'WsonDecl', 'VisualDecl', 'ServerVarDecl', 'ServerReactiveDecl', 'ServerFunctionDecl', 'ServerWsonDecl',
   'PostFunctionDecl', 'PutFunctionDecl', 'DeleteFunctionDecl', 'GetFunctionDecl',
 ]);
 
@@ -262,6 +264,60 @@ function validate(ast) {
     }
   }
 
+  // wson / server wson: si "via" es un literal de texto estático (entre comillas), debe
+  // ser uno de los tres verbos soportados por ahora (destinos URL). Si es una expresión
+  // dinámica (una variable, por ejemplo) no se comprueba aquí -- igual que el resto del
+  // tipado opcional del proyecto, solo se valida lo que se puede comprobar en
+  // compilación sin ejecutar nada.
+  const ALLOWED_VIA = new Set(['POST', 'PUT', 'DELETE']);
+  for (const wson of ast.body.filter(n => n.type === 'WsonDecl' || n.type === 'ServerWsonDecl')) {
+    const viaField = wson.fields.find(f => f.key === 'via');
+    if (!viaField) continue;
+    const literalMatch = viaField.value.match(/^["'](.+)["']$/);
+    if (!literalMatch) continue; // expresión dinámica, no se comprueba
+    const via = literalMatch[1].toUpperCase();
+    if (!ALLOWED_VIA.has(via)) {
+      throw new SyntaxError(
+        `"${labelFor(wson.type)} ${wson.name}" (línea ${viaField.fieldLine}) -- "via: ${JSON.stringify(literalMatch[1])}" ` +
+        `no es un verbo soportado. Por ahora (destinos URL) solo se admiten "POST", "PUT" o "DELETE" -- ` +
+        `email y número de teléfono como destino están pensados para más adelante, no implementados todavía.`
+      );
+    }
+  }
+
+  // "secret" (firma HMAC del content) y "encrypt" (cifrado AES-256-GCM, necesita
+  // "secret" como clave) SOLO tienen sentido en "server wson" -- usarlos en el CLIENTE
+  // sería un error de seguridad real: cualquiera con las herramientas de desarrollador
+  // del navegador vería el secreto tal cual, en texto plano, en el bundle.js. Se
+  // rechaza en compilación, no solo se documenta como mala práctica.
+  for (const wson of ast.body.filter(n => n.type === 'WsonDecl')) {
+    for (const key of ['secret', 'encrypt']) {
+      const field = wson.fields.find(f => f.key === key);
+      if (field) {
+        throw new SyntaxError(
+          `"wson ${wson.name}" (línea ${field.fieldLine}) usa "${key}" -- eso solo tiene sentido en ` +
+          `"server wson", nunca en un "wson" de cliente. Un secreto en el bundle.js es visible para ` +
+          `cualquiera que abra las herramientas de desarrollador del navegador -- ni siquiera está oculto, ` +
+          `solo minificado (y este proyecto ni eso hace). Mueve este wson al servidor.`
+        );
+      }
+    }
+  }
+
+  // "encrypt" sin "secret" no tiene ninguna clave con la que cifrar -- se rechaza en
+  // compilación en vez de fallar en tiempo de ejecución con un mensaje críptico de
+  // Node sobre una clave inválida.
+  for (const wson of ast.body.filter(n => n.type === 'ServerWsonDecl')) {
+    const encryptField = wson.fields.find(f => f.key === 'encrypt');
+    const hasSecret = wson.fields.some(f => f.key === 'secret');
+    if (encryptField && !hasSecret) {
+      throw new SyntaxError(
+        `"server wson ${wson.name}" (línea ${encryptField.fieldLine}) usa "encrypt" sin "secret" -- ` +
+        `no hay ninguna clave con la que cifrar. Añade "-> secret: ..." también.`
+      );
+    }
+  }
+
   const routeDecls = ast.body.filter(n => n.type === 'RouteDecl');
   if (routeDecls.length > 1) {
     throw new SyntaxError(
@@ -372,6 +428,29 @@ function validate(ast) {
     }
   }
 
+  // Un bloque WSON ("NOMBRE =" seguido de "-> clave: valor" indentado) SOLO existe en
+  // una declaración "wson"/"server wson" -- el cuerpo de cualquier función (o de un
+  // watch) es texto "casi crudo" que nunca se vuelve a analizar, así que "->" ahí
+  // dentro no se reconoce como WSON, se cuela tal cual en el JS generado y revienta con
+  // un SyntaxError real ("Unexpected token '>'"). Se rechaza en compilación, con el
+  // mismo espíritu que ya hicimos con "watch" anidado -- mejor un error claro aquí que
+  // uno críptico en el bundle/server.js.
+  const allFnBodies = ast.body.filter(n =>
+    httpFnTypes.has(n.type) || n.type === 'ServerFunctionDecl' || n.type === 'FunctionDecl' || n.type === 'WatchDecl'
+  );
+  for (const fn of allFnBodies) {
+    if (/^\s*->\s*(from|to|via|content)\s*:/m.test(fn.body)) {
+      const etiqueta = fn.type === 'WatchDecl' ? `watch(${fn.name})` : `${labelFor(fn.type)} ${fn.name}`;
+      throw new SyntaxError(
+        `"${etiqueta}" contiene algo que parece un bloque WSON ("-> from/to/via/content: valor") dentro de ` +
+        `su cuerpo -- eso SOLO funciona en una declaración "wson"/"server wson" de nivel superior, nunca ` +
+        `dentro de una función o de un watch. Ahí dentro no se reconoce, se cuela como texto literal en el ` +
+        `JS generado y revienta con un SyntaxError real. Declara el WSON aparte, a nivel superior del ` +
+        `archivo ("wson NOMBRE =" / "server wson NOMBRE ="), y referencia su nombre desde aquí.`
+      );
+    }
+  }
+
   // "server function" sin NINGUNA función HTTP (get/post/put/delete) en un archivo
   // que SÍ declara route() es inalcanzable de raíz: no hay ninguna de las cuatro que la
   // llame desde dentro, y un archivo con route() no se puede importar desde otro (ya
@@ -408,12 +487,14 @@ function validate(ast) {
     // no existe en server.js, solo se compiló -- y se tiró -- al lado de cliente); si
     // nadie las referencia, son código muerto sin ningún efecto. Mismo criterio que
     // "server function inalcanzable": se rechaza en compilación en vez de fallar en silencio.
-    const clientDecls = ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'FunctionDecl');
+    const clientDecls = ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'FunctionDecl' || n.type === 'WsonDecl');
     if (clientDecls.length > 0) {
       const first = clientDecls[0];
       const alternativa = first.type === 'FunctionDecl'
         ? `"server function ${first.name}"`
-        : `"server var ${first.name}"/"server reactive ${first.name}"`;
+        : first.type === 'WsonDecl'
+          ? `"server wson ${first.name}"`
+          : `"server var ${first.name}"/"server reactive ${first.name}"`;
       throw new SyntaxError(
         `"${labelFor(first.type)} ${first.name}" (línea ${first.line}) no tiene ningún efecto: ` +
         `este archivo declara route(...) pero no render(...), así que es una ruta "solo backend" -- ` +
@@ -497,11 +578,11 @@ function validate(ast) {
   // implicaría exponerlos al cliente, que es justo lo que "server" prohíbe. ("post function"
   // es la única excepción: esa SÍ se puede llamar desde un visual, es su razón de ser.)
   const serverNames = ast.body
-    .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl')
+    .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl' || n.type === 'ServerWsonDecl')
     .map(n => n.name);
   const serverNameKind = new Map(
     ast.body
-      .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl')
+      .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl' || n.type === 'ServerWsonDecl')
       .map(n => [n.name, labelFor(n.type)])
   );
 
@@ -511,10 +592,6 @@ function validate(ast) {
       collectTemplateExprs(v.template, exprs);
       for (const r of v.localReactives) exprs.push(r.init);
       for (const vr of v.localVars) exprs.push(vr.init);
-      for (const b of v.bindings) {
-        if (b.key === 'style') continue; // valor literal (nombre de clase), no una expresión
-        exprs.push(b.kind === 'value' ? b.value : b.code);
-      }
 
       for (const expr of exprs) {
         for (const serverName of serverNames) {
@@ -548,16 +625,32 @@ function validate(ast) {
         }
       }
     }
+
+    // Mismo hueco, pero en los CAMPOS de un "wson" de cliente (from/to/via/content son
+    // expresiones normales, con el mismo riesgo que el init de una reactive/var).
+    for (const wson of ast.body.filter(n => n.type === 'WsonDecl')) {
+      for (const field of wson.fields) {
+        for (const serverName of serverNames) {
+          if (referencesName(field.value, serverName)) {
+            throw new SyntaxError(
+              `"wson ${wson.name}" (línea ${field.fieldLine}, campo "${field.key}") referencia "${serverName}", ` +
+              `que es "${serverNameKind.get(serverName)}" -- eso nunca llega al bundle.js, así que fallaría en ` +
+              `el navegador con un ReferenceError real. Usa "server.${serverName}" en su lugar.`
+            );
+          }
+        }
+      }
+    }
   }
 
   // "updateServer" ya no existe -- se unificó con "post function" (ver README). Se
   // detecta explícitamente para dar un error útil en vez de un ReferenceError críptico
   // en el navegador si alguien lo escribe por costumbre.
   for (const v of ast.body.filter(n => n.type === 'VisualDecl')) {
-    for (const b of v.bindings) {
-      if (!b.key.startsWith('on')) continue;
-      const code = b.kind === 'value' ? b.value : b.code;
-      if (/\bupdateServer\s*\(/.test(code)) {
+    const exprs = [];
+    collectTemplateExprs(v.template, exprs);
+    for (const expr of exprs) {
+      if (/\bupdateServer\s*\(/.test(expr)) {
         throw new SyntaxError(
           `"visual ${v.name}" usa "updateServer(...)", que ya no existe -- se unificó con ` +
           `"post function". Declara una "post function" que actualice la(s) "server var" que ` +
