@@ -70,6 +70,20 @@ function isObjectKeyPosition(expr, index, length) {
   return (before === '{' || before === ',') && after === ':';
 }
 
+// Mismo motivo que en compiler.js: "var contador = 99" NO es una referencia a una
+// "server var contador" que exista en otro sitio -- es una declaración local nueva que
+// simplemente comparte nombre. Sin esto, declarar una variable local con un nombre que
+// coincide con una server var daba un FALSO POSITIVO real ("referencia prohibida"),
+// aunque el código no tuviera ninguna relación de verdad con esa server var.
+function isSimpleDeclarationNamePosition(expr, index) {
+  const before = expr.slice(0, index);
+  if (/(?:^|[;{}(]|\bfor\s*\()\s*(?:var|let|const)\s*$/.test(before)) return true;
+  const stmtStart = Math.max(before.lastIndexOf(';'), before.lastIndexOf('{'), before.lastIndexOf('\n'), -1) + 1;
+  const stmtSoFar = before.slice(stmtStart);
+  if (/^\s*(var|let|const)\b/.test(stmtSoFar) && /,\s*$/.test(stmtSoFar)) return true;
+  return false;
+}
+
 function isInsideAnySpan(index, spans) {
   return spans.some(([s, e]) => index >= s && index < e);
 }
@@ -163,6 +177,7 @@ function referencesName(expr, name) {
   while ((m = re.exec(expr)) !== null) {
     if (isInsideAnySpan(m.index, stringSpans)) continue;
     if (isObjectKeyPosition(expr, m.index, name.length)) continue;
+    if (isSimpleDeclarationNamePosition(expr, m.index)) continue;
     if (destructuringSpans.some(([s, e]) => m.index >= s && m.index < e)) continue;
     return true;
   }

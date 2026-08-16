@@ -90,7 +90,7 @@ npm test
 ```
 
 Corre la suite completa con el *test runner* nativo de Node (`node:test`,
-sin dependencias que instalar) — **141 tests, 40 suites** a estas alturas
+sin dependencias que instalar) — **228 tests, 64 suites** a estas alturas
 (el número ha ido creciendo turno a turno; ver `tests/` para el desglose
 completo, cada archivo nuevo se documenta en su sección correspondiente
 más abajo), cubriendo:
@@ -113,7 +113,17 @@ más abajo), cubriendo:
   estado local vs. global, *destructuring*/atajos de objeto.
 - **`tests/server.test.js`** — arranca un servidor HTTP real en un puerto
   efímero y usa `fetch` nativo: `post function`, sesiones aisladas por
-  cookie, persistencia de `server var`.
+  cookie, persistencia de `server var`, `watch()`, `async server
+  function`, WSON completo (firma, cifrado, varios destinos, reintentos,
+  historial en fichero), `respond()`.
+- **`tests/reactivity.test.js`** — el motor de reactividad profunda en sí
+  (aislado, sin compilador): mutación de propiedades anidadas, arrays,
+  identidad estable de los `Proxy` entre lecturas repetidas.
+- **`tests/security.test.js`** — *path traversal*, modo estricto
+  (`'use strict'`) evitando fugas a variables globales.
+- **`tests/ssr.test.js`** — renderizado SSR/SSG real, composición con
+  *slot* en el servidor, *fallback* seguro cuando algo no se puede
+  evaluar.
 
 Esta suite formaliza en tests permanentes todo lo que fui comprobando a
 mano a lo largo de esta conversación — incluida la limitación real del
@@ -1902,104 +1912,6 @@ quien use la página. Verificado que la forma correcta
 (`reactive x = server.contador`) sigue compilando sin ningún falso
 positivo, tanto local como importada.
 
-## WSON: mensajes estructurados para comunicación entre sistemas
-
-Idea propuesta a partir de un concepto tuyo: un formato pensado para
-describir "un mensaje que sale hacia otro sistema" de forma legible,
-reutilizando la sintaxis `-> clave: valor` que ya existía para `style`,
-pero aplicada al valor inicial de una variable en vez de a un bloque CSS.
-
-```
-server var message = "Hola"
-
-server var sender =
-    -> from: "yo"
-    -> to: "/comunicaciones"
-    -> via: "POST"
-    -> content: message
-```
-
-**Dos decisiones de diseño que se resolvieron discutiéndolas antes de
-tocar código:**
-
-1. **Es solo estructura de datos — declararlo NO envía nada.** `sender`
-   es un objeto normal, construido una vez, sin ningún efecto secundario.
-   Hace falta una llamada explícita a `send(sender)` para que de verdad
-   salga algo. Verificado con un servidor real: construir un WSON con un
-   dominio inválido en `to` no revienta ni intenta conectar a ningún
-   sitio — solo `send()` lo intentaría.
-2. **La indentación se adaptó a la convención ya existente** (como
-   `style`, todas las `->` indentadas debajo del `=`, no la primera
-   pegada a la misma línea) — para no inventar un patrón híbrido nuevo
-   dentro de un lenguaje que ya tiene sus propias reglas de indentación.
-
-### Cómo se implementó por debajo (más simple de lo que parece)
-
-`sender` **no es un nodo de AST nuevo** — el *parser* reconoce el bloque
-`-> clave: valor` y sintetiza directamente un objeto literal JS
-(`{ from: "yo", to: "/comunicaciones", ... }`) como si fuera el valor
-inicial normal de la declaración. Para el resto del compilador,
-`sender` es una `reactive`/`var`/`server var`/`server reactive` como
-cualquier otra, cuyo valor inicial resulta ser un objeto — funciona
-automáticamente con la sustitución de identificadores que ya existía
-(`content: message` se resuelve solo, sin necesitar ningún código nuevo).
-
-A diferencia de `style` (cuyas propiedades son texto CSS literal, sin
-sustitución), aquí cada valor **es una expresión JS de verdad** — por
-eso `via: "POST"` necesita comillas (no es un identificador especial,
-es un string como cualquier otro).
-
-### `send(wson)`: el paso explícito que sí envía
-
-Interpretación server-side, generada solo si se usa (mismo criterio que
-`http`/`whisper`): lee `to`/`via`/`content` del objeto y despacha por
-`http.*` — reutiliza por completo lo que ya existía, no un mecanismo de
-red nuevo.
-
-```
-via: "POST"   -- por defecto si no se especifica
-via: "PUT"
-via: "DELETE"
-```
-
-Verificado de extremo a extremo contra un "sistema externo" simulado:
-`send()` transmitió `content` de verdad, el `via` se respetó
-exactamente (probado con `PUT`, confirmando el método HTTP real recibido
-al otro lado), y `from` opcional (para mensajes anónimos) funciona sin
-más porque simplemente no se incluye en el objeto si no se especifica.
-
-**Alcance honesto de esta primera versión**: `to` como email o número de
-teléfono **no está implementado** — mandar un correo o un SMS de verdad
-necesita un servicio externo real (SMTP, o una API tipo
-SendGrid/Twilio) con credenciales, algo que no se puede construir ni
-probar sin red en este entorno. `send()` lo detecta y falla con un
-mensaje explícito y capturable (`try`/`catch`), en vez de fallar en
-silencio o intentar algo que no puede funcionar — verificado
-explícitamente.
-
-**`style` como "WSON especial"**: se planteó, pero no se implementó
-unificado — `style` compila a CSS, un WSON de mensaje compila a una
-llamada de red; son salidas demasiado distintas por debajo para que
-compartir la sintaxis de entrada (`->`) se traduzca en compartir
-implementación. Quedan conceptualmente emparentados (ambos son bloques
-`-> clave: valor`), pero cada uno con su propio significado según el
-contexto donde aparecen. (Nota: esto se escribió cuando los eventos
-también usaban `->` — desde la migración a atributos en línea, `style`
-y `wson` son los dos únicos sitios del lenguaje que siguen usando esta
-sintaxis.)
-
-### Bug real encontrado montando esto: WSON dentro de un cuerpo de función
-
-Al probar `send(sender)` dentro de una `post function`, escribí por
-error el bloque WSON **dentro** del cuerpo de la función en vez de a
-nivel superior del archivo — y compiló "sin error", generando JS
-**roto** (`SyntaxError: Unexpected token '>'`). Causa: los cuerpos de
-función son texto "casi crudo" que nunca se vuelve a analizar, así que
-`->` ahí dentro no se reconoce como WSON, se cuela tal cual. Mismo
-patrón exacto que ya habíamos cerrado con `watch()` anidado — arreglado
-con una validación que lo rechaza en compilación, con un mensaje
-explicando que hay que declarar el WSON aparte, a nivel superior.
-
 ## WSON: formato para describir mensajes salientes entre sistemas
 
 Idea original tuya: un formato ligero (parecido a JSON, de ahí el nombre)
@@ -2044,6 +1956,18 @@ post function disparar(args)
   compila a una llamada de red. Comparten la sintaxis `-> clave: valor`
   (reutilizada a propósito, mismo parser), pero no tiene sentido
   unificar su significado.
+
+### Bug real encontrado montando esto: WSON dentro de un cuerpo de función
+
+Al probar `WSON.send(sender)` dentro de una `post function`, escribí por
+error el bloque WSON **dentro** del cuerpo de la función en vez de a
+nivel superior del archivo — y compiló "sin error", generando JS
+**roto** (`SyntaxError: Unexpected token '>'`). Causa: los cuerpos de
+función son texto "casi crudo" que nunca se vuelve a analizar, así que
+`->` ahí dentro no se reconoce como WSON, se cuela tal cual. Mismo
+patrón exacto que ya habíamos cerrado con `watch()` anidado — arreglado
+con una validación que lo rechaza en compilación, con un mensaje
+explicando que hay que declarar el WSON aparte, a nivel superior.
 
 ### Bug real encontrado construyendo esto: `await` explícito en un handler no forzaba `async`
 
@@ -2144,6 +2068,210 @@ email/SMS), el lado receptor completo y automático (que WebScript
 reconozca y verifique un WSON entrante sin que el desarrollador tenga
 que llamar a `WSON.verify()` a mano), reintentos con idempotencia, y
 validación de forma del `content`.
+
+## `WSON.history()` reinventado: fichero real (JSONL), no memoria — con un bug real encontrado en el proceso
+
+Encargo directo: rediseñar `WSON.history()` para que vuelque a un
+fichero del sistema y no se pierda al reiniciar, y **evaluar si el
+propio método seguía teniendo sentido** una vez existiera el fichero, o
+si había que borrarlo.
+
+### La pregunta de si borrarlo, respondida antes de tocar código
+
+Sí sigue teniendo sentido, pero **rediseñado, no simplemente mantenido**:
+un fichero en disco es bueno para persistencia y para inspeccionarlo por
+fuera, pero el **propio código de la aplicación** (dentro de un
+`post`/`get function`) necesita alguna forma de **consultar** ese
+historial desde dentro — por ejemplo, para decidir si avisar a alguien
+tras varios *dead letters* seguidos. Un fichero externo no resuelve eso
+por sí solo sin algo que lo lea. Así que se mantiene, pero pasa a
+**leer del fichero real** en cada llamada, en vez de un array en
+memoria — resolviendo el "no perderlo" y manteniendo la utilidad de
+poder consultarlo desde dentro, ahora reflejando también lo de antes de
+reiniciar, no solo lo de la ejecución actual.
+
+### Diseño
+
+- **Formato JSONL** (una línea JSON por evento) — se puede **añadir**
+  una línea sin reescribir el fichero entero (mucho más barato que ir
+  regrabando un array JSON completo cada vez), y se puede inspeccionar
+  con herramientas normales (`cat`, `tail`, `grep`) sin necesitar nada
+  especial.
+- **Ubicación**: junto al propio `server.js`, usando `__dirname` desde
+  dentro del código generado — así el fichero vive donde vive el sitio
+  compilado, sin importar desde qué directorio se arranque el proceso
+  Node (`process.cwd()` habría sido frágil si el proceso se lanza desde
+  otro sitio).
+- **`WSON.send()`/`WSON.parse()` siguen registrando automáticamente**,
+  sin ninguna llamada aparte — solo cambió *dónde* se guarda, no cuándo.
+- **Sin límite de entradas** (a diferencia del tope de 1000 que tenía la
+  versión en memoria) — el fichero puede crecer sin freno en un proceso
+  muy longevo. **Límite reconocido, no resuelto**: no hay rotación de
+  logs implementada.
+- Si escribir falla (permisos, disco lleno...), **no tumba la
+  petición** — se avisa por consola, nada más. El registro es un
+  extra, nunca algo crítico para poder responder.
+
+### Verificado con dos procesos Node genuinamente separados, no simulado
+
+La prueba que de verdad importa aquí: un primer proceso compila,
+manda un mensaje (a un destino que falla a propósito, para que quede
+registrado como *dead letter*), y **cierra del todo**. Se confirma que
+el fichero sigue en disco tras el cierre. Un **segundo proceso Node
+completamente nuevo**, que arranca después, apunta al mismo directorio
+de salida y consulta el historial — **sin haber mandado nada él
+mismo** — y ve el mensaje del primero. No hay forma de que eso pase si
+la persistencia fuera solo en memoria.
+
+### Bug real encontrado revisando el código para el rediseño, no relacionado con lo que se pedía
+
+Repasando la implementación antes de tocarla, `WSON.history({ deadLetter:
+true })` — documentado y con un test que "pasaba" — resultó que
+**nunca filtraba nada de verdad**: la lista de filtros solo comprobaba
+`direction`/`from`/`to`/`id`, nunca `deadLetter`. El test anterior pasaba
+por pura casualidad, porque en ese momento solo había **una** entrada
+en todo el historial — filtrar sin filtrar de verdad daba el mismo
+resultado. Confirmado el bug con un caso real (dos envíos, uno que
+triunfa y otro que falla): `WSON.history({ deadLetter: true })` devolvía
+las **dos**, no solo la fallida. Arreglado añadiendo la comprobación que
+faltaba, con un test nuevo que sí tiene más de una entrada para que un
+filtro roto no pueda pasar por casualidad otra vez.
+
+## `respond(status, cuerpo)` — código de estado HTTP explícito
+
+Hasta ahora, las cuatro funciones HTTP siempre respondían `200` — no
+había forma de que un `post function` diera `201 Created`, `400 Bad
+Request`, o cualquier otro código. Diseño decidido antes de tocar
+código: no una forma especial en el valor de retorno (`return { status:
+400, body: {...} }`, descartado por ambiguo con datos reales que
+tuvieran un campo llamado literalmente `status`), sino un primitivo con
+nombre propio, coherente con `whisper()`/`WSON.*`:
+
+```
+post function crear(args)
+    if (!args.nombre)
+        return respond(400, { error: "falta el nombre" })
+    items = [...items, args.nombre]
+    return respond(201, { creado: true, total: items.length })
+```
+
+- **Generado solo si se usa**, como el resto de *helpers* condicionales
+  del proyecto — sin `respond()`, ni rastro de la función en el
+  `server.js`.
+- **Retrocompatibilidad total**: sin `respond()`, una función sigue
+  respondiendo `200` con lo que devuelva, exactamente igual que antes —
+  verificado explícitamente que esto no cambió.
+- Funciona en las **cuatro** (`get`/`post`/`put`/`delete function`), no
+  solo `post` — probado con `PUT`→`204` y `DELETE`→`202`.
+- El despachador (`site-builder.js`) reconoce el sobre especial que
+  genera `respond()` (`{ __wsHttpResponse: true, status, body }`) en los
+  dos únicos sitios donde se escribía la respuesta de éxito — con un
+  único ayudante compartido (`writeHandlerResult`), no lógica duplicada
+  en cada uno.
+
+Verificado con servidor real, los tres casos a la vez: sin nombre → `400`
+con su cuerpo; con nombre → `201` con el suyo; una `get function` en el
+mismo archivo que nunca usa `respond()` → sigue en `200`, sin ningún
+cambio.
+
+## `WSON.getSignature(headers)` — atajo para no escribir la cabecera a mano
+
+Propuesta directa: en vez de `headers['x-wson-signature']` (hay que
+recordar el nombre exacto, en minúsculas), un método con nombre propio.
+
+```
+post function recibir(args, query, headers)
+    var firma = WSON.getSignature(headers)
+    var valido = WSON.verify(args, firma, "clave-compartida")
+```
+
+Implementado como una envoltura fina — devuelve el valor **tal cual**,
+sin transformarlo, para que siga siendo componible con `WSON.verify()`
+exactamente como antes (`WSON.verify(args, WSON.getSignature(headers),
+secreto)` funciona igual que con la cabecera leída a mano). Verificado
+con dos servidores reales (emisor firma, receptor usa `getSignature()` +
+`verify()`) y con los dos casos de ausencia/presencia de la cabecera por
+separado.
+
+## Acorn confirmado por primera vez, y dos bugs reales encontrados verificándolo
+
+Hasta ahora, todo lo dicho sobre el motor con Acorn era razonamiento sin
+poder ejecutarlo — este entorno no tiene acceso a red para instalarlo.
+Jorge lo instaló en su propio entorno y confirmó que **la suite completa
+sigue pasando con Acorn activo**.
+
+### Por qué "la suite pasa" no bastaba por sí solo, y qué sí lo confirma
+
+De los cuatro límites documentados del motor de respaldo, solo **uno**
+tenía un test diseñado con dos ramas distintas (`if
+(jsAnalyzer.isAvailable())`), exigiendo un resultado **diferente** según
+el motor — no una aserción fija que "coincidiera por casualidad" con
+cualquiera de los dos. Ese test SÍ confirma, con la palabra de Jorge de
+que la suite entera pasó, que Acorn está activo de verdad y resuelve el
+caso de *destructuring* + *shadowing* tal como se esperaba (`99`, la
+variable local, no `5`, la reactive). Los otros tres límites documentados
+no tenían ningún test así — "la suite pasa" no decía nada sobre ellos.
+
+### Bug real, más grave que el que se estaba verificando, encontrado en el camino
+
+Construyendo los tests que faltaban para los otros límites, sin
+comprobar hasta ahora de ninguna forma: **`var contador = 99` (una declaración
+local simple, sin *destructuring* de por medio) generaba JS
+directamente inválido** si `contador` coincidía con el nombre de una
+`reactive`/`server var`/global — `var state.contador = 99`, un
+`SyntaxError` real al cargar el `bundle.js`, no solo un valor
+equivocado. Confirmado que afecta a `var`, `let` **y** `const` por
+igual. Arreglado con una función nueva
+(`isSimpleDeclarationNamePosition`) que excluye el **sitio de la
+declaración** de la sustitución — cubre tanto `var NOMBRE` a secas como
+declaradores separados por coma (`var a = 1, NOMBRE = 2`) y el
+declarador de un `for (let NOMBRE of/in ...)`.
+
+**Límite que queda, honesto**: esto arregla que el archivo **compile a
+JS válido** — no arregla que una referencia **posterior** a esa misma
+variable, dentro del mismo bloque, use la variable local en vez de la
+reactive. Es la misma limitación de *shadowing* ya documentada para
+*destructuring*, ahora confirmada que también aplica a declaraciones
+simples. Con Acorn, sí se resuelve del todo (seguimiento de ámbito
+real); con el motor de respaldo, sigue dando el valor de la reactive en
+vez del de la variable local — pero ya no revienta.
+
+### Un segundo bug, en `validate.js`, encontrado revisando el primero
+
+`validate.js` reimplementa esta misma lógica de sustitución por separado
+a propósito (para no acoplar la validación al compilador) — y tenía el
+mismo hueco, con una consecuencia distinta: declarar una variable local
+`var contador = 99` dentro de un `visual`, cuando `contador` coincidía
+con el nombre de una `server var` **en cualquier otro sitio del
+archivo**, disparaba un **falso positivo** de "referencia prohibida" —
+aunque el código no tuviera ninguna relación real con esa `server var`.
+Arreglado con la misma función, replicada en este archivo. Verificado
+que la detección real (una referencia genuina, sin ninguna declaración
+local que la sombree) sigue funcionando exactamente igual que antes —
+el arreglo no debilitó la validación de seguridad, solo dejó de disparar
+en un caso que nunca debió dispararse.
+
+### Bug aparte, no relacionado, encontrado por casualidad mientras probaba esto
+
+Al construir uno de los casos de prueba, apareció un `TypeError: 0 is
+not a function` completamente ajeno a la sustitución de identificadores:
+si una línea dentro de un `onclick={...}` empieza por `(` y la línea
+anterior no termina en `;`, la inserción automática de punto y coma de
+JS interpreta la línea anterior como una llamada a función. Es una
+trampa real y general de JS (no específica de WebScript), que puede
+afectar a cualquier código multilínea generado sin separadores
+explícitos. **Documentado aquí, no arreglado** — queda fuera del alcance
+de esta verificación de Acorn, pero merece su propia revisión aparte.
+
+### Lo que queda por confirmar
+
+Los dos límites restantes (valor por defecto en *destructuring*
+referenciando una reactive, y asignación-*destructuring* con sombra
+local previa) ahora **sí tienen tests con dos ramas**, recién escritos
+— pero fueron añadidos **después** de la confirmación de Jorge, así que
+todavía no se han corrido con Acorn de verdad. Hace falta un
+`npm test` más, con Acorn instalado, para completar la confirmación de
+los cuatro límites documentados, no solo el primero.
 
 ## WSON, cuarta vuelta: reintentos con backoff, cola muerta, y `WSON.enqueue()` — más cerca de una cola de mensajes
 
@@ -2282,11 +2410,14 @@ por sesión) — es una propiedad del **proceso entero**, no de una visita
 concreta. Confirmado explícitamente contigo antes de escribir código:
 **global al proceso**, no por sesión. `WSON.send()` registra cada envío
 (incluso los que fallan, con el error incluido); `WSON.parse()` registra
-cada recepción; ambos automáticamente, sin llamada aparte. Con un límite
-de 1000 entradas (las más viejas se descartan) para no crecer sin límite
-en memoria — y, como siempre en este proyecto, se pierde al reiniciar el
-proceso (una base de datos real de verdad está fuera de lo que se puede
-montar y probar en este entorno).
+cada recepción; ambos automáticamente, sin llamada aparte.
+
+> **Actualizado más adelante**: en su primera versión, esto vivía en un
+> array en memoria (con límite de 1000 entradas, perdido al reiniciar el
+> proceso). Se rediseñó por completo para persistir en un fichero real —
+> ver la sección "`WSON.history()` reinventado" más arriba para el diseño
+> nuevo, la verificación de persistencia real entre reinicios, y un bug
+> real que salió en el proceso.
 
 **Verificado que de verdad es global, no por sesión, de la forma más
 convincente posible**: tres peticiones con cookies de sesión
@@ -3032,45 +3163,72 @@ categoría, de más a menos probable que te sorprenda.
 
 ### Motor de sustitución de identificadores (sin Acorn instalado)
 
-Estas cuatro solo aplican al motor de respaldo por regex — **con Acorn
-instalado y verificado, se resuelven solas**, porque el AST sí hace
-seguimiento de ámbitos real:
+**Confirmado por Jorge en su propio entorno (con Acorn instalado y la
+suite completa corrida): el primer punto de esta lista se resuelve solo
+con Acorn**, tal como estaba razonado. Los otros tres tienen tests con
+dos ramas ya escritos, pero **todavía no confirmados con Acorn real** —
+ver la sección "Acorn confirmado por primera vez" más arriba para el
+detalle completo, incluyendo dos bugs reales (uno de sintaxis inválida,
+otro un falso positivo de seguridad) encontrados verificando esto, ya
+arreglados en ambos motores:
 
 - Tras un *destructuring* (`const { contador } = obj`), una referencia
   **posterior** a `contador` en el mismo bloque se sigue sustituyendo por
   `state.contador` en vez de resolver a la variable local — el motor de
   regex no rastrea que esa línea creó una variable que hace *shadowing*.
+  **Confirmado que Acorn lo resuelve.** La misma limitación también
+  aplica a una declaración simple (`var contador = 99`, sin
+  *destructuring*) — antes esto generaba directamente JS **inválido**
+  (arreglado en los dos motores: ya no revienta, aunque con el motor de
+  respaldo sigue sin usar el valor de la variable local en la referencia
+  posterior).
 - Dentro de un *destructuring* con valor por defecto
   (`const { contador = otraReactive } = obj`), ese valor por defecto NO
-  se sustituye si referencia otra `reactive`.
+  se sustituye — con el motor de respaldo, esto da un `ReferenceError`
+  real al ejecutar (confirmado ahora mismo, es más grave que "no se
+  sustituye": revienta). Test con dos ramas ya escrito, pendiente de
+  confirmar con Acorn real.
 - **Referencias hacia adelante entre `reactive` no funcionan** — solo
   hacia atrás. `reactive a = b` seguido de `reactive b = 5` da
   `ReferenceError: b is not defined` (verificado ahora mismo); al revés
   (`reactive b = 5` antes que `reactive a = b`) sí funciona. Es un patrón
   inusual, pero es una limitación real y no se ha resuelto — arreglarlo
   necesitaría reordenar declaraciones automáticamente según sus
-  dependencias, más trabajo del que parece a primera vista.
+  dependencias, más trabajo del que parece a primera vista. **Esta NO es
+  una limitación de Acorn** — es un problema de orden en el código
+  generado (`initLocalLines`), no de sustitución de identificadores, así
+  que Acorn no la resolvería aunque estuviera activo.
 - Un *destructuring* dentro de una **asignación** sin declarar
   (`({ contador } = obj)`, sin `const`/`let`/`var` delante) no se maneja
-  como caso especial — puede comportarse de forma distinta a lo esperado.
+  como caso especial — puede comportarse de forma distinta a lo esperado,
+  sobre todo si el nombre ya estaba sombreado por una declaración local
+  anterior. Test con dos ramas ya escrito, pendiente de confirmar con
+  Acorn real.
+- **Nuevo, encontrado de pasada, sin relación con Acorn ni con
+  sustitución de identificadores**: si una línea dentro de un cuerpo de
+  handler multilínea empieza por `(` y la línea anterior no termina en
+  `;`, la inserción automática de punto y coma de JS interpreta la línea
+  anterior como una llamada a función (`TypeError` real, confirmado).
+  Es una trampa general de JS, no arreglada todavía — añade `;` al final
+  de tus líneas si la siguiente empieza por `(`, `[` o una comilla
+  invertida, como precaución mientras tanto.
 
-**Pendiente real, no solo teórico**: Acorn se implementó pero **nunca se
-ha podido probar con la librería de verdad instalada** — este entorno no
-tiene acceso a red para hacer `npm install acorn`. Todo lo anterior
-asume que Acorn, una vez instalado, se comporta como está razonado — si
-lo instalas y algo de esto no se resuelve como se espera, sería la
-primera señal de un bug en `src/js-analyzer.js` que nadie ha detectado
-aún.
+**Sigue pendiente**: la suite completa corrida con Acorn instalado, una
+vez, confirmó el primer punto — pero los tests nuevos para los otros
+tres se escribieron **después** de esa confirmación, así que hace falta
+un `npm test` más con Acorn activo para terminar de confirmarlos.
 
 ### Servidor
 
-- **`server function` es siempre síncrona** — no puede usar `await`
+- **`server function` es síncrona por defecto** — no puede usar `await`
   dentro (a diferencia de `get`/`post`/`put`/`delete function`, que sí
-  son `async`). Si necesitas llamar a otro sistema (`http.*`/`fetch`),
-  hazlo directamente en una de las cuatro HTTP, no en un `server
-  function`. Decisión deliberada: hacerla `async` rompía el patrón de
-  llamarla sin `await` esperando su valor de vuelta directo, que ya
-  estaba en uso.
+  son `async` siempre). Con `async server function` delante, sí puede
+  usar `await` — pero entonces quien la llame también necesita `await`,
+  o recibirá una `Promise` en vez del valor. Por defecto (sin el
+  prefijo) sigue síncrona a propósito: hacerla `async` siempre rompía el
+  patrón de llamarla sin `await` esperando su valor de vuelta directo,
+  que ya estaba en uso. Lo mismo aplica a `function` (cliente) con
+  `async function`.
 - **Sin protección CSRF** en los endpoints `POST`/`PUT`/`DELETE` — un
   sitio malicioso podría, en teoría, disparar esas peticiones
   aprovechando la cookie de sesión del navegador de la víctima.
@@ -3091,6 +3249,38 @@ aún.
   manuales — el caso cubierto y probado (arrays vía
   `.slice()`/`.filter()`/`.map()`/*spread*) es el que de verdad importa
   en la práctica.
+
+### WSON
+
+Creció mucho a lo largo de varias rondas (firma, cifrado, varios
+destinos, reintentos, historial) — estas son las limitaciones reales
+que quedan, consolidadas en un solo sitio en vez de dispersas por las
+secciones narrativas de cada ronda:
+
+- **Solo destinos URL** — `to` como email o número de teléfono está
+  pensado pero **no implementado**: necesitaría conectar un servicio
+  real (SMTP, o una API tipo Twilio/SendGrid) con credenciales, algo que
+  no se puede construir ni probar sin red en este entorno. `via` rechaza
+  en compilación cualquier valor que no sea `POST`/`PUT`/`DELETE`, con
+  el motivo explicado en el propio mensaje.
+- **Sin protección contra reenvío (*replay*)** — un atacante que capture
+  un mensaje válido y firmado podría reenviarlo tal cual, y
+  `WSON.verify()` lo aceptaría de nuevo, porque la firma sigue siendo
+  válida (no hay marca de tiempo/expiración ni control de mensajes ya
+  vistos). El ID de correlación existe para trazabilidad, no para esto
+  — no se comprueba automáticamente que no se repita.
+- **`wson-history.jsonl` crece sin límite** — a diferencia de la versión
+  en memoria anterior (que tenía un tope de 1000 entradas), la versión
+  en fichero no tiene ninguno. En un proceso muy longevo con mucho
+  tráfico, el fichero puede crecer indefinidamente — no hay rotación de
+  *logs* implementada.
+- **Sin publicación/suscripción ni *broker* real** — `WSON.send()` sigue
+  siendo punto-a-punto (una URL concreta por mensaje, o varias en
+  paralelo con un array), no un modelo de "temas" con varios
+  suscriptores. Y la persistencia es un fichero local del proceso, no un
+  almacén compartido entre varios servidores — ver la sección de ideas
+  para acercarlo a una cola de mensajes de verdad, más arriba, para el
+  resto de lo que quedó sin construir y por qué.
 
 ### Experiencia de desarrollo / build
 
@@ -3114,6 +3304,16 @@ mutación de propiedades), `JSON.stringify`/`parse` y sus métodos, *query
 string* y cabeceras en las cuatro funciones HTTP, `import` de `server
 var`/`server function`/`server reactive` (incluyendo dependencias
 transitivas), composición de `visual` con *slot* y *children* (cliente y
-SSR), SSG/SSR con *fallback* seguro, y protección explícita contra path
-traversal y fuga de variables globales.
+SSR), SSG/SSR con *fallback* seguro, protección explícita contra path
+traversal y fuga de variables globales, y código de estado HTTP
+explícito en las cuatro funciones (`respond(status, cuerpo)`).
 
+**WSON en particular** ha crecido mucho más de lo que su primera
+versión sugiere — fácil de subestimar si solo viste las primeras rondas:
+firma HMAC-SHA256 con comparación en tiempo constante, cifrado
+AES-256-GCM opcional (confirmado que el contenido nunca viaja en texto
+plano), envío a varios destinos en paralelo con fallo aislado por
+destino, reintentos con *backoff* exponencial y marcado de *dead
+letter*, envío no bloqueante (`WSON.enqueue()`), y un historial
+persistente en fichero que sobrevive a reiniciar el proceso (confirmado
+con dos procesos Node genuinamente separados, no simulado).

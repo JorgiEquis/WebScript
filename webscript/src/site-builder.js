@@ -68,6 +68,21 @@ function countParams(paramsStr) {
   return trimmed.split(',').map(s => s.trim()).filter(Boolean).length;
 }
 
+// Escribe el resultado de una get/post/put/delete function como respuesta HTTP real.
+// Si el valor devuelto es el sobre especial que genera "respond(status, cuerpo)", usa
+// ESE código de estado y ESE cuerpo; si no (el caso de siempre, sin cambios), responde
+// 200 con el valor devuelto tal cual -- exactamente el comportamiento de antes de que
+// existiera "respond()".
+function writeHandlerResult(res, result) {
+  if (result && typeof result === 'object' && result.__wsHttpResponse === true) {
+    res.writeHead(result.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result.body === undefined ? null : result.body));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(result === undefined ? null : result));
+}
+
 function compileRoutes(routes, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
 
@@ -412,8 +427,7 @@ function startServer(table, outDir, port, options = {}) {
             const { query, headers } = extractQueryAndHeaders(req);
             const callArgs = [args, query, headers].slice(0, paramCount);
             const result = await state[fnName](...callArgs);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(result === undefined ? null : result));
+            writeHandlerResult(res, result);
           } catch (err) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: err.message }));
@@ -445,8 +459,7 @@ function startServer(table, outDir, port, options = {}) {
           }
           try {
             const result = await state[route.getFnName](...callArgs);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(result === undefined ? null : result));
+            writeHandlerResult(res, result);
           } catch (err) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: err.message }));

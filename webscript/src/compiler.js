@@ -192,9 +192,26 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
   // los stubs de cliente. Cualquiera de los WSON.* también activa "http" aunque el
   // código del usuario no escriba "http." en ningún sitio -- lo usan por dentro.
   const allBodies = [...serverFunctions, ...allHttpFns.map(([, , fn]) => fn), ...watchDecls].map(fn => fn.body);
-  const usesWson = allBodies.some(body => /\bWSON\.(send|enqueue|verify|showContent|parse|history)\s*\(/.test(body));
+  const usesWson = allBodies.some(body => /\bWSON\.(send|enqueue|verify|showContent|parse|history|getSignature)\s*\(/.test(body));
   const usesHttpObject = allBodies.some(body => /\bhttp\s*\./.test(body));
   const usesWhisper = allBodies.some(body => /\bwhisper\s*\(/.test(body));
+  // "respond(status, cuerpo)" SOLO tiene sentido dentro de una get/post/put/delete
+  // function (son las únicas que de verdad escriben una respuesta HTTP) -- se detecta
+  // por separado del resto, mirando solo esos cuatro cuerpos, no server function/watch.
+  const usesRespond = allHttpFns.some(([, , fn]) => /\brespond\s*\(/.test(fn.body));
+
+  const respondDef = usesRespond
+    ? [
+      '// respond(status, cuerpo) -- envuelve la respuesta con un código de estado HTTP',
+      '// explícito, en vez del 200 por defecto. Un primitivo con nombre propio, no una',
+      '// forma especial en el valor de retorno -- así nunca se confunde con datos reales',
+      '// que el usuario devuelva y que casualmente tengan un campo llamado "status".',
+      '// Sin "respond()", una get/post/put/delete function sigue respondiendo 200 con el',
+      '// valor que devuelva, exactamente igual que siempre -- esto es puramente opcional.',
+      'function respond(status, body) { return { __wsHttpResponse: true, status: status, body: body }; }',
+      '',
+    ]
+    : [];
 
   const whisperDef = usesWhisper
     ? [
@@ -253,20 +270,37 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '// no intenta verificar ni descifrar -- "content" es el payload tal cual, "signatureValid"',
       '// queda "undefined" (ni verdadero ni falso: sencillamente no se comprobó).',
       '//',
-      '// WSON.history(filtros?) -- almacén EN MEMORIA, compartido por TODO EL PROCESO (no por',
-      '// sesión -- es un registro de comunicación entre sistemas, no estado de un visitante',
-      '// concreto). WSON.send() registra cada envío, WSON.parse() registra cada recepción,',
-      '// automáticamente. Con límite de 1000 entradas (las más viejas se descartan) para no',
-      '// crecer sin límite en memoria. Se pierde al reiniciar el proceso -- no hay persistencia',
-      '// real (necesitaría una base de datos de verdad, fuera del alcance de lo que se puede',
-      '// montar y probar en este entorno).',
+      '// WSON.history(filtros?) -- almacén en un FICHERO real (JSONL, una línea JSON por',
+      '// evento), junto al propio server.js -- sobrevive a reiniciar el proceso, a',
+      '// diferencia del array en memoria que tenía antes (que se perdía sin remedio).',
+      '// WSON.send() registra cada envío (incluso los que fallan, con el error incluido),',
+      '// WSON.parse() registra cada recepción -- ambos automáticamente, sin llamada aparte.',
+      '// Formato JSONL elegido porque se puede AÑADIR una línea sin reescribir el fichero',
+      '// entero (mucho más barato que ir regrabando un array JSON completo en cada evento),',
+      '// y porque se puede inspeccionar con herramientas normales (cat, tail, grep) sin',
+      '// necesitar nada especial. Sin límite de entradas (a diferencia del tope de 1000 que',
+      '// tenía la versión en memoria) -- el fichero puede crecer sin freno en un proceso muy',
+      '// longevo; no hay rotación de logs implementada, queda documentado como límite',
+      '// conocido, no resuelto aquí.',
+      '//',
+      '// WSON.getSignature(headers) -- atajo para no tener que recordar el nombre exacto de',
+      '// la cabecera ("x-wson-signature", en minúsculas) -- devuelve el mismo valor que ya',
+      '// espera WSON.verify() como segundo argumento, sin transformarlo, para que sigan',
+      '// siendo componibles: WSON.verify(payload, WSON.getSignature(headers), secreto).',
       'function __wsonDeriveKey(secret, salt) {',
       "  return require('crypto').createHash('sha256').update(secret + ':' + salt).digest();",
       '}',
-      'const __wsonHistory = [];',
+      "const __wsonHistoryFile = require('path').join(__dirname, 'wson-history.jsonl');",
       'function __wsonRecord(entry) {',
-      '  __wsonHistory.push(Object.assign({ timestamp: Date.now() }, entry));',
-      '  if (__wsonHistory.length > 1000) __wsonHistory.shift();',
+      '  const line = JSON.stringify(Object.assign({ timestamp: Date.now() }, entry)) + \'\\n\';',
+      '  try {',
+      "    require('fs').appendFileSync(__wsonHistoryFile, line);",
+      '  } catch (e) {',
+      '    // Si por lo que sea no se puede escribir (permisos, disco lleno...), no se tumba',
+      '    // la petición por esto -- el registro es un extra, nunca algo crítico para poder',
+      '    // responder. Se avisa por consola, nada más.',
+      "    console.error('WSON: no se pudo escribir en el historial (' + __wsonHistoryFile + '): ' + e.message);",
+      '  }',
       '}',
       'const WSON = {',
       '  send: async (wson) => {',
@@ -379,15 +413,26 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '    return { from: from, id: id, content: content, signatureValid: signatureValid };',
       '  },',
       '  history: (filtros) => {',
-      '    let results = __wsonHistory;',
+      '    let entries = [];',
+      '    try {',
+      "      const raw = require('fs').readFileSync(__wsonHistoryFile, 'utf8');",
+      "      entries = raw.split('\\n').filter(Boolean).map((line) => {",
+      '        try { return JSON.parse(line); } catch (e) { return null; }',
+      '      }).filter((e) => e !== null);',
+      '    } catch (e) {',
+      '      entries = []; // el fichero no existe todavía (nada se ha enviado/recibido aún)',
+      '    }',
+      '    let results = entries;',
       '    if (filtros) {',
       "      if (filtros.direction) results = results.filter((e) => e.direction === filtros.direction);",
       "      if (filtros.from) results = results.filter((e) => e.from === filtros.from);",
       "      if (filtros.to) results = results.filter((e) => e.to === filtros.to);",
       "      if (filtros.id) results = results.filter((e) => e.id === filtros.id);",
+      "      if (filtros.deadLetter) results = results.filter((e) => e.deadLetter === true);",
       '    }',
       '    return results.slice();',
       '  },',
+      '  getSignature: (headers) => (headers ? headers[\'x-wson-signature\'] : undefined),',
       '};',
       '',
     ]
@@ -437,6 +482,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     '// UNA vez y se queda con su propia instancia -- el estado NO se comparte entre visitantes.',
     '',
     ...whisperDef,
+    ...respondDef,
     ...httpObjectDef,
     ...wsonSendDef,
     'function createSessionState() {',
@@ -478,6 +524,28 @@ function isObjectKeyPosition(expr, index, length) {
   while (j < expr.length && /\s/.test(expr[j])) j++;
   const after = expr[j] || '';
   return (before === '{' || before === ',') && after === ':';
+}
+
+// "var contador = 99" -- ¿el identificador que estamos mirando es el NOMBRE de una
+// declaración simple (var/let/const), no una referencia? Sin esto, si el nombre
+// coincide con una reactive/var/global, se sustituía igual que cualquier referencia
+// -- "var contador = 99" se convertía en "var state.contador = 99", JS INVÁLIDO (no
+// solo un valor equivocado, un SyntaxError real al ejecutar el bundle). Cubre tanto
+// "var NOMBRE" (justo tras la palabra clave) como declaradores separados por coma
+// ("var a = 1, NOMBRE = 2") y el declarador de un "for (let NOMBRE of/in ...)".
+function isSimpleDeclarationNamePosition(expr, index) {
+  const before = expr.slice(0, index);
+  // caso 1: justo después de "var"/"let"/"const" (inicio de declaración, o dentro de
+  // un "for (let NOMBRE of ...)")
+  if (/(?:^|[;{}(]|\bfor\s*\()\s*(?:var|let|const)\s*$/.test(before)) return true;
+  // caso 2: declarador separado por coma dentro de la MISMA declaración -- ej.
+  // "var a = 1, NOMBRE = 2". Se busca hacia atrás el inicio de sentencia más cercano
+  // y se comprueba que arranque con var/let/const y que lo último antes de esta
+  // posición sea una coma (no dentro de un valor, ej. un array o llamada).
+  const stmtStart = Math.max(before.lastIndexOf(';'), before.lastIndexOf('{'), before.lastIndexOf('\n'), -1) + 1;
+  const stmtSoFar = before.slice(stmtStart);
+  if (/^\s*(var|let|const)\b/.test(stmtSoFar) && /,\s*$/.test(stmtSoFar)) return true;
+  return false;
 }
 
 // Encuentra los tramos "const/let/var { ... }" -- un destructuring. Dentro de esos
@@ -617,6 +685,7 @@ function findIdentifierMatches(expr, name) {
   let m;
   while ((m = re.exec(expr)) !== null) {
     if (isObjectKeyPosition(expr, m.index, name.length)) continue;
+    if (isSimpleDeclarationNamePosition(expr, m.index)) continue;
     if (isInsideAnySpan(m.index, destructuringSpans)) continue;
     if (isInsideAnySpan(m.index, stringSpans)) continue;
     const expand = isShorthandPropertyPosition(expr, m.index, name.length);

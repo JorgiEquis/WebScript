@@ -101,4 +101,14 @@ describe('validate: server var / server function prohibidas en visuales', () => 
     const src = 'server var x = 1\n\nvisual v =\n<div>\n    if (true)\n        <p>{x}</p>\n</div>';
     assert.throws(() => parseSource(src), /server var/);
   });
+
+  test('bug real: declarar localmente un nombre que coincide con una server var ya no da falso positivo', () => {
+    const src = 'server var contador = 5\n\nvisual v =\n<button onclick={\n    var contador = 99;\n}>\n    x\n</button>';
+    assert.doesNotThrow(() => parseSource(src), 'una declaración local aislada, sin referencia posterior, no es una fuga real');
+  });
+
+  test('la excepción anterior no debilita la detección de una referencia REAL a una server var', () => {
+    const src = 'server var contador = 5\n\nvisual v =\n<button onclick={\n    resultado = contador\n}>\n    x\n</button>';
+    assert.throws(() => parseSource(src), /server var/, 'sin ninguna declaración local que la sombree, sigue siendo una referencia real');
+  });
 });

@@ -2134,3 +2134,238 @@ get function estado(query)
     }
   ));
 });
+
+describe('WSON.getSignature(headers): atajo para no escribir headers[\'x-wson-signature\'] a mano', () => {
+  test('devuelve el mismo valor que headers[\'x-wson-signature\'], sin transformarlo', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    const { compile } = require('../src/compiler');
+    const ast = parseSource('route("/x")\n\npost function f(args, query, headers)\n    return { firma: WSON.getSignature(headers) }');
+    const { server } = compile(ast, { routePath: '/' });
+    const fs2 = require('fs');
+    const path2 = require('path');
+    const tmpFile = path2.join(require('os').tmpdir(), `wson-getsig-${Date.now()}.server.js`);
+    fs2.writeFileSync(tmpFile, server);
+    const state = require(tmpFile).createSessionState();
+    return Promise.all([
+      state.f({}, {}, {}).then(r => assert.equal(r.firma, undefined, 'sin cabecera, undefined')),
+      state.f({}, {}, { 'x-wson-signature': 'sha256=abc123' }).then(r => assert.equal(r.firma, 'sha256=abc123', 'con cabecera, el mismo valor tal cual')),
+    ]).finally(() => fs2.rmSync(tmpFile, { force: true }));
+  });
+
+  test('componible con WSON.verify() de extremo a extremo, con dos servidores reales', withServer(
+    { 'api.ws': `route("/recibir")
+
+post function recibir(args, query, headers)
+    var firma = WSON.getSignature(headers)
+    var valido = WSON.verify(args, firma, "clave-getsig-test")
+    return { firmaObtenida: firma !== undefined, firmaValida: valido }
+` },
+    async (receptorBase) => {
+      const fs2 = require('fs');
+      const os2 = require('os');
+      const path2 = require('path');
+      const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+      const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-getsig-'));
+      const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-getsig-out-'));
+      fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/enviar")
+
+server wson sender =
+    -> to: "${receptorBase}/recibir"
+    -> content: "mensaje"
+    -> secret: "clave-getsig-test"
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+`);
+      const { table } = build2(srcDir, outDir);
+      const emisor = start2(table, outDir, 0);
+      await new Promise(resolve => emisor.on('listening', resolve));
+      const emisorPort = emisor.address().port;
+      try {
+        const r = await fetch(`http://localhost:${emisorPort}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const data = await r.json();
+        assert.deepEqual(data, { respuesta: { firmaObtenida: true, firmaValida: true } });
+      } finally {
+        emisor.close();
+        fs2.rmSync(srcDir, { recursive: true, force: true });
+        fs2.rmSync(outDir, { recursive: true, force: true });
+      }
+    }
+  ));
+});
+
+describe('respond(status, cuerpo): código de estado HTTP explícito en las cuatro funciones', () => {
+  test('post function con respond(400, ...) da el código y cuerpo exactos', withServer(
+    { 'api.ws': `route("/api/items")
+
+server var items = []
+
+post function crear(args)
+    if (!args.nombre)
+        return respond(400, { error: "falta el nombre" })
+    items = [...items, args.nombre]
+    return respond(201, { creado: true, total: items.length })
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/api/items`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+      });
+      assert.equal(r1.status, 400);
+      assert.deepEqual(await r1.json(), { error: 'falta el nombre' });
+      const cookie = r1.headers.get('set-cookie').split(';')[0];
+
+      const r2 = await fetch(`${base}/api/items`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ nombre: 'x' }),
+      });
+      assert.equal(r2.status, 201);
+      assert.deepEqual(await r2.json(), { creado: true, total: 1 });
+    }
+  ));
+
+  test('sin respond(), sigue respondiendo 200 exactamente como antes -- retrocompatibilidad', withServer(
+    { 'api.ws': `route("/api/items")
+
+get function listar(query)
+    return ["a", "b"]
+` },
+    async (base) => {
+      const r = await fetch(`${base}/api/items`);
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), ['a', 'b']);
+    }
+  ));
+
+  test('respond() se genera solo si se usa -- no aparece en server.js si nadie lo llama', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    const { compile } = require('../src/compiler');
+    const ast = parseSource('route("/x")\n\npost function f(args)\n    return { ok: true }');
+    const { server } = compile(ast, { routePath: '/' });
+    assert.doesNotMatch(server, /function respond/);
+  });
+
+  test('put/delete/get function también respetan respond(), no solo post', withServer(
+    { 'api.ws': `route("/api/x")
+
+put function actualizar(args)
+    return respond(204, {})
+
+delete function borrar(args)
+    return respond(202, { aceptado: true })
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/api/x`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      assert.equal(r1.status, 204);
+
+      const r2 = await fetch(`${base}/api/x`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      assert.equal(r2.status, 202);
+      assert.deepEqual(await r2.json(), { aceptado: true });
+    }
+  ));
+});
+
+describe('WSON.history() rediseñado: persiste en un fichero real (JSONL), no en memoria', () => {
+  test('sobrevive de verdad a un "reinicio" -- módulo recargado desde cero, el fichero en disco permanece', async () => {
+    const fs2 = require('fs');
+    const os2 = require('os');
+    const path2 = require('path');
+    const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+    const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-persist-'));
+    const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-persist-out-'));
+    fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/x")
+
+post function enviar(args)
+    try {
+        await WSON.send({ to: args.destino, content: args.mensaje })
+    } catch (e) {
+    }
+    return { ok: true }
+
+get function estado(query)
+    return { total: WSON.history().length, entradas: WSON.history() }
+`);
+    try {
+      // "proceso 1"
+      const { table } = build2(srcDir, outDir);
+      const server1 = start2(table, outDir, 0);
+      await new Promise(resolve => server1.on('listening', resolve));
+      const port1 = server1.address().port;
+      await fetch(`http://localhost:${port1}/api/x`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destino: 'http://localhost:1/x', mensaje: 'sobrevivo al reinicio' }),
+      });
+      await new Promise(resolve => server1.close(resolve));
+
+      // limpia la caché de require -- fuerza que TODO el estado a nivel de módulo se
+      // reconstruya desde cero, simulando un reinicio real del proceso. El fichero en
+      // disco (wson-history.jsonl) NO se toca por esto -- solo el require() del
+      // server.js compilado.
+      Object.keys(require.cache).forEach((key) => {
+        if (key.includes(outDir)) delete require.cache[key];
+      });
+
+      // "proceso 2" -- nunca mandó nada él mismo
+      const { table: table2 } = build2(srcDir, outDir);
+      const server2 = start2(table2, outDir, 0);
+      await new Promise(resolve => server2.on('listening', resolve));
+      const port2 = server2.address().port;
+      const r = await fetch(`http://localhost:${port2}/api/x`);
+      const data = await r.json();
+      assert.equal(data.total, 1, 'debe ver el mensaje del "proceso" anterior, sin haberlo mandado él mismo');
+      assert.equal(data.entradas[0].content, 'sobrevivo al reinicio');
+      server2.close();
+    } finally {
+      fs2.rmSync(srcDir, { recursive: true, force: true });
+      fs2.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('bug real encontrado en el rediseño: el filtro deadLetter nunca se había implementado -- ahora sí filtra de verdad', withServer(
+    { 'api.ws': `route("/api/x")
+
+post function usar(args)
+    try {
+        await WSON.send({ to: args.d, content: "x" })
+    } catch (e) {
+    }
+    return { ok: true }
+
+get function estado(query)
+    return { total: WSON.history().length, soloDead: WSON.history({ deadLetter: true }).length }
+` },
+    async (base) => {
+      const http2 = require('http');
+      const receptorOk = http2.createServer((req, res) => { res.writeHead(200); res.end('{}'); });
+      await new Promise(resolve => receptorOk.listen(0, resolve));
+      try {
+        const puertoOk = receptorOk.address().port;
+        // uno que triunfa
+        await fetch(`${base}/api/x`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ d: `http://localhost:${puertoOk}/x` }),
+        });
+        // uno que falla -- ese sí debe contar como deadLetter
+        await fetch(`${base}/api/x`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ d: 'http://localhost:1/x' }),
+        });
+        const r = await fetch(`${base}/api/x`);
+        assert.deepEqual(await r.json(), { total: 2, soloDead: 1 }, 'antes del arreglo esto daba soloDead:2 (el filtro no filtraba nada)');
+      } finally {
+        receptorOk.close();
+      }
+    }
+  ));
+
+  test('sin nada enviado/recibido todavía (fichero inexistente), WSON.history() da vacío, sin error', withServer(
+    { 'api.ws': `route("/api/x")\n\nget function estado(query)\n    return { total: WSON.history().length }\n` },
+    async (base) => {
+      const r = await fetch(`${base}/api/x`);
+      assert.deepEqual(await r.json(), { total: 0 });
+    }
+  ));
+});

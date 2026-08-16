@@ -426,3 +426,165 @@ render(
     assert.equal(app.children[0].textContent, 'alto: 25');
   });
 });
+
+describe('bug real encontrado verificando Acorn: "var NOMBRE" coincidiendo con una reactive generaba JS inválido', () => {
+  test('var/let/const con un nombre que coincide con una reactive ya NO genera JS inválido', async () => {
+    for (const kw of ['var', 'let', 'const']) {
+      const src = `
+reactive contador = 7
+reactive resultado = 0
+
+visual test =
+<button onclick={
+    ${kw} contador = 99;
+    resultado = contador
+}>
+    {resultado}
+</button>
+
+render(
+    test
+)
+`;
+      const { js } = compileSource(src);
+      assert.doesNotMatch(js, new RegExp(`${kw} state\\.contador`), `"${kw} state.contador" sería JS inválido -- antes se generaba así`);
+      // confirma que de verdad es JS ejecutable, no solo que el texto no coincide --
+      // ejecutando el bundle real, no con una comprobación de sintaxis recortada a mano
+      const { app, ready } = runBundle(js);
+      await ready;
+      const btn = app.children[0];
+      assert.doesNotThrow(() => btn.listeners.click({ target: btn }), `el bundle con "${kw}" debe ejecutarse sin lanzar`);
+    }
+  });
+
+  test('declarar la sombra SIN referenciarla después ejecuta bien (caso aislado, totalmente resuelto)', async () => {
+    const src = `
+reactive contador = 7
+
+visual test =
+<button onclick={
+    var contador = 99;
+}>
+    {contador}
+</button>
+
+render(
+    test
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const btn = app.children[0];
+    assert.doesNotThrow(() => btn.listeners.click({ target: btn }), 'no debe lanzar ningún error al ejecutar');
+  });
+
+  test('con referencia posterior a la sombra, el motor de respaldo sigue usando la reactive (limitación conocida, ya no un crash)', async () => {
+    const src = `
+reactive contador = 7
+reactive resultado = 0
+
+visual test =
+<button onclick={
+    var contador = 99;
+    resultado = contador
+}>
+    {resultado}
+</button>
+
+render(
+    test
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const btn = app.children[0];
+    btn.listeners.click({ target: btn });
+
+    const jsAnalyzer = require('../src/js-analyzer');
+    if (jsAnalyzer.isAvailable()) {
+      assert.equal(app.children[0].textContent, '99', 'con Acorn, debe usar la variable local sombreada (99), no la reactive (7)');
+    } else {
+      assert.equal(app.children[0].textContent, '7', 'motor de respaldo: limitación conocida (ya no es un crash, pero el valor sigue siendo el de la reactive)');
+    }
+  });
+});
+
+describe('Acorn: los otros dos límites documentados, nunca antes comprobados con la librería real instalada', () => {
+  test('valor por defecto en destructuring referenciando una reactive', async () => {
+    const src = `
+reactive contador = 42
+reactive resultado = 0
+
+visual test =
+<button onclick={
+    var obj = {};
+    var valor = 5;
+    const { x = contador } = obj;
+    resultado = x
+}>
+    {resultado}
+</button>
+
+render(
+    test
+)
+`;
+    const { js } = compileSource(src);
+    const jsAnalyzer = require('../src/js-analyzer');
+    if (jsAnalyzer.isAvailable()) {
+      // con Acorn, "contador" dentro del valor por defecto SÍ debe sustituirse -- sin
+      // eso, el bundle fallaría con ReferenceError al ejecutar
+      const { app, ready } = runBundle(js);
+      await ready;
+      const btn = app.children[0];
+      assert.doesNotThrow(() => btn.listeners.click({ target: btn }), 'con Acorn, no debe lanzar ReferenceError');
+      assert.equal(app.children[0].textContent, '42', 'con Acorn, el valor por defecto debe resolver a la reactive');
+    } else {
+      // motor de respaldo: limitación documentada -- ReferenceError real al ejecutar
+      assert.doesNotThrow(() => runBundle(js), 'compilar no debe fallar');
+      const { app, ready } = runBundle(js);
+      await ready;
+      const btn = app.children[0];
+      let lanzo = false;
+      try { btn.listeners.click({ target: btn }); } catch (e) { lanzo = true; }
+      assert.ok(lanzo, 'motor de respaldo: limitación conocida -- debe seguir lanzando ReferenceError (contador no sustituido)');
+    }
+  });
+
+  test('destructuring en una asignación (sin declarador) con sombra local previa', async () => {
+    const src = `
+reactive contador = 7
+reactive resultado = 0
+
+visual test =
+<button onclick={
+    var contador = 1;
+    var obj = { contador: 99 };
+    ({ contador } = obj);
+    resultado = contador
+}>
+    {resultado}
+</button>
+
+render(
+    test
+)
+`;
+    const { js } = compileSource(src);
+    const jsAnalyzer = require('../src/js-analyzer');
+    if (jsAnalyzer.isAvailable()) {
+      const { app, ready } = runBundle(js);
+      await ready;
+      const btn = app.children[0];
+      assert.doesNotThrow(() => btn.listeners.click({ target: btn }), 'con Acorn, debe ser JS válido y ejecutable');
+      assert.equal(app.children[0].textContent, '99', 'con Acorn, debe asignar a la variable LOCAL sombreada, no a la reactive');
+    } else {
+      // motor de respaldo: no rastrea que "contador" ya estaba sombreada por el "var"
+      // anterior -- puede o no ejecutar sin lanzar, según cómo caiga la sustitución;
+      // lo único que hace falta confirmar es que el propio compileSource no revienta
+      assert.doesNotThrow(() => compileSource(src), 'compilar no debe fallar en sí, aunque el resultado sea incorrecto');
+    }
+  });
+});
