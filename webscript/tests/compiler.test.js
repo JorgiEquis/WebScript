@@ -588,3 +588,246 @@ render(
     }
   });
 });
+
+describe('const (cliente): compila a un const real de JS, no reactivo, reasignar lanza un error real', () => {
+  test('se compila con la palabra clave "const", no "let" ni "state."', async () => {
+    const src = `
+const pi = 3.14
+reactive resultado = 0
+
+visual v =
+<button onclick={resultado = pi * 2}>{resultado}</button>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /const pi = 3\.14;/);
+    assert.doesNotMatch(js, /state\.pi/, 'nunca debe pasar por el store reactivo -- const no es reactive');
+  });
+
+  test('funciona correctamente al leerlo, ejecutado de verdad', async () => {
+    const src = `
+const pi = 3.14
+reactive resultado = 0
+
+visual v =
+<button onclick={resultado = pi * 2}>{resultado}</button>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const btn = app.children[0];
+    btn.listeners.click({ target: btn });
+    assert.equal(app.children[0].textContent, '6.28');
+  });
+
+  test('reasignar una const lanza un TypeError real de JS, no algo inventado por WebScript', async () => {
+    const src = `
+const pi = 3.14
+
+visual v =
+<button onclick={pi = 99}>x</button>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    const { app, ready } = runBundle(js);
+    await ready;
+    const btn = app.children[0];
+    assert.throws(() => btn.listeners.click({ target: btn }), /Assignment to constant variable/);
+  });
+});
+
+describe('stylesheets externas (ej. Bootstrap): <link> inyectados en el <head>', () => {
+  test('sin stylesheets configuradas, el <head> sigue exactamente igual que siempre', () => {
+    const src = `
+visual v =
+<p>x</p>
+
+render(
+    v
+)
+`;
+    const { html } = compileSource(src);
+    assert.doesNotMatch(html, /jsdelivr|bootstrap/i);
+    assert.match(html, /<link rel="stylesheet" href="styles\.css">/);
+  });
+
+  test('con stylesheets configuradas, aparecen como <link> ANTES del CSS propio del proyecto', () => {
+    const { compile } = require('../src/compiler');
+    const { parseSource } = require('./helpers/compile-helper');
+    const ast = parseSource('visual v =\n<div class="container"><button class="btn btn-primary">x</button></div>\n\nrender(\n    v\n)');
+    const { html } = compile(ast, {
+      stylesheets: ['https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css'],
+    });
+    const posBootstrap = html.indexOf('bootstrap.min.css');
+    const posPropio = html.indexOf('href="styles.css"');
+    assert.ok(posBootstrap !== -1, 'debe aparecer el link de Bootstrap');
+    assert.ok(posBootstrap < posPropio, 'Bootstrap debe ir ANTES del CSS propio, para que este último pueda sobreescribir');
+  });
+
+  test('varias stylesheets a la vez, en el orden declarado', () => {
+    const { compile } = require('../src/compiler');
+    const { parseSource } = require('./helpers/compile-helper');
+    const ast = parseSource('visual v =\n<p>x</p>\n\nrender(\n    v\n)');
+    const { html } = compile(ast, {
+      stylesheets: ['https://a.com/1.css', 'https://b.com/2.css'],
+    });
+    const pos1 = html.indexOf('a.com/1.css');
+    const pos2 = html.indexOf('b.com/2.css');
+    assert.ok(pos1 !== -1 && pos2 !== -1 && pos1 < pos2);
+  });
+
+  test('una URL con caracteres especiales se escapa correctamente al insertarse en el atributo', () => {
+    const { compile } = require('../src/compiler');
+    const { parseSource } = require('./helpers/compile-helper');
+    const ast = parseSource('visual v =\n<p>x</p>\n\nrender(\n    v\n)');
+    const { html } = compile(ast, {
+      stylesheets: ['https://ejemplo.com/x.css?a=1&b="comilla"'],
+    });
+    assert.match(html, /href="https:\/\/ejemplo\.com\/x\.css\?a=1&amp;b=&quot;comilla&quot;"/);
+  });
+});
+
+describe('async/await implícito: solo las funciones que de verdad lo necesitan se compilan async (punto fijo)', () => {
+  test('bug real cerrado: una function síncrona llamada desde una interpolación NO debe compilarse async -- si lo fuera, la interpolación mostraría "[object Promise]"', async () => {
+    const src = `
+reactive base = 10
+
+function calcularConBase(x)
+    var resultado = x + base
+    if (resultado > 20)
+        return "alto: " + resultado
+    else
+        return "bajo: " + resultado
+
+visual v =
+<p>{calcularConBase(15)}</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    // confirma en el propio texto generado, no solo por ejecución
+    assert.match(js, /function calcularConBase\(x\) \{/, 'debe ser función normal');
+    assert.doesNotMatch(js, /async function calcularConBase/, 'NUNCA debe compilarse async -- nunca llama a nada asíncrono');
+
+    const { app, ready } = runBundle(js);
+    await ready;
+    assert.equal(app.children[0].textContent, 'alto: 25', 'antes del arreglo, esto daba "[object Promise]"');
+  });
+
+  test('una function que SÍ llama a fetch() se compila async, y quien la llama recibe el valor ya resuelto, sin escribir await', async () => {
+    const src = `
+function obtenerDatos(url)
+    var r = fetch(url)
+    return r
+
+function usarDatos(url)
+    var datos = obtenerDatos(url)
+    return datos
+
+visual v =
+<p>x</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /async function obtenerDatos/, 'llama a fetch() directamente -- debe ser async');
+    assert.match(js, /async function usarDatos/, 'llama a obtenerDatos(), que es async -- debe propagarse (transitivo)');
+    assert.match(js, /await fetch\(/);
+    assert.match(js, /await obtenerDatos\(/);
+  });
+
+  test('cadena de tres funciones (A llama a B llama a C-que-usa-fetch) -- las tres se marcan async, sin importar el orden de declaración', async () => {
+    const src = `
+function funcionA(url)
+    return funcionB(url)
+
+function funcionC(url)
+    return fetch(url)
+
+function funcionB(url)
+    return funcionC(url)
+
+visual v =
+<p>x</p>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /async function funcionA/);
+    assert.match(js, /async function funcionB/);
+    assert.match(js, /async function funcionC/);
+  });
+});
+
+describe('async/await implícito: manejadores onclick, solo async cuando de verdad hace falta', () => {
+  test('onclick con función síncrona -- el manejador NO se compila async, funciona de inmediato', async () => {
+    const src = `
+function duplicar(x)
+    return x * 2
+
+reactive resultado = 0
+
+visual v =
+<div>
+    <button id="sync" onclick={resultado = duplicar(21)}>{resultado}</button>
+</div>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.doesNotMatch(js, /addEventListener\("click", async/, 'sin llamadas async, el manejador debe quedarse como función normal');
+
+    const { app, ready } = runBundle(js);
+    await ready;
+    const btn = app.children[0].children[0];
+    btn.listeners.click({ target: btn });
+    assert.equal(btn.textContent, '42');
+  });
+
+  test('onclick con función que usa fetch() -- el manejador SÍ se compila async, y el resultado llega tras esperar', async () => {
+    const src = `
+function esperar(url)
+    var r = fetch(url)
+    return r
+
+reactive datos = ""
+
+visual v =
+<div>
+    <button id="async" onclick={datos = esperar("http://x")}>{datos}</button>
+</div>
+
+render(
+    v
+)
+`;
+    const { js } = compileSource(src);
+    assert.match(js, /addEventListener\("click", async/, 'usa fetch() -- el manejador debe ser async');
+
+    const { app, ready } = runBundle(js, { fetch: () => Promise.resolve('datos reales') });
+    await ready;
+    const btn = app.children[0].children[0];
+    const resultadoClic = btn.listeners.click({ target: btn });
+    assert.equal(typeof resultadoClic?.then, 'function', 'debe devolver algo con .then -- una promesa de verdad');
+    await resultadoClic;
+    assert.equal(btn.textContent, 'datos reales');
+  });
+});

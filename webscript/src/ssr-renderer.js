@@ -172,6 +172,13 @@ function renderRouteToHtml(ast, options = {}) {
   };
 
   const globalScope = { server: options.serverScope || {} };
+  // query() -- la query string de la petición REAL, como objeto. Función de verdad en
+  // el scope (no un valor ya resuelto), para que "query()" se evalúe como una llamada,
+  // igual que en el cliente -- ambos lados devuelven la misma forma de datos. Sin
+  // "queryParams" (ej. SSG en tiempo de compilación, sin ninguna petición real detrás),
+  // devuelve un objeto vacío -- nunca falla, nunca revienta la evaluación.
+  const queryParamsForSSR = options.queryParams || {};
+  globalScope.query = () => queryParamsForSSR;
   // El nombre de un "style" es literalmente su propia clase CSS -- se añade al scope
   // como una cadena que se referencia a sí misma, para que "class={estilo}" (o
   // "class={activo ? estilo : 'otra'}") se evalúe correctamente en SSR sin necesitar
@@ -186,6 +193,17 @@ function renderRouteToHtml(ast, options = {}) {
     const val = evalExpr(v.init, globalScope);
     if (!val.ok) return { ok: false, html: '' };
     globalScope[v.name] = val.value;
+  }
+  // Bug real encontrado revisando este mismo bloque para query(): los "const" globales
+  // nunca se evaluaban aquí -- una plantilla que usara una "const" fallaba en SSR
+  // (ReferenceError: nombre no definido en el scope) y caía al fallback de concha vacía,
+  // perdiendo el pre-renderizado por completo, aunque el valor fuera un literal simple
+  // sin ninguna razón real para no poder evaluarse en el servidor.
+  const globalConstsList = ast.body.filter(n => n.type === 'ConstDecl');
+  for (const c of globalConstsList) {
+    const val = evalExpr(c.init, globalScope);
+    if (!val.ok) return { ok: false, html: '' };
+    globalScope[c.name] = val.value;
   }
   ctx.globalScope = globalScope;
 

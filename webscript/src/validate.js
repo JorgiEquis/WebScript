@@ -3,29 +3,34 @@ const jsAnalyzer = require('./js-analyzer');
 const LABELS = {
   ReactiveDecl: 'reactive',
   VarDecl: 'var',
+  ConstDecl: 'const',
   FunctionDecl: 'function',
   StyleDecl: 'style',
   VisualDecl: 'visual',
   ServerVarDecl: 'server var',
+  ServerConstDecl: 'server const',
   ServerReactiveDecl: 'server reactive',
   ServerFunctionDecl: 'server function',
   PostFunctionDecl: 'post function',
   PutFunctionDecl: 'put function',
   DeleteFunctionDecl: 'delete function',
   GetFunctionDecl: 'get function',
+  WsFunctionDecl: 'ws function',
   WatchDecl: 'watch',
   WsonDecl: 'wson',
   ServerWsonDecl: 'server wson',
 };
 
-// Espacios de nombres: reactive/var/function/wson/visual/server-var/server-reactive/
-// server-function/server-wson/get-post-put-delete-function comparten uno -- colisionan
-// de verdad (variable JS muerta, función pisada en silencio, o ambigüedad sobre si un
-// nombre es de cliente o de servidor). "style" tiene el suyo propio. "watch" no declara
-// ningún nombre (solo referencia uno existente), así que no participa en este espacio.
+// Espacios de nombres: reactive/var/const/function/wson/visual/server-var/
+// server-const/server-reactive/server-function/server-wson/
+// get-post-put-delete-function comparten uno -- colisionan de verdad (variable JS
+// muerta, función pisada en silencio, o ambigüedad sobre si un nombre es de cliente o
+// de servidor). "style" tiene el suyo propio. "watch" no declara ningún nombre (solo
+// referencia uno existente), así que no participa en este espacio.
 const SHARED_NAMESPACE = new Set([
-  'ReactiveDecl', 'VarDecl', 'FunctionDecl', 'WsonDecl', 'VisualDecl', 'ServerVarDecl', 'ServerReactiveDecl', 'ServerFunctionDecl', 'ServerWsonDecl',
-  'PostFunctionDecl', 'PutFunctionDecl', 'DeleteFunctionDecl', 'GetFunctionDecl',
+  'ReactiveDecl', 'VarDecl', 'ConstDecl', 'FunctionDecl', 'WsonDecl', 'VisualDecl',
+  'ServerVarDecl', 'ServerConstDecl', 'ServerReactiveDecl', 'ServerFunctionDecl', 'ServerWsonDecl',
+  'PostFunctionDecl', 'PutFunctionDecl', 'DeleteFunctionDecl', 'GetFunctionDecl', 'WsFunctionDecl',
 ]);
 
 function labelFor(type) {
@@ -268,9 +273,9 @@ function findVisualCycle(graph) {
 }
 
 function validate(ast) {
-  // Tipado opcional: reactive/var globales y locales (dentro de cada visual)
+  // Tipado opcional: reactive/var/const globales y locales (dentro de cada visual)
   for (const decl of ast.body) {
-    if (decl.type === 'ReactiveDecl' || decl.type === 'VarDecl') {
+    if (decl.type === 'ReactiveDecl' || decl.type === 'VarDecl' || decl.type === 'ConstDecl') {
       checkDeclaredType(decl, ' (global)');
     }
     if (decl.type === 'VisualDecl') {
@@ -284,8 +289,9 @@ function validate(ast) {
   // dinámica (una variable, por ejemplo) no se comprueba aquí -- igual que el resto del
   // tipado opcional del proyecto, solo se valida lo que se puede comprobar en
   // compilación sin ejecutar nada.
-  const ALLOWED_VIA = new Set(['POST', 'PUT', 'DELETE']);
+  const ALLOWED_VIA = new Set(['POST', 'PUT', 'DELETE', 'SOCKET']);
   for (const wson of ast.body.filter(n => n.type === 'WsonDecl' || n.type === 'ServerWsonDecl')) {
+    if (!wson.fields) continue; // segunda forma ("wson NOMBRE = expresión") -- nada que validar aquí, no hay campos literales
     const viaField = wson.fields.find(f => f.key === 'via');
     if (!viaField) continue;
     const literalMatch = viaField.value.match(/^["'](.+)["']$/);
@@ -294,8 +300,9 @@ function validate(ast) {
     if (!ALLOWED_VIA.has(via)) {
       throw new SyntaxError(
         `"${labelFor(wson.type)} ${wson.name}" (línea ${viaField.fieldLine}) -- "via: ${JSON.stringify(literalMatch[1])}" ` +
-        `no es un verbo soportado. Por ahora (destinos URL) solo se admiten "POST", "PUT" o "DELETE" -- ` +
-        `email y número de teléfono como destino están pensados para más adelante, no implementados todavía.`
+        `no es un verbo soportado. Se admiten "POST", "PUT", "DELETE" (destino URL por HTTP) o "SOCKET" ` +
+        `(destino ws:// por WebSocket) -- email y número de teléfono como destino están pensados para más ` +
+        `adelante, no implementados todavía.`
       );
     }
   }
@@ -306,6 +313,7 @@ function validate(ast) {
   // del navegador vería el secreto tal cual, en texto plano, en el bundle.js. Se
   // rechaza en compilación, no solo se documenta como mala práctica.
   for (const wson of ast.body.filter(n => n.type === 'WsonDecl')) {
+    if (!wson.fields) continue; // segunda forma -- sin campos literales que inspeccionar aquí
     for (const key of ['secret', 'encrypt']) {
       const field = wson.fields.find(f => f.key === key);
       if (field) {
@@ -323,6 +331,7 @@ function validate(ast) {
   // compilación en vez de fallar en tiempo de ejecución con un mensaje críptico de
   // Node sobre una clave inválida.
   for (const wson of ast.body.filter(n => n.type === 'ServerWsonDecl')) {
+    if (!wson.fields) continue; // segunda forma -- lo que traiga la expresión no se puede validar aquí
     const encryptField = wson.fields.find(f => f.key === 'encrypt');
     const hasSecret = wson.fields.some(f => f.key === 'secret');
     if (encryptField && !hasSecret) {
@@ -347,7 +356,9 @@ function validate(ast) {
 
   // Como mucho una función por verbo HTTP (get/post/put/delete) por archivo -- cada
   // verbo dispara la suya propia en la URL de la ruta; nada impide tener varias a la vez.
-  for (const [type, verb] of [['PostFunctionDecl', 'post'], ['PutFunctionDecl', 'put'], ['DeleteFunctionDecl', 'delete'], ['GetFunctionDecl', 'get']]) {
+  // "ws function" sigue la misma regla, aunque no es un verbo HTTP -- una conexión
+  // WebSocket entrante a la ruta de este archivo solo puede tener un manejador.
+  for (const [type, verb] of [['PostFunctionDecl', 'post'], ['PutFunctionDecl', 'put'], ['DeleteFunctionDecl', 'delete'], ['GetFunctionDecl', 'get'], ['WsFunctionDecl', 'ws']]) {
     const decls = ast.body.filter(n => n.type === type);
     if (decls.length > 1) {
       throw new SyntaxError(
@@ -373,14 +384,21 @@ function validate(ast) {
 
   // watch(NOMBRE) solo tiene sentido si NOMBRE es una "server reactive" declarada en el
   // mismo archivo -- ni una "server var" normal (esas no se observan, watch no dispararía
-  // nunca), ni un nombre inventado.
+  // nunca), ni una "server const" (nunca cambia, watch nunca dispararía tampoco), ni un
+  // nombre inventado.
   const serverReactiveNamesSet = new Set(ast.body.filter(n => n.type === 'ServerReactiveDecl').map(n => n.name));
   for (const w of ast.body.filter(n => n.type === 'WatchDecl')) {
     if (!serverReactiveNamesSet.has(w.name)) {
       const asServerVar = ast.body.some(n => n.type === 'ServerVarDecl' && n.name === w.name);
+      const asServerConst = ast.body.some(n => n.type === 'ServerConstDecl' && n.name === w.name);
+      const aclaracion = asServerVar
+        ? ` (es "server var", que no se puede observar -- usa "server reactive ${w.name}" en su lugar si necesitas watch())`
+        : asServerConst
+          ? ` (es "server const" -- nunca cambia, así que watch() nunca dispararía; no tiene sentido observarla)`
+          : '';
       throw new SyntaxError(
         `"watch(${w.name})" (línea ${w.line}) -- "${w.name}" no es una "server reactive" ` +
-        `declarada en este archivo${asServerVar ? ` (es "server var", que no se puede observar -- usa "server reactive ${w.name}" en su lugar si necesitas watch())` : ''}.`
+        `declarada en este archivo${aclaracion}.`
       );
     }
   }
@@ -495,21 +513,23 @@ function validate(ast) {
       );
     }
 
-    // "reactive"/"var"/"function" (CLIENTE) en una ruta "solo backend" (route() sin
-    // render()) son inertes: su código compilado (bundle.js) NUNCA se escribe a disco
+    // "reactive"/"var"/"const"/"function" (CLIENTE) en una ruta "solo backend" (route()
+    // sin render()) son inertes: su código compilado (bundle.js) NUNCA se escribe a disco
     // ahí -- se descarta entero, siempre. Si algo del servidor las referencia (post/put/
     // delete/get/server function, watch), revienta con un ReferenceError real (el nombre
     // no existe en server.js, solo se compiló -- y se tiró -- al lado de cliente); si
     // nadie las referencia, son código muerto sin ningún efecto. Mismo criterio que
     // "server function inalcanzable": se rechaza en compilación en vez de fallar en silencio.
-    const clientDecls = ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'FunctionDecl' || n.type === 'WsonDecl');
+    const clientDecls = ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'ConstDecl' || n.type === 'FunctionDecl' || n.type === 'WsonDecl');
     if (clientDecls.length > 0) {
       const first = clientDecls[0];
       const alternativa = first.type === 'FunctionDecl'
         ? `"server function ${first.name}"`
         : first.type === 'WsonDecl'
           ? `"server wson ${first.name}"`
-          : `"server var ${first.name}"/"server reactive ${first.name}"`;
+          : first.type === 'ConstDecl'
+            ? `"server const ${first.name}"`
+            : `"server var ${first.name}"/"server reactive ${first.name}"`;
       throw new SyntaxError(
         `"${labelFor(first.type)} ${first.name}" (línea ${first.line}) no tiene ningún efecto: ` +
         `este archivo declara route(...) pero no render(...), así que es una ruta "solo backend" -- ` +
@@ -588,16 +608,17 @@ function validate(ast) {
     }
   }
 
-  // "server var" y "server function" NUNCA pueden usarse dentro de un visual (ni en su
-  // plantilla, ni en sus bindings/handlers, ni en sus reactive/var locales) -- eso
-  // implicaría exponerlos al cliente, que es justo lo que "server" prohíbe. ("post function"
-  // es la única excepción: esa SÍ se puede llamar desde un visual, es su razón de ser.)
+  // "server var"/"server const" y "server function" NUNCA pueden usarse dentro de un
+  // visual (ni en su plantilla, ni en sus bindings/handlers, ni en sus reactive/var
+  // locales) -- eso implicaría exponerlos al cliente, que es justo lo que "server"
+  // prohíbe. ("post function" es la única excepción: esa SÍ se puede llamar desde un
+  // visual, es su razón de ser.)
   const serverNames = ast.body
-    .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl' || n.type === 'ServerWsonDecl')
+    .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerConstDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl' || n.type === 'ServerWsonDecl')
     .map(n => n.name);
   const serverNameKind = new Map(
     ast.body
-      .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl' || n.type === 'ServerWsonDecl')
+      .filter(n => n.type === 'ServerVarDecl' || n.type === 'ServerConstDecl' || n.type === 'ServerReactiveDecl' || n.type === 'ServerFunctionDecl' || n.type === 'ServerWsonDecl')
       .map(n => [n.name, labelFor(n.type)])
   );
 
@@ -628,7 +649,7 @@ function validate(ast) {
     // (server.NOMBRE, que "referencesName" excluye correctamente por el punto delante),
     // pero nadie avisaba si se te olvidaba. Se aplica igual tanto si la "server var" es
     // local como si llegó por "import" -- en ambos casos es el mismo AST, misma regla.
-    for (const decl of ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl')) {
+    for (const decl of ast.body.filter(n => n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'ConstDecl')) {
       for (const serverName of serverNames) {
         if (referencesName(decl.init, serverName)) {
           throw new SyntaxError(
@@ -642,13 +663,17 @@ function validate(ast) {
     }
 
     // Mismo hueco, pero en los CAMPOS de un "wson" de cliente (from/to/via/content son
-    // expresiones normales, con el mismo riesgo que el init de una reactive/var).
+    // expresiones normales, con el mismo riesgo que el init de una reactive/var) -- y en
+    // el "init" si usa la segunda forma ("wson NOMBRE = expresión").
     for (const wson of ast.body.filter(n => n.type === 'WsonDecl')) {
-      for (const field of wson.fields) {
+      const camposAComprobar = wson.fields
+        ? wson.fields.map(f => ({ value: f.value, etiqueta: `campo "${f.key}"`, line: f.fieldLine }))
+        : [{ value: wson.init, etiqueta: 'su valor', line: wson.line }];
+      for (const campo of camposAComprobar) {
         for (const serverName of serverNames) {
-          if (referencesName(field.value, serverName)) {
+          if (referencesName(campo.value, serverName)) {
             throw new SyntaxError(
-              `"wson ${wson.name}" (línea ${field.fieldLine}, campo "${field.key}") referencia "${serverName}", ` +
+              `"wson ${wson.name}" (línea ${campo.line}, ${campo.etiqueta}) referencia "${serverName}", ` +
               `que es "${serverNameKind.get(serverName)}" -- eso nunca llega al bundle.js, así que fallaría en ` +
               `el navegador con un ReferenceError real. Usa "server.${serverName}" en su lugar.`
             );

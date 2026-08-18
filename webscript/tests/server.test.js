@@ -5,6 +5,75 @@ const os = require('os');
 const path = require('path');
 const { buildSite, startServer } = require('../src/site-builder');
 
+// Envuelve fetch() para TODA la suite de este archivo: añade automáticamente la
+// cabecera "X-WebScript-CSRF" en POST/PUT/DELETE, y recuerda qué cookie "wcsrf"
+// corresponde a cada "wsid" visto, entre llamadas -- sin importar cuántos servidores
+// distintos arranque cada test (los ids de sesión son UUID, sin riesgo real de
+// colisión entre servidores distintos del mismo archivo). Se instaló así (envoltura
+// global, una sola vez) en vez de tocar los ~80 sitios que ya llamaban a fetch() en
+// esta suite, tras añadir la protección CSRF real -- todo test existente sigue
+// funcionando sin cambios. Los tests que YA gestionaban su propia cookie
+// "Cookie: ..." a mano (para probar continuidad de sesión) siguen funcionando igual
+// -- se respeta esa cookie explícita, solo se le añade el CSRF que corresponda a ESA
+// sesión concreta, aprendido de alguna respuesta anterior. Los pocos tests que
+// quieren probar el rechazo por CSRF a propósito usan la cabecera a mano, mal o
+// ausente -- ver más abajo, sección dedicada.
+const __originalFetch = global.fetch;
+const __wcsrfBySessionId = new Map(); // wsid visto -> wcsrf correspondiente
+
+function __extractCookieValue(cookieHeaderStr, name) {
+  if (!cookieHeaderStr) return null;
+  for (const part of cookieHeaderStr.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return null;
+}
+
+// Asignación DIRECTA a nivel de módulo, sin before()/after() -- el código de nivel
+// superior de un archivo de test se ejecuta al cargarlo, antes de que node:test
+// empiece a correr ninguna prueba registrada, así que esto ya está activo para TODO
+// el archivo desde el principio, sin ninguna ambigüedad de orden.
+global.fetch = async (url, options = {}) => {
+  const opts = { ...options };
+  const method = (opts.method || 'GET').toUpperCase();
+  const rawHeaders = opts.headers || {};
+  const existingCookieHeader = rawHeaders['Cookie'] || rawHeaders['cookie'] || null;
+  // Deliberadamente SIN "adivinar" una cookie cuando la petición no trae ninguna --
+  // bug real encontrado aquí mismo: con decenas de servidores distintos en el mismo
+  // archivo de test, "usar la última cookie vista" contaminaba peticiones de un
+  // servidor con la sesión de OTRO servidor completamente distinto. Sin cookie
+  // explícita, la petición se manda tal cual (sesión nueva de verdad, que además ya
+  // no exige CSRF, ver la excepción en site-builder.js) -- solo se añade la cabecera
+  // CSRF cuando el propio test SÍ trae una cookie explícita que ya vimos antes.
+  const effectiveWsid = existingCookieHeader ? __extractCookieValue(existingCookieHeader, 'wsid') : null;
+
+  const headers = { ...rawHeaders };
+  if (['POST', 'PUT', 'DELETE'].includes(method) && effectiveWsid && !headers['X-WebScript-CSRF']) {
+    const wcsrf = __wcsrfBySessionId.get(effectiveWsid);
+    if (wcsrf) headers['X-WebScript-CSRF'] = wcsrf;
+  }
+  opts.headers = headers;
+
+  const res = await __originalFetch(url, opts);
+
+  const setCookies = (res.headers.getSetCookie && res.headers.getSetCookie()) || [];
+  let sawWsid = null;
+  for (const sc of setCookies) {
+    const wsidVal = __extractCookieValue(sc, 'wsid');
+    if (wsidVal) sawWsid = wsidVal;
+  }
+  for (const sc of setCookies) {
+    const wcsrfVal = __extractCookieValue(sc, 'wcsrf');
+    if (wcsrfVal) {
+      const forWsid = sawWsid || effectiveWsid;
+      if (forWsid) __wcsrfBySessionId.set(forWsid, wcsrfVal);
+    }
+  }
+  return res;
+};
+
 // Arranca un servidor real sobre un directorio temporal de .ws, en un puerto
 // efímero (0 -> el SO elige uno libre), y lo cierra al terminar. "serverOptions" es
 // opcional -- se propaga tal cual a startServer() (TTL/límite de sesiones, etc).
@@ -1189,7 +1258,7 @@ post function usar(args)
   });
 });
 
-describe('async opcional en function/server function; watch() siempre async (ejecución real)', () => {
+describe('async/await implícito: nunca hace falta escribirlo, ni declarar function como async (ejecución real)', () => {
   function withExternalSystem(handler, testFn) {
     return async (base) => {
       const http2 = require('http');
@@ -1204,16 +1273,16 @@ describe('async opcional en function/server function; watch() siempre async (eje
     };
   }
 
-  test('async server function puede usar await http.* de verdad, llamada con await desde post function', withServer(
+  test('server function usa http.* SIN "await" explícito, y se llama desde post function SIN "await" tampoco -- ambos se insertan solos', withServer(
     {
       'api.ws': `route("/api/x")
 
-async server function llamarFuera(url)
-    var r = await http.get(url, {})
+server function llamarFuera(url)
+    var r = http.get(url, {})
     return r
 
 post function usar(args)
-    var datos = await llamarFuera(args.url)
+    var datos = llamarFuera(args.url)
     return { recibido: datos }
 `,
     },
@@ -1227,12 +1296,16 @@ post function usar(args)
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: `${externalBase}/x` }),
         });
+        // Si "await" NO se hubiera insertado solo en ninguno de los dos sitios,
+        // "recibido" habría sido una Promise (o un objeto de Promise anidada), no
+        // el objeto real -- confirma que el auto-await funciona en cadena, no solo
+        // en la llamada directa.
         assert.deepEqual(await r.json(), { recibido: { mensaje: 'hola desde fuera' } });
       }
     )
   ));
 
-  test('server function SIN async sigue funcionando sin await, esperando el valor directo (retrocompatibilidad)', withServer(
+  test('server function que NUNCA llama a nada async sigue dando el valor directo, sin ningún coste añadido', withServer(
     {
       'api.ws': `route("/api/x")
 
@@ -1248,21 +1321,40 @@ post function incrementar(args)
     },
     async (base) => {
       const r = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      assert.deepEqual(await r.json(), { contador: 1, doble: 2 }, 'duplicar(contador) sin await debe seguir dando el número directo, no una Promise');
+      assert.deepEqual(await r.json(), { contador: 1, doble: 2 }, 'duplicar(contador) debe seguir dando el número directo, no una Promise, aunque ahora se compile async por debajo');
     }
   ));
 
-  test('watch() ahora siempre async, sin necesitar ningún prefijo -- await http.* funciona dentro', () => {
+  test('watch() tampoco necesita "await" explícito -- http.* dentro se espera solo', () => {
     const { parseSource } = require('./helpers/compile-helper');
     const { compile } = require('../src/compiler');
     const src = `server reactive var1 = 0
 
 watch(var1)
-    await http.post("http://ejemplo.com", {}, {})
+    http.post("http://ejemplo.com", {}, {})
 `;
     const ast = parseSource(src);
     const { server } = compile(ast, { routePath: '/' });
     assert.match(server, /__watchers\.var1\.push\(async \(\) => \{/);
+    assert.match(server, /await http\.post/);
+  });
+
+  test('WSON.enqueue() se excluye a propósito del auto-await -- sigue siendo fire-and-forget de verdad', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    const { compile } = require('../src/compiler');
+    const src = `route("/x")
+
+server wson msg =
+    -> to: "http://ejemplo.com"
+    -> content: 1
+
+post function disparar(args)
+    var id = WSON.enqueue(msg)
+    return { id: id }
+`;
+    const ast = parseSource(src);
+    const { server } = compile(ast, { routePath: '/' });
+    assert.doesNotMatch(server, /await WSON\.enqueue/, 'WSON.enqueue() nunca debe llevar await -- su razón de ser es no esperar');
   });
 });
 
@@ -1652,7 +1744,7 @@ describe('WSON: firma HMAC (secret) y WSON.verify() -- confianza entre sistemas'
 server var ultimaVerificacion = false
 
 post function recibir(args, query, headers)
-    ultimaVerificacion = WSON.verify(args, headers['x-wson-signature'], "clave-compartida-test")
+    ultimaVerificacion = WSON.verify(args, headers['x-wson-signature'], "clave-compartida-test", headers['x-wson-timestamp'])
     return { firmaValida: ultimaVerificacion }
 ` },
     async (receptorBase) => {
@@ -1819,7 +1911,7 @@ server var contenidoDescifrado = ""
 server var firmaValida = false
 
 post function recibir(args, query, headers)
-    firmaValida = WSON.verify(args, headers['x-wson-signature'], "clave-e2e")
+    firmaValida = WSON.verify(args, headers['x-wson-signature'], "clave-e2e", headers['x-wson-timestamp'])
     contenidoDescifrado = WSON.showContent(args, "clave-e2e")
     return { firmaValida: firmaValida, contenido: contenidoDescifrado, tieneId: headers['x-wson-correlation-id'] !== undefined }
 ` },
@@ -2157,7 +2249,8 @@ describe('WSON.getSignature(headers): atajo para no escribir headers[\'x-wson-si
 
 post function recibir(args, query, headers)
     var firma = WSON.getSignature(headers)
-    var valido = WSON.verify(args, firma, "clave-getsig-test")
+    var marca = WSON.getTimestamp(headers)
+    var valido = WSON.verify(args, firma, "clave-getsig-test", marca)
     return { firmaObtenida: firma !== undefined, firmaValida: valido }
 ` },
     async (receptorBase) => {
@@ -2368,4 +2461,1410 @@ get function estado(query)
       assert.deepEqual(await r.json(), { total: 0 });
     }
   ));
+});
+
+describe('startClusteredServer: N procesos reales, sesiones pegajosas por cookie', () => {
+  const { startClusteredServer } = require('../src/site-builder');
+
+  function withCluster(wsFiles, workerCount, testFn) {
+    return async () => {
+      const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-cluster-test-'));
+      const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-cluster-out-'));
+      for (const [name, content] of Object.entries(wsFiles)) {
+        fs.writeFileSync(path.join(srcDir, name), content);
+      }
+      // Puerto público fijo alto, poco probable de colisión -- startClusteredServer
+      // necesita un puerto CONCRETO (no 0) porque también reserva los internos como
+      // "publicPort + 1 + i", así que no puede dejarse "cualquiera libre" aquí.
+      const publicPort = 45000 + Math.floor(Math.random() * 3000);
+      const frontal = await startClusteredServer(srcDir, outDir, publicPort, workerCount);
+      try {
+        await testFn(`http://localhost:${publicPort}`, frontal);
+      } finally {
+        frontal.close();
+        fs.rmSync(srcDir, { recursive: true, force: true });
+        fs.rmSync(outDir, { recursive: true, force: true });
+      }
+    };
+  }
+
+  test('bug real arreglado: la MISMA sesión, varias peticiones seguidas, incrementa de forma consistente (no se pierde ningún incremento)', withCluster(
+    {
+      'api.ws': `route("/api/x")
+
+server var contador = 0
+
+post function incrementar(args)
+    contador = contador + 1
+    return { contador: contador }
+`,
+    },
+    4,
+    async (base) => {
+      let cookie = null;
+      const secuencia = [];
+      for (let i = 0; i < 6; i++) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (cookie) headers.Cookie = cookie;
+        const r = await fetch(`${base}/api/x`, { method: 'POST', headers, body: '{}' });
+        if (!cookie) cookie = r.headers.get('set-cookie').split(';')[0];
+        secuencia.push((await r.json()).contador);
+      }
+      assert.deepEqual(secuencia, [1, 2, 3, 4, 5, 6], 'antes del arreglo, esto daba [1,1,2,3,4,5] -- la sesión perdía el primer incremento');
+    }
+  ));
+
+  test('varias sesiones distintas a la vez, cada una consistente por separado', withCluster(
+    {
+      'api.ws': `route("/api/x")
+
+server var contador = 0
+
+post function incrementar(args)
+    contador = contador + 1
+    return { contador: contador }
+`,
+    },
+    4,
+    async (base) => {
+      const sesiones = [];
+      for (let s = 0; s < 6; s++) {
+        let cookie = null;
+        const secuencia = [];
+        for (let i = 0; i < 3; i++) {
+          const headers = { 'Content-Type': 'application/json' };
+          if (cookie) headers.Cookie = cookie;
+          const r = await fetch(`${base}/api/x`, { method: 'POST', headers, body: '{}' });
+          if (!cookie) cookie = r.headers.get('set-cookie').split(';')[0];
+          secuencia.push((await r.json()).contador);
+        }
+        sesiones.push(secuencia);
+      }
+      for (const s of sesiones) assert.deepEqual(s, [1, 2, 3]);
+    }
+  ));
+
+  test('con workerCount=1, se comporta exactamente igual que startServer() -- sin proxy, sin procesos extra', withCluster(
+    { 'api.ws': `route("/api/x")\n\nget function f(query)\n    return { ok: true }\n` },
+    1,
+    async (base, servidor) => {
+      const r = await fetch(`${base}/api/x`);
+      assert.deepEqual(await r.json(), { ok: true });
+      assert.equal(servidor._clusterWorkers, undefined, 'sin clustering no debe haber ningún array de workers');
+    }
+  ));
+});
+
+describe('config: "cluster-workers" de wconfig.json activa startClusteredServer de verdad', () => {
+  test('cluster-workers > 1 en wconfig.json arranca varios procesos reales, con sesiones pegajosas', async () => {
+    const { startClusteredServer } = require('../src/site-builder');
+    const { loadConfig } = require('../src/config');
+    const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-cluster-config-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-cluster-config-out-'));
+    try {
+      fs.writeFileSync(path.join(srcDir, 'wconfig.json'), JSON.stringify({ 'cluster-workers': 3 }));
+      fs.writeFileSync(path.join(srcDir, 'api.ws'), `route("/api/x")
+
+server var contador = 0
+
+post function incrementar(args)
+    contador = contador + 1
+    return { contador: contador }
+`);
+      const config = loadConfig(srcDir);
+      assert.equal(config['cluster-workers'], 3);
+
+      const publicPort = 46000 + Math.floor(Math.random() * 3000);
+      const frontal = await startClusteredServer(srcDir, outDir, publicPort, config['cluster-workers']);
+      try {
+        assert.equal(frontal._clusterWorkers.length, 3);
+        let cookie = null;
+        const secuencia = [];
+        for (let i = 0; i < 4; i++) {
+          const headers = { 'Content-Type': 'application/json' };
+          if (cookie) headers.Cookie = cookie;
+          const r = await fetch(`http://localhost:${publicPort}/api/x`, { method: 'POST', headers, body: '{}' });
+          if (!cookie) cookie = r.headers.get('set-cookie').split(';')[0];
+          secuencia.push((await r.json()).contador);
+        }
+        assert.deepEqual(secuencia, [1, 2, 3, 4]);
+      } finally {
+        frontal.close();
+      }
+    } finally {
+      fs.rmSync(srcDir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('WSON: "server wson NOMBRE = WSON.parse(...)" dentro de un post function, de extremo a extremo', () => {
+  test('el receptor declara el resultado de WSON.parse() con la palabra clave "wson", no "var" -- dos servidores reales', withServer(
+    { 'api.ws': `route("/recibir")
+
+post function recibir(args, query, headers)
+    server wson msg = WSON.parse(args, headers, "clave-parse-keyword-test")
+    return { from: msg.from, content: msg.content, signatureValid: msg.signatureValid }
+` },
+    async (receptorBase) => {
+      const fs2 = require('fs');
+      const os2 = require('os');
+      const path2 = require('path');
+      const { buildSite: build2, startServer: start2 } = require('../src/site-builder');
+
+      const srcDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-parsekw-'));
+      const outDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ws-wson-parsekw-out-'));
+      fs2.writeFileSync(path2.join(srcDir, 'api.ws'), `route("/api/enviar")
+
+server wson sender =
+    -> from: "servicio-x"
+    -> to: "${receptorBase}/recibir"
+    -> content: "pago confirmado"
+    -> secret: "clave-parse-keyword-test"
+
+post function disparar(args)
+    var r = await WSON.send(sender)
+    return { respuesta: r }
+`);
+      const { table } = build2(srcDir, outDir);
+      const emisor = start2(table, outDir, 0);
+      await new Promise(resolve => emisor.on('listening', resolve));
+      const emisorPort = emisor.address().port;
+      try {
+        const r = await fetch(`http://localhost:${emisorPort}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const data = await r.json();
+        assert.deepEqual(data, {
+          respuesta: { from: 'servicio-x', content: 'pago confirmado', signatureValid: true },
+        });
+      } finally {
+        emisor.close();
+        fs2.rmSync(srcDir, { recursive: true, force: true });
+        fs2.rmSync(outDir, { recursive: true, force: true });
+      }
+    }
+  ));
+});
+
+describe('server const: compila a un const real de JS, uso normal funciona, reasignar da un error real (sin tumbar el proceso)', () => {
+  test('uso normal, y reasignar da 500 con el error real de JS -- verificado con servidor real', withServer(
+    { 'api.ws': `route("/api/x")
+
+server const tasa = 0.21
+
+post function accion(args)
+    if (args.reasignar)
+        tasa = 99
+    return { conIva: args.precio * (1 + tasa) }
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/api/x`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ precio: 100 }),
+      });
+      assert.equal(r1.status, 200);
+      assert.deepEqual(await r1.json(), { conIva: 121 });
+
+      const r2 = await fetch(`${base}/api/x`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ precio: 100, reasignar: true }),
+      });
+      assert.equal(r2.status, 500, 'debe fallar esta petición concreta, sin tumbar el proceso');
+      const data = await r2.json();
+      assert.match(data.error, /Assignment to constant variable/);
+
+      // el servidor sigue vivo tras el error -- otra petición normal debe seguir funcionando
+      const r3 = await fetch(`${base}/api/x`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ precio: 50 }),
+      });
+      assert.equal(r3.status, 200);
+      assert.deepEqual(await r3.json(), { conIva: 60.5 });
+    }
+  ));
+
+  test('server const sin valor inicial se rechaza en compilación', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    assert.throws(
+      () => parseSource('route("/x")\n\nserver const tasa\n\npost function f(args)\n    return {}'),
+      /"server const" necesita un valor inicial/
+    );
+  });
+
+  test('watch() sobre una server const da un mensaje claro (nunca cambia, nunca dispararía)', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    assert.throws(
+      () => parseSource('server const tasa = 0.21\n\nwatch(tasa)\n    whisper("nunca pasa")'),
+      /nunca cambia, así que watch\(\) nunca dispararía/
+    );
+  });
+
+  test('server const prohibida dentro de un visual, igual que server var', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    const src = 'server const tasa = 0.21\n\nvisual v =\n<p>{tasa}</p>\n\nrender(\n    v\n)';
+    assert.throws(() => parseSource(src), /"visual v" referencia "tasa", que es "server const"/);
+  });
+});
+
+describe('route con parámetros (":id") y params()', () => {
+  test('el caso real: route("/monedas/:id") + const {id} = params() -- servidor real', withServer(
+    { 'api.ws': `route("/monedas/:id")
+
+get function obtener(query)
+    const {id} = params()
+    return { moneda: id, query: query }
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/monedas/bitcoin`);
+      assert.deepEqual(await r1.json(), { moneda: 'bitcoin', query: {} });
+
+      const r2 = await fetch(`${base}/monedas/eth?vs=usd`);
+      assert.deepEqual(await r2.json(), { moneda: 'eth', query: { vs: 'usd' } });
+    }
+  ));
+
+  test('POST también recibe los parámetros de la URL, junto con el body', withServer(
+    { 'api.ws': `route("/monedas/:id")
+
+post function actualizar(args)
+    const {id} = params()
+    return { actualizada: id, nombreNuevo: args.nombre }
+` },
+    async (base) => {
+      const r = await fetch(`${base}/monedas/dogecoin`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nombre: 'Dogecoin' }),
+      });
+      assert.deepEqual(await r.json(), { actualizada: 'dogecoin', nombreNuevo: 'Dogecoin' });
+    }
+  ));
+
+  test('una ruta LITERAL gana siempre sobre una dinámica que también encajaría -- sin ambigüedad', withServer(
+    {
+      'dinamica.ws': `route("/monedas/:id")
+
+get function obtener(query)
+    const {id} = params()
+    return { moneda: id }
+`,
+      'literal.ws': `route("/monedas/nuevo")
+
+get function especial(query)
+    return { esRutaLiteral: true }
+`,
+    },
+    async (base) => {
+      const r = await fetch(`${base}/monedas/nuevo`);
+      assert.deepEqual(await r.json(), { esRutaLiteral: true }, 'debe ganar la ruta literal, no interpretarse como :id="nuevo"');
+    }
+  ));
+
+  test('varios parámetros en la misma ruta, incluso sin ningún parámetro nombrado en la función', withServer(
+    { 'api.ws': `route("/tienda/:categoria/:producto")
+
+get function obtener()
+    const p = params()
+    return p
+` },
+    async (base) => {
+      const r = await fetch(`${base}/tienda/electronica/portatil`);
+      assert.deepEqual(await r.json(), { categoria: 'electronica', producto: 'portatil' });
+    }
+  ));
+
+  test('params() en una ruta SIN ":" devuelve un objeto vacío, no falla', withServer(
+    { 'api.ws': `route("/estatico")
+
+get function obtener(query)
+    const p = params()
+    return { params: p, esVacio: Object.keys(p).length === 0 }
+` },
+    async (base) => {
+      const r = await fetch(`${base}/estatico`);
+      assert.deepEqual(await r.json(), { params: {}, esVacio: true });
+    }
+  ));
+
+  test('nombre de parámetro repetido en la misma ruta -- rechazado en compilación', () => {
+    const { parseSource } = require('./helpers/compile-helper');
+    assert.throws(
+      () => parseSource('route("/x/:id/y/:id")\n\nget function f(query)\n    return {}'),
+      /repite el parámetro ":id"/
+    );
+  });
+});
+
+describe('query() de extremo a extremo: página con render(), servidor real', () => {
+  test('el HTML pre-renderizado refleja la query string real de cada petición, no un valor fijo', withServer(
+    { 'pagina.ws': `route("/")
+
+reactive pagina = query().page || "1"
+
+visual v =
+<p>Página: {pagina}</p>
+
+render(
+    v
+)
+` },
+    async (base) => {
+      const r1 = await fetch(`${base}/`);
+      assert.match(await r1.text(), /Página: 1/);
+
+      const r2 = await fetch(`${base}/?page=7`);
+      assert.match(await r2.text(), /Página: 7/, 'debe reflejar la query real de ESTA petición, pre-renderizado de verdad, no tras el JS del cliente');
+
+      const r3 = await fetch(`${base}/?page=42`);
+      assert.match(await r3.text(), /Página: 42/);
+    }
+  ));
+
+  test('query() y server.X conviven en la misma página, ambos pre-renderizados a la vez', withServer(
+    { 'pagina.ws': `route("/")
+
+server var visitas = 100
+
+reactive pagina = query().page || "1"
+reactive contadorServidor = server.visitas
+
+visual v =
+<p>Página: {pagina} -- Visitas: {contadorServidor}</p>
+
+render(
+    v
+)
+` },
+    async (base) => {
+      const r = await fetch(`${base}/?page=3`);
+      assert.match(await r.text(), /Página: 3 -- Visitas: 100/);
+    }
+  ));
+
+  test('bug real cerrado: query() usado dentro de una "reactive" (no solo "var") se detecta y genera el helper correctamente', withServer(
+    { 'pagina.ws': `route("/")
+
+reactive filtro = query().filtro || "todos"
+
+visual v =
+<p>{filtro}</p>
+
+render(
+    v
+)
+` },
+    async (base) => {
+      // Antes del arreglo, esto daba ReferenceError: query is not defined -- la
+      // colección de "cuerpos a revisar" no incluía los init de "reactive"
+      const r = await fetch(`${base}/?filtro=activos`);
+      assert.equal(r.status, 200);
+      assert.match(await r.text(), /activos/);
+    }
+  ));
+});
+
+describe('ws function: servidor WebSocket real (RFC 6455 desde cero, sin dependencias)', () => {
+  const { connectWs } = require('./helpers/ws-test-client');
+
+  function withWs(wsFiles, testFn) {
+    return async () => {
+      const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-ws-test-'));
+      const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-ws-out-'));
+      for (const [name, content] of Object.entries(wsFiles)) {
+        fs.writeFileSync(path.join(srcDir, name), content);
+      }
+      const { buildSite, startServer } = require('../src/site-builder');
+      const { table } = buildSite(srcDir, outDir);
+      const wsPort = 47000 + Math.floor(Math.random() * 3000);
+      const server = startServer(table, outDir, 0, { wsPort });
+      await new Promise(resolve => server.on('listening', resolve));
+      try {
+        await testFn(wsPort, server);
+      } finally {
+        server.close();
+        fs.rmSync(srcDir, { recursive: true, force: true });
+        fs.rmSync(outDir, { recursive: true, force: true });
+      }
+    };
+  }
+
+  test('mensaje único, eco simple -- handshake real + frame real, extremo a extremo', withWs(
+    { 'chat.ws': `route("/chat")
+
+ws function entradaWS(args)
+    return { eco: args.mensaje, mayusculas: args.mensaje.toUpperCase() }
+` },
+    async (wsPort) => {
+      const client = await connectWs(wsPort, '/chat');
+      const respuesta = await new Promise((resolve) => {
+        client.onMessage(resolve);
+        client.send({ mensaje: 'hola' });
+      });
+      assert.deepEqual(respuesta, { eco: 'hola', mayusculas: 'HOLA' });
+      client.close();
+    }
+  ));
+
+  test('bug real cerrado: la ws function se exponía en el server.js pero nunca en el objeto de sesión -- ahora sí es llamable', withWs(
+    { 'chat.ws': `route("/chat")\n\nws function f(args)\n    return { ok: true }\n` },
+    async (wsPort) => {
+      // Este mismo test, antes del arreglo, daba "sessionState[route.wsFnName] is not a function"
+      const client = await connectWs(wsPort, '/chat');
+      const respuesta = await new Promise((resolve) => {
+        client.onMessage(resolve);
+        client.send({});
+      });
+      assert.deepEqual(respuesta, { ok: true });
+      client.close();
+    }
+  ));
+
+  test('varios mensajes en la MISMA conexión persistente -- el estado de sesión (server var) se mantiene entre ellos', withWs(
+    { 'chat.ws': `route("/chat")
+
+server var mensajesRecibidos = 0
+
+ws function entradaWS(args)
+    mensajesRecibidos = mensajesRecibidos + 1
+    return { eco: args.mensaje, total: mensajesRecibidos }
+` },
+    async (wsPort) => {
+      const client = await connectWs(wsPort, '/chat');
+      const respuestas = [];
+      const todasLlegaron = new Promise((resolve) => {
+        client.onMessage((msg) => {
+          respuestas.push(msg);
+          if (respuestas.length === 3) resolve();
+        });
+      });
+      client.send({ mensaje: 'uno' });
+      client.send({ mensaje: 'dos' });
+      client.send({ mensaje: 'tres' });
+      await todasLlegaron;
+      assert.deepEqual(respuestas.map(r => r.total), [1, 2, 3]);
+      client.close();
+    }
+  ));
+
+  test('una conexión a una ruta sin "ws function" es rechazada (404), no aceptada en silencio', withWs(
+    {
+      'chat.ws': `route("/chat")\n\nws function f(args)\n    return { ok: true }\n`,
+      'normal.ws': `route("/x")\n\nget function f(query)\n    return { ok: true }\n`,
+    },
+    async (wsPort) => {
+      // El servidor WS solo arranca si ALGUNA ruta tiene ws function (aquí, /chat) --
+      // por eso este archivo incluye una, aunque el test prueba contra /x, que no la
+      // tiene. Sin ninguna ws function en absoluto, el puerto ni siquiera escucharía
+      // (ECONNREFUSED, no 404) -- ese es un escenario distinto, no lo que este test
+      // quiere comprobar.
+      await assert.rejects(() => connectWs(wsPort, '/x'), /404/);
+    }
+  ));
+
+  test('un error dentro de la ws function no tumba la conexión -- se manda como mensaje de error, y la conexión sigue viva para el siguiente mensaje', withWs(
+    { 'chat.ws': `route("/chat")
+
+ws function f(args)
+    if (args.reventar)
+        return args.noExiste.propiedad
+    return { ok: true }
+` },
+    async (wsPort) => {
+      const client = await connectWs(wsPort, '/chat');
+      const respuestas = [];
+      const dosRespuestas = new Promise((resolve) => {
+        client.onMessage((msg) => {
+          respuestas.push(msg);
+          if (respuestas.length === 2) resolve();
+        });
+      });
+      client.send({ reventar: true });
+      client.send({ reventar: false });
+      await dosRespuestas;
+      assert.ok(respuestas[0].error, 'el primer mensaje debe traer un error, no tumbar la conexión');
+      assert.deepEqual(respuestas[1], { ok: true }, 'la conexión debe seguir viva para el segundo mensaje');
+      client.close();
+    }
+  ));
+});
+
+describe('WSON via:"socket" de extremo a extremo: cliente WebSocket real dentro de WSON.send()', () => {
+  test('el emisor se conecta como cliente WS al receptor, manda, y recibe la respuesta -- dos servidores reales', async () => {
+    const { buildSite, startServer } = require('../src/site-builder');
+    const receptorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-r-'));
+    const receptorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-r-out-'));
+    const emisorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-e-'));
+    const emisorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-e-out-'));
+    try {
+      fs.writeFileSync(path.join(receptorDir, 'eco.ws'), `route("/eco")
+
+ws function recibir(args)
+    return { recibido: args.mensaje, doble: args.mensaje + args.mensaje }
+`);
+      const { table: tableR } = buildSite(receptorDir, receptorOut);
+      const wsPort = 48000 + Math.floor(Math.random() * 3000);
+      const serverR = startServer(tableR, receptorOut, 0, { wsPort });
+      await new Promise(resolve => serverR.on('listening', resolve));
+
+      fs.writeFileSync(path.join(emisorDir, 'api.ws'), `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({ to: "ws://localhost:${wsPort}/eco", via: "socket", content: { mensaje: args.texto } })
+    return { respuestaRecibida: r }
+`);
+      const { table: tableE } = buildSite(emisorDir, emisorOut);
+      const serverE = startServer(tableE, emisorOut, 0);
+      await new Promise(resolve => serverE.on('listening', resolve));
+
+      try {
+        const port = serverE.address().port;
+        const r = await fetch(`http://localhost:${port}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ texto: 'hola' }),
+        });
+        assert.deepEqual(await r.json(), { respuestaRecibida: { recibido: 'hola', doble: 'holahola' } });
+      } finally {
+        serverR.close();
+        serverE.close();
+      }
+    } finally {
+      fs.rmSync(receptorDir, { recursive: true, force: true });
+      fs.rmSync(receptorOut, { recursive: true, force: true });
+      fs.rmSync(emisorDir, { recursive: true, force: true });
+      fs.rmSync(emisorOut, { recursive: true, force: true });
+    }
+  });
+
+  test('destino inalcanzable -- reintenta, falla, y queda registrado como deadLetter en WSON.history()', withServer(
+    { 'api.ws': `route("/api/x")
+
+post function disparar(args)
+    try {
+        await WSON.send({ to: "ws://localhost:1/eco", via: "socket", content: { x: 1 }, retries: 1, retryDelayMs: 20 })
+    } catch (e) {
+    }
+    return { total: WSON.history().length, soloDead: WSON.history({ deadLetter: true }).length }
+` },
+    async (base) => {
+      const r = await fetch(`${base}/api/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      assert.deepEqual(await r.json(), { total: 1, soloDead: 1 });
+    }
+  ));
+});
+
+describe('WSON con via:"socket" -- cifrado, firma, from: verificado a fondo (bugs reales encontrados y cerrados)', () => {
+  test('bug real cerrado: WSON no estaba disponible dentro de una "ws function" en absoluto', () => {
+    const { compile } = require('../src/compiler');
+    const { parseSource } = require('./helpers/compile-helper');
+    const ast = parseSource('route("/x")\n\nws function f(args)\n    var r = WSON.showContent(args, "clave")\n    return r');
+    const { server } = compile(ast, { routePath: '/x' });
+    assert.match(server, /const WSON = \{/, 'antes de este arreglo, "allBodies" no incluía el cuerpo de ws function -- WSON no se generaba');
+  });
+
+  test('secret/from/id llegan de verdad al receptor -- transmitidos en el handshake, leídos con headers()', async () => {
+    const { buildSite, startServer } = require('../src/site-builder');
+    const receptorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-sec-r-'));
+    const receptorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-sec-r-out-'));
+    const emisorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-sec-e-'));
+    const emisorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-sec-e-out-'));
+    try {
+      fs.writeFileSync(path.join(receptorDir, 'eco.ws'), `route("/eco")
+
+ws function recibir(args)
+    server wson msg = WSON.parse(args, headers(), "clave-super-secreta")
+    return { from: msg.from, content: msg.content, signatureValid: msg.signatureValid }
+`);
+      const { table: tableR } = buildSite(receptorDir, receptorOut);
+      const wsPort = 50000 + Math.floor(Math.random() * 3000);
+      const serverR = startServer(tableR, receptorOut, 0, { wsPort });
+      await new Promise(resolve => serverR.on('listening', resolve));
+
+      fs.writeFileSync(path.join(emisorDir, 'api.ws'), `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({
+        to: "ws://localhost:${wsPort}/eco",
+        via: "socket",
+        content: { mensaje: "secreto" },
+        secret: "clave-super-secreta",
+        encrypt: true,
+        from: "servicio-x"
+    })
+    return { respuesta: r }
+`);
+      const { table: tableE } = buildSite(emisorDir, emisorOut);
+      const serverE = startServer(tableE, emisorOut, 0);
+      await new Promise(resolve => serverE.on('listening', resolve));
+
+      try {
+        const port = serverE.address().port;
+        const r = await fetch(`http://localhost:${port}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        // Antes del arreglo: from llegaba undefined, signatureValid undefined, y content
+        // era el blob cifrado sin descifrar (WSON ni siquiera estaba definido).
+        assert.deepEqual(await r.json(), {
+          respuesta: { from: 'servicio-x', content: { mensaje: 'secreto' }, signatureValid: true },
+        });
+      } finally {
+        serverR.close();
+        serverE.close();
+      }
+    } finally {
+      fs.rmSync(receptorDir, { recursive: true, force: true });
+      fs.rmSync(receptorOut, { recursive: true, force: true });
+      fs.rmSync(emisorDir, { recursive: true, force: true });
+      fs.rmSync(emisorOut, { recursive: true, force: true });
+    }
+  });
+
+  test('firma incorrecta (secreto equivocado) se detecta como inválida, no se acepta a ciegas', async () => {
+    const { buildSite, startServer } = require('../src/site-builder');
+    const receptorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-badsig-r-'));
+    const receptorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-badsig-r-out-'));
+    const emisorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-badsig-e-'));
+    const emisorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-socket-badsig-e-out-'));
+    try {
+      fs.writeFileSync(path.join(receptorDir, 'eco.ws'), `route("/eco")
+
+ws function recibir(args)
+    var valida = WSON.verify(args, WSON.getSignature(headers()), "clave-correcta", WSON.getTimestamp(headers()))
+    return { firmaValida: valida }
+`);
+      const { table: tableR } = buildSite(receptorDir, receptorOut);
+      const wsPort = 53000 + Math.floor(Math.random() * 3000);
+      const serverR = startServer(tableR, receptorOut, 0, { wsPort });
+      await new Promise(resolve => serverR.on('listening', resolve));
+
+      fs.writeFileSync(path.join(emisorDir, 'api.ws'), `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({
+        to: "ws://localhost:${wsPort}/eco",
+        via: "socket",
+        content: { x: 1 },
+        secret: "clave-INCORRECTA"
+    })
+    return { respuesta: r }
+`);
+      const { table: tableE } = buildSite(emisorDir, emisorOut);
+      const serverE = startServer(tableE, emisorOut, 0);
+      await new Promise(resolve => serverE.on('listening', resolve));
+
+      try {
+        const port = serverE.address().port;
+        const r = await fetch(`http://localhost:${port}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        assert.deepEqual(await r.json(), { respuesta: { firmaValida: false } });
+      } finally {
+        serverR.close();
+        serverE.close();
+      }
+    } finally {
+      fs.rmSync(receptorDir, { recursive: true, force: true });
+      fs.rmSync(receptorOut, { recursive: true, force: true });
+      fs.rmSync(emisorDir, { recursive: true, force: true });
+      fs.rmSync(emisorOut, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('route() sirve HTTP y WebSocket a la vez, en la misma ruta -- verificado en varios ángulos', () => {
+  const { connectWs } = require('./helpers/ws-test-client');
+
+  test('post function + ws function en el mismo archivo, misma sesión compartida entre los dos protocolos', async () => {
+    const { buildSite, startServer } = require('../src/site-builder');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-combo-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-combo-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'chat.ws'), `route("/chat")
+
+server var contadorCompartido = 0
+
+post function enviarHttp(args)
+    contadorCompartido = contadorCompartido + 1
+    return { via: "http", total: contadorCompartido }
+
+ws function entradaWs(args)
+    contadorCompartido = contadorCompartido + 1
+    return { via: "websocket", total: contadorCompartido }
+`);
+      const { table } = buildSite(dir, outDir);
+      const wsPort = 51000 + Math.floor(Math.random() * 3000);
+      const server = startServer(table, outDir, 0, { wsPort });
+      await new Promise(resolve => server.on('listening', resolve));
+      const httpPort = server.address().port;
+      try {
+        // HTTP, WS, HTTP -- misma cookie, misma variable -- continuidad estricta
+        // esperada: 1 (http), 2 (ws), 3 (http de nuevo), cruzando entre protocolos.
+        const r1 = await fetch(`http://localhost:${httpPort}/chat`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const cookie = r1.headers.get('set-cookie').split(';')[0];
+        assert.deepEqual(await r1.json(), { via: 'http', total: 1 });
+
+        const client = await connectWs(wsPort, '/chat', { Cookie: cookie });
+        const respuestaWs = await new Promise((resolve) => {
+          client.onMessage(resolve);
+          client.send({});
+        });
+        assert.deepEqual(respuestaWs, { via: 'websocket', total: 2 }, 'debe seguir desde el HTTP, misma sesión');
+
+        const r2 = await fetch(`http://localhost:${httpPort}/chat`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}',
+        });
+        assert.deepEqual(await r2.json(), { via: 'http', total: 3 }, 'debe seguir desde el WebSocket, misma sesión');
+
+        client.close();
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('una ruta CON render() (página real) también puede tener ws function -- la SSR refleja los cambios hechos por WebSocket', async () => {
+    const { buildSite, startServer } = require('../src/site-builder');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-combo-page-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-combo-page-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'panel.ws'), `route("/panel")
+
+server var contador = 0
+
+ws function entrada(args)
+    contador = contador + 1
+    return { total: contador }
+
+reactive vista = server.contador
+
+visual v =
+<p>Contador: {vista}</p>
+
+render(
+    v
+)
+`);
+      const { table } = buildSite(dir, outDir);
+      assert.equal(table[0].apiOnly, false, 'sigue siendo una página real, no solo backend');
+      assert.equal(table[0].wsFnName, 'entrada', 'y también tiene su ws function');
+
+      const wsPort = 54000 + Math.floor(Math.random() * 3000);
+      const server = startServer(table, outDir, 0, { wsPort });
+      await new Promise(resolve => server.on('listening', resolve));
+      const httpPort = server.address().port;
+      try {
+        const r1 = await fetch(`http://localhost:${httpPort}/panel`);
+        const cookie = r1.headers.get('set-cookie').split(';')[0];
+        assert.match(await r1.text(), /Contador: 0/);
+
+        const client = await connectWs(wsPort, '/panel', { Cookie: cookie });
+        await new Promise((resolve) => {
+          client.onMessage(resolve);
+          client.send({});
+        });
+
+        const r2 = await fetch(`http://localhost:${httpPort}/panel`, { headers: { Cookie: cookie } });
+        assert.match(await r2.text(), /Contador: 1/, 'la SSR debe reflejar el cambio hecho por WebSocket, misma sesión');
+
+        client.close();
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('varias rutas distintas, cada una con su propia ws function, compartiendo el mismo ws-port -- distinguidas por path', async () => {
+    const { buildSite, startServer } = require('../src/site-builder');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-combo-multi-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-combo-multi-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'chat.ws'), `route("/chat")\n\nws function entradaChat(args)\n    return { ruta: "chat", eco: args.texto }\n`);
+      fs.writeFileSync(path.join(dir, 'notificaciones.ws'), `route("/notificaciones")\n\nws function entradaNotif(args)\n    return { ruta: "notificaciones", eco: args.texto }\n`);
+      const { table } = buildSite(dir, outDir);
+      const wsPort = 57000 + Math.floor(Math.random() * 3000);
+      const server = startServer(table, outDir, 0, { wsPort });
+      await new Promise(resolve => server.on('listening', resolve));
+      try {
+        const clienteChat = await connectWs(wsPort, '/chat');
+        const clienteNotif = await connectWs(wsPort, '/notificaciones');
+
+        const respuestaChat = await new Promise((resolve) => {
+          clienteChat.onMessage(resolve);
+          clienteChat.send({ texto: 'hola chat' });
+        });
+        assert.deepEqual(respuestaChat, { ruta: 'chat', eco: 'hola chat' });
+
+        const respuestaNotif = await new Promise((resolve) => {
+          clienteNotif.onMessage(resolve);
+          clienteNotif.send({ texto: 'hola notif' });
+        });
+        assert.deepEqual(respuestaNotif, { ruta: 'notificaciones', eco: 'hola notif' });
+
+        clienteChat.close();
+        clienteNotif.close();
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('WSON.showContent/verify/getSignature con WebSocket: cada uno probado por separado, positivo y negativo', () => {
+  async function montarParEmisorReceptor(receptorBody, emisorWsonExtra) {
+    const receptorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-methods-r-'));
+    const receptorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-methods-r-out-'));
+    const emisorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-methods-e-'));
+    const emisorOut = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-methods-e-out-'));
+    const wsPort = 55000 + Math.floor(Math.random() * 3000);
+
+    fs.writeFileSync(path.join(receptorDir, 'eco.ws'), `route("/eco")\n\nws function recibir(args)\n${receptorBody}\n`);
+    const { table: tableR } = buildSite(receptorDir, receptorOut);
+    const serverR = startServer(tableR, receptorOut, 0, { wsPort });
+    await new Promise(resolve => serverR.on('listening', resolve));
+
+    fs.writeFileSync(path.join(emisorDir, 'api.ws'), `route("/api/enviar")
+
+post function disparar(args)
+    var r = await WSON.send({
+        to: "ws://localhost:${wsPort}/eco",
+        via: "socket",
+        content: { dato: "valor-real" }${emisorWsonExtra}
+    })
+    return r
+`);
+    const { table: tableE } = buildSite(emisorDir, emisorOut);
+    const serverE = startServer(tableE, emisorOut, 0);
+    await new Promise(resolve => serverE.on('listening', resolve));
+
+    return {
+      async llamar() {
+        const r = await fetch(`http://localhost:${serverE.address().port}/api/enviar`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        return r.json();
+      },
+      cerrar() {
+        serverR.close();
+        serverE.close();
+        fs.rmSync(receptorDir, { recursive: true, force: true });
+        fs.rmSync(receptorOut, { recursive: true, force: true });
+        fs.rmSync(emisorDir, { recursive: true, force: true });
+        fs.rmSync(emisorOut, { recursive: true, force: true });
+      },
+    };
+  }
+
+  const { buildSite, startServer } = require('../src/site-builder');
+
+  test('WSON.getSignature()/verify()/showContent() -- los tres, con clave correcta, funcionan a la vez', async () => {
+    const par = await montarParEmisorReceptor(
+      `    var firmaCabecera = WSON.getSignature(headers())
+    var firmaValida = WSON.verify(args, firmaCabecera, "clave-correcta", WSON.getTimestamp(headers()))
+    var contenido = WSON.showContent(args, "clave-correcta")
+    return { firmaCabeceraExiste: firmaCabecera !== undefined, firmaValida: firmaValida, contenido: contenido }`,
+      ',\n        secret: "clave-correcta",\n        encrypt: true'
+    );
+    try {
+      const resultado = await par.llamar();
+      assert.equal(resultado.firmaCabeceraExiste, true);
+      assert.equal(resultado.firmaValida, true);
+      assert.deepEqual(resultado.contenido, { dato: 'valor-real' });
+    } finally {
+      par.cerrar();
+    }
+  });
+
+  test('WSON.showContent() con clave incorrecta da null -- no descifra basura', async () => {
+    const par = await montarParEmisorReceptor(
+      `    return { contenido: WSON.showContent(args, "clave-INCORRECTA") }`,
+      ',\n        secret: "clave-correcta",\n        encrypt: true'
+    );
+    try {
+      const resultado = await par.llamar();
+      assert.equal(resultado.contenido, null);
+    } finally {
+      par.cerrar();
+    }
+  });
+
+  test('WSON.verify() con clave incorrecta da false -- no acepta la firma a ciegas', async () => {
+    const par = await montarParEmisorReceptor(
+      `    var firma = WSON.getSignature(headers())
+    return { valida: WSON.verify(args, firma, "clave-INCORRECTA", WSON.getTimestamp(headers())) }`,
+      ',\n        secret: "clave-correcta"'
+    );
+    try {
+      const resultado = await par.llamar();
+      assert.equal(resultado.valida, false);
+    } finally {
+      par.cerrar();
+    }
+  });
+
+  test('WSON.getSignature() da undefined en un mensaje SIN firmar (sin "secret")', async () => {
+    const par = await montarParEmisorReceptor(
+      `    var firma = WSON.getSignature(headers())
+    return { esUndefined: firma === undefined }`,
+      ''
+    );
+    try {
+      const resultado = await par.llamar();
+      assert.equal(resultado.esUndefined, true);
+    } finally {
+      par.cerrar();
+    }
+  });
+});
+
+describe('Seguridad: protección CSRF real (cookie de doble envío)', () => {
+  test('la cookie wcsrf se manda junto a wsid, y NO es HttpOnly (legible por JS, a diferencia de wsid)', withServer(
+    { 'api.ws': `route("/x")\n\npost function f(args)\n    return { ok: true }\n` },
+    async (base) => {
+      const r = await fetch(`${base}/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const cookies = r.headers.getSetCookie();
+      const wsidCookie = cookies.find(c => c.startsWith('wsid='));
+      const wcsrfCookie = cookies.find(c => c.startsWith('wcsrf='));
+      assert.ok(wsidCookie, 'debe mandar la cookie wsid');
+      assert.ok(wcsrfCookie, 'debe mandar la cookie wcsrf');
+      assert.match(wsidCookie, /HttpOnly/, 'wsid SÍ debe ser HttpOnly');
+      assert.doesNotMatch(wcsrfCookie, /HttpOnly/, 'wcsrf NO debe ser HttpOnly -- JS necesita poder leerla');
+    }
+  ));
+
+  test('la PRIMERA petición de una sesión nueva no exige el token (nada que secuestrar todavía)', withServer(
+    { 'api.ws': `route("/x")\n\npost function f(args)\n    return { ok: true }\n` },
+    async (base) => {
+      const r = await fetch(`${base}/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      assert.equal(r.status, 200, 'la primera petición, sin sesión previa, no debe rechazarse por CSRF');
+    }
+  ));
+
+  test('una SEGUNDA petición (sesión existente) SIN el token CSRF se rechaza con 403', withServer(
+    { 'api.ws': `route("/x")\n\npost function f(args)\n    return { ok: true }\n` },
+    async (base) => {
+      const r1 = await fetch(`${base}/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const wsidCookie = r1.headers.getSetCookie().find(c => c.startsWith('wsid=')).split(';')[0];
+
+      // __originalFetch (sin el envoltorio de esta suite) -- de verdad SIN la
+      // cabecera CSRF, no un string vacío (que sigue siendo falsy y el envoltorio la
+      // rellenaría solo, invalidando la prueba).
+      const r2 = await __originalFetch(`${base}/x`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: wsidCookie },
+        body: '{}',
+      });
+      assert.equal(r2.status, 403, 'una sesión existente, sin el token CSRF, debe rechazarse');
+    }
+  ));
+
+  test('una SEGUNDA petición con un token CSRF INCORRECTO también se rechaza con 403 -- no basta con mandar algo', withServer(
+    { 'api.ws': `route("/x")\n\npost function f(args)\n    return { ok: true }\n` },
+    async (base) => {
+      const r1 = await fetch(`${base}/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const wsidCookie = r1.headers.getSetCookie().find(c => c.startsWith('wsid=')).split(';')[0];
+
+      const r2 = await fetch(`${base}/x`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: wsidCookie, 'X-WebScript-CSRF': 'token-inventado-al-azar' },
+        body: '{}',
+      });
+      assert.equal(r2.status, 403);
+    }
+  ));
+
+  test('con el token CSRF correcto, la sesión existente SÍ acepta la petición', withServer(
+    { 'api.ws': `route("/x")\n\nserver var total = 0\n\npost function f(args)\n    total = total + 1\n    return { total: total }\n` },
+    async (base) => {
+      const r1 = await fetch(`${base}/x`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const cookies = r1.headers.getSetCookie();
+      const wsidCookie = cookies.find(c => c.startsWith('wsid=')).split(';')[0];
+      const wcsrfToken = cookies.find(c => c.startsWith('wcsrf=')).split(';')[0].split('=')[1];
+      assert.deepEqual(await r1.json(), { total: 1 });
+
+      const r2 = await fetch(`${base}/x`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: wsidCookie, 'X-WebScript-CSRF': wcsrfToken },
+        body: '{}',
+      });
+      assert.equal(r2.status, 200);
+      assert.deepEqual(await r2.json(), { total: 2 }, 'debe seguir acumulando en la misma sesión, no una nueva');
+    }
+  ));
+
+  test('GET no exige token CSRF -- solo las escrituras (POST/PUT/DELETE)', withServer(
+    { 'api.ws': `route("/x")\n\nserver var total = 5\n\nget function f(query)\n    return { total: total }\n` },
+    async (base) => {
+      const r = await fetch(`${base}/x`);
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), { total: 5 });
+    }
+  ));
+
+  test('PUT y DELETE también exigen el token en una sesión existente, igual que POST', withServer(
+    { 'api.ws': `route("/x")\n\nput function actualizar(args)\n    return { ok: "put" }\n\ndelete function borrar(args)\n    return { ok: "delete" }\n` },
+    async (base) => {
+      const r1 = await fetch(`${base}/x`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const wsidCookie = r1.headers.getSetCookie().find(c => c.startsWith('wsid=')).split(';')[0];
+      assert.equal(r1.status, 200, 'primera petición (sesión nueva) -- sin exigir token');
+
+      const r2 = await __originalFetch(`${base}/x`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Cookie: wsidCookie },
+        body: '{}',
+      });
+      assert.equal(r2.status, 403, 'PUT en sesión existente, sin token, debe rechazarse');
+
+      const r3 = await __originalFetch(`${base}/x`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', Cookie: wsidCookie },
+        body: '{}',
+      });
+      assert.equal(r3.status, 403, 'DELETE en sesión existente, sin token, debe rechazarse');
+    }
+  ));
+});
+
+describe('Seguridad: el bundle.js generado SÍ manda la cabecera CSRF de verdad -- bug real que faltaba conectar', () => {
+  test('el postFnStub del cliente lee la cookie wcsrf y la manda como X-WebScript-CSRF -- servidor real, bundle.js real ejecutado', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-csrf-client-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-csrf-client-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'pagina.ws'), `route("/")
+
+server var total = 0
+
+post function incrementar(args)
+    total = total + 1
+    return { total: total }
+
+visual v =
+<button onclick={incrementar()}>x</button>
+
+render(
+    v
+)
+`);
+      const { table } = buildSite(dir, outDir);
+      const server = startServer(table, outDir, 0);
+      await new Promise(resolve => server.on('listening', resolve));
+      const port = server.address().port;
+
+      try {
+        // 1. Primera visita real -- como haría un navegador cargando la página --
+        //    consigue las cookies wsid/wcsrf reales del servidor.
+        const r1 = await __originalFetch(`http://localhost:${port}/`);
+        const setCookies = r1.headers.getSetCookie();
+        const wsidCookie = setCookies.find(c => c.startsWith('wsid=')).split(';')[0];
+        const wcsrfValue = setCookies.find(c => c.startsWith('wcsrf=')).split(';')[0].split('=')[1];
+
+        // 2. Ejecuta el bundle.js REAL, en un entorno con document.cookie simulado
+        //    (conteniendo la cookie wcsrf real que el servidor mandó) y fetch()
+        //    interceptado para inspeccionar qué cabeceras manda de verdad el código
+        //    generado, sin mockear la lógica en sí -- es el bundle.js compilado tal cual.
+        const bundleCode = fs.readFileSync(path.join(outDir, 'index.bundle.js'), 'utf8');
+        const vm = require('vm');
+        let capturedHeaders = null;
+
+        function makeEl(tag) {
+          const el = {
+            tag, nodeType: 1, children: [], attrs: {}, listeners: {},
+            appendChild(c) { this.children.push(c); },
+            setAttribute(k, v) { this.attrs[k] = v; },
+            addEventListener(ev, fn) { this.listeners[ev] = fn; },
+          };
+          el.classList = { add: () => {} };
+          return el;
+        }
+        function makeText(v) { return { nodeType: 3, text: v }; }
+        const appSingleton = makeEl('div');
+
+        const sandbox = {
+          document: {
+            cookie: `wsid=${wsidCookie.split('=')[1]}; wcsrf=${wcsrfValue}`,
+            createElement: (tag) => makeEl(tag),
+            createTextNode: (v) => makeText(v),
+            createComment: () => makeText(''),
+            createDocumentFragment: () => makeEl('fragment'),
+            getElementById: () => appSingleton,
+            addEventListener: (ev, fn) => fn(),
+          },
+          window: { location: { pathname: '/', search: '' } },
+          location: { protocol: 'http:', pathname: '/' },
+          fetch: (url, opts) => {
+            capturedHeaders = opts.headers;
+            return Promise.resolve({ json: () => Promise.resolve({ total: 1 }) });
+          },
+          console,
+        };
+        vm.createContext(sandbox);
+        vm.runInContext(bundleCode, sandbox);
+        // Llama directamente a la función generada "incrementar" (expuesta como global
+        // en el propio contexto del vm, ya que el bundle la declara a nivel de módulo).
+        await sandbox.incrementar();
+
+        assert.ok(capturedHeaders, 'el fetch() del bundle.js debe haberse llamado de verdad');
+        assert.equal(
+          capturedHeaders['X-WebScript-CSRF'],
+          wcsrfValue,
+          'el postFnStub generado debe leer document.cookie y mandar el token real, no dejarlo vacío'
+        );
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Seguridad: límite de tasa (rate limiting) por IP', () => {
+  test('bloquea al superar el límite, dentro de la misma ventana', withServer(
+    { 'api.ws': `route("/x")\n\nget function f(query)\n    return { ok: true }\n` },
+    async (base) => {
+      const resultados = [];
+      for (let i = 0; i < 7; i++) {
+        const r = await __originalFetch(`${base}/x`);
+        resultados.push(r.status);
+      }
+      assert.deepEqual(resultados, [200, 200, 200, 200, 200, 429, 429]);
+    },
+    { rateLimitMax: 5, rateLimitWindowMs: 1000 }
+  ));
+
+  test('la respuesta 429 trae Retry-After y un mensaje claro', withServer(
+    { 'api.ws': `route("/x")\n\nget function f(query)\n    return { ok: true }\n` },
+    async (base) => {
+      await __originalFetch(`${base}/x`);
+      const r = await __originalFetch(`${base}/x`);
+      assert.equal(r.status, 429);
+      assert.ok(r.headers.get('retry-after'), 'debe traer Retry-After');
+      const body = await r.json();
+      assert.match(body.error, /Demasiadas peticiones/);
+    },
+    { rateLimitMax: 1, rateLimitWindowMs: 5000 }
+  ));
+
+  test('tras pasar la ventana, el contador se renueva -- vuelve a aceptar', withServer(
+    { 'api.ws': `route("/x")\n\nget function f(query)\n    return { ok: true }\n` },
+    async (base) => {
+      await __originalFetch(`${base}/x`);
+      const bloqueada = await __originalFetch(`${base}/x`);
+      assert.equal(bloqueada.status, 429);
+
+      await new Promise(r => setTimeout(r, 600));
+      const renovada = await __originalFetch(`${base}/x`);
+      assert.equal(renovada.status, 200, 'la ventana debe haberse renovado');
+    },
+    { rateLimitMax: 1, rateLimitWindowMs: 500 }
+  ));
+
+  test('rateLimitMax: 0 desactiva el límite -- ninguna petición se rechaza', withServer(
+    { 'api.ws': `route("/x")\n\nget function f(query)\n    return { ok: true }\n` },
+    async (base) => {
+      const resultados = [];
+      for (let i = 0; i < 15; i++) {
+        const r = await __originalFetch(`${base}/x`);
+        resultados.push(r.status);
+      }
+      assert.ok(resultados.every(s => s === 200), 'con el límite desactivado, ninguna debe rechazarse');
+    },
+    { rateLimitMax: 0 }
+  ));
+
+  test('sin configurar nada (valor por defecto), un puñado de peticiones normales no se ve afectado', withServer(
+    { 'api.ws': `route("/x")\n\nget function f(query)\n    return { ok: true }\n` },
+    async (base) => {
+      const resultados = [];
+      for (let i = 0; i < 10; i++) {
+        const r = await __originalFetch(`${base}/x`);
+        resultados.push(r.status);
+      }
+      assert.ok(resultados.every(s => s === 200), 'el valor por defecto (300) no debe interferir con un uso normal de pruebas');
+    }
+  ));
+});
+
+describe('config: "rate-limit-max"/"rate-limit-window-ms" se conectan automáticamente vía serveSite()', () => {
+  test('con valores personalizados en wconfig.json, el límite real se aplica sin pasar nada a mano', async () => {
+    const { serveSite } = require('../src/site-builder');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-ratelimit-cfg-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-ratelimit-cfg-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'wconfig.json'), JSON.stringify({ 'rate-limit-max': 2, 'rate-limit-window-ms': 2000 }));
+      fs.writeFileSync(path.join(dir, 'api.ws'), 'route("/x")\n\nget function f(query)\n    return { ok: true }\n');
+      const server = serveSite(dir, outDir, 0);
+      await new Promise(resolve => server.on('listening', resolve));
+      try {
+        const port = server.address().port;
+        const resultados = [];
+        for (let i = 0; i < 4; i++) {
+          const r = await __originalFetch(`http://localhost:${port}/x`);
+          resultados.push(r.status);
+        }
+        assert.deepEqual(resultados, [200, 200, 429, 429]);
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Seguridad: protección contra reenvío (replay) en WSON', () => {
+  test('un mensaje capturado y reenviado tal cual se detecta -- firma sigue válida (no se alteró), pero replayDetected: true', withServer(
+    { 'api.ws': `route("/recibir")
+
+post function recibir(args, query, headers)
+    server wson msg = WSON.parse(args, headers, "clave-compartida")
+    return { signatureValid: msg.signatureValid, replayDetected: msg.replayDetected }
+` },
+    async (base) => {
+      const crypto = require('crypto');
+      const payload = { x: 1 };
+      const timestamp = Date.now();
+      const sig = crypto.createHmac('sha256', 'clave-compartida').update(JSON.stringify(payload) + '.' + timestamp).digest('hex');
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-WSON-Correlation-Id': 'id-fijo-reenvio-test',
+        'X-WSON-Timestamp': String(timestamp),
+        'X-WSON-Signature': 'sha256=' + sig,
+      };
+
+      const r1 = await __originalFetch(`${base}/recibir`, { method: 'POST', headers, body: JSON.stringify(payload) });
+      assert.deepEqual(await r1.json(), { signatureValid: true, replayDetected: false });
+
+      // Reenvío EXACTO -- mismas cabeceras, mismo cuerpo, simula un atacante que
+      // capturó la petición anterior y la manda otra vez tal cual.
+      const r2 = await __originalFetch(`${base}/recibir`, { method: 'POST', headers, body: JSON.stringify(payload) });
+      assert.deepEqual(await r2.json(), { signatureValid: true, replayDetected: true });
+    }
+  ));
+
+  test('una firma correcta pero con marca de tiempo fuera de la ventana se rechaza -- aunque matemáticamente sea válida', withServer(
+    { 'api.ws': `route("/x")
+
+post function f(args, query, headers)
+    server wson msg = WSON.parse(args, headers, "clave")
+    return { valida: msg.signatureValid }
+` },
+    async (base) => {
+      const crypto = require('crypto');
+      const payload = { x: 1 };
+      const timestampViejo = Date.now() - (10 * 60 * 1000); // 10 minutos -- fuera de la ventana por defecto (5 min)
+      const sig = crypto.createHmac('sha256', 'clave').update(JSON.stringify(payload) + '.' + timestampViejo).digest('hex');
+      const r = await __originalFetch(`${base}/x`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-WSON-Timestamp': String(timestampViejo), 'X-WSON-Signature': 'sha256=' + sig },
+        body: JSON.stringify(payload),
+      });
+      assert.deepEqual(await r.json(), { valida: false });
+    }
+  ));
+
+  test('sin marca de tiempo en absoluto, se rechaza -- ya no basta con mandar solo la firma', withServer(
+    { 'api.ws': `route("/x")
+
+post function f(args, query, headers)
+    server wson msg = WSON.parse(args, headers, "clave")
+    return { valida: msg.signatureValid }
+` },
+    async (base) => {
+      const crypto = require('crypto');
+      const payload = { x: 1 };
+      const sigConTimestampInventado = crypto.createHmac('sha256', 'clave').update(JSON.stringify(payload) + '.' + Date.now()).digest('hex');
+      const r = await __originalFetch(`${base}/x`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-WSON-Signature': 'sha256=' + sigConTimestampInventado },
+        body: JSON.stringify(payload),
+      });
+      assert.deepEqual(await r.json(), { valida: false });
+    }
+  ));
+
+  test('con una ventana MUY corta configurada, un mensaje sigue válido de inmediato pero deja de estarlo tras esperar', async () => {
+    // "wsonReplayWindowMs" es una opción de COMPILACIÓN (se hornea en el server.js
+    // generado), no de tiempo de ejecución -- withServer() solo pasa "serverOptions"
+    // a startServer(), así que aquí hace falta un wconfig.json real, como el resto de
+    // opciones de compilación de este proyecto.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-replay-window-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-replay-window-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'wconfig.json'), JSON.stringify({ 'wson-replay-window-ms': 500 }));
+      fs.writeFileSync(path.join(dir, 'x.ws'), `route("/x")
+
+post function f(args, query, headers)
+    server wson msg = WSON.parse(args, headers, "clave")
+    return { valida: msg.signatureValid }
+`);
+      const { table } = buildSite(dir, outDir);
+      const server = startServer(table, outDir, 0);
+      await new Promise(resolve => server.on('listening', resolve));
+      try {
+        const port = server.address().port;
+        const crypto = require('crypto');
+        const payload = { x: 1 };
+        const timestamp = Date.now();
+        const sig = crypto.createHmac('sha256', 'clave').update(JSON.stringify(payload) + '.' + timestamp).digest('hex');
+        const headers = { 'Content-Type': 'application/json', 'X-WSON-Timestamp': String(timestamp), 'X-WSON-Signature': 'sha256=' + sig };
+
+        const r1 = await __originalFetch(`http://localhost:${port}/x`, { method: 'POST', headers, body: JSON.stringify(payload) });
+        assert.deepEqual(await r1.json(), { valida: true }, 'de inmediato, dentro de la ventana, debe ser válido');
+
+        await new Promise(resolve => setTimeout(resolve, 600));
+        const r2 = await __originalFetch(`http://localhost:${port}/x`, { method: 'POST', headers, body: JSON.stringify(payload) });
+        const data2 = await r2.json();
+        assert.equal(data2.valida, false, 'tras pasar la ventana configurada (500ms), la misma firma ya no debe ser válida');
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('config: "wson-replay-window-ms" se conecta automáticamente vía serveSite()', () => {
+  test('con una ventana corta en wconfig.json, el rechazo real se aplica sin pasar nada a mano', async () => {
+    const { serveSite } = require('../src/site-builder');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-replay-cfg-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-replay-cfg-out-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'wconfig.json'), JSON.stringify({ 'wson-replay-window-ms': 500 }));
+      fs.writeFileSync(path.join(dir, 'x.ws'), `route("/x")
+
+post function f(args, query, headers)
+    server wson msg = WSON.parse(args, headers, "clave")
+    return { valida: msg.signatureValid }
+`);
+      const server = serveSite(dir, outDir, 0);
+      await new Promise(resolve => server.on('listening', resolve));
+      try {
+        const port = server.address().port;
+        const crypto = require('crypto');
+        const payload = { x: 1 };
+        const timestampViejo = Date.now() - 2000; // 2s -- fuera de la ventana de 500ms configurada
+        const sig = crypto.createHmac('sha256', 'clave').update(JSON.stringify(payload) + '.' + timestampViejo).digest('hex');
+        const r = await __originalFetch(`http://localhost:${port}/x`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-WSON-Timestamp': String(timestampViejo), 'X-WSON-Signature': 'sha256=' + sig },
+          body: JSON.stringify(payload),
+        });
+        assert.deepEqual(await r.json(), { valida: false });
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
 });

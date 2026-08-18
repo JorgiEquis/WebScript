@@ -4,6 +4,21 @@
     "body": "route(\"${1:/}\")",
     "description": "Declara la ruta que sirve este archivo (debe ir primero)"
   },
+  "route con parámetro": {
+    "prefix": "routeparam",
+    "body": "route(\"/${1:recurso}/:${2:id}\")",
+    "description": "Ruta con un segmento dinámico -- léelo dentro de una función HTTP con params()"
+  },
+  "params": {
+    "prefix": "params",
+    "body": "const { ${1:id} } = params()",
+    "description": "Parámetros dinámicos de la propia URL (los segmentos :algo de route()), como un objeto"
+  },
+  "query": {
+    "prefix": "query",
+    "body": "query().${1:parametro}",
+    "description": "Query string de la propia URL (?a=1), disponible en páginas con render() -- sin fetch, con SSR real"
+  },
   "reactive": {
     "prefix": "reactive",
     "body": "reactive ${1:nombre} = ${2:valor}",
@@ -19,6 +34,16 @@
     "body": "var ${1:nombre} = ${2:valor}",
     "description": "Variable NO reactiva: se calcula una sola vez"
   },
+  "const": {
+    "prefix": "const",
+    "body": "const ${1:nombre} = ${2:valor}",
+    "description": "Valor fijo e inmutable -- reasignarlo lanza un TypeError real de JS. Nunca reactivo."
+  },
+  "server const": {
+    "prefix": "serverconst",
+    "body": "server const ${1:nombre} = ${2:valor}",
+    "description": "Valor fijo e inmutable en el servidor -- reasignarlo lanza un TypeError real de JS. Exige valor inicial."
+  },
   "var tipada": {
     "prefix": "vart",
     "body": "var ${1|string,number,boolean|} ${2:nombre} = ${3:valor}",
@@ -27,12 +52,7 @@
   "function": {
     "prefix": "function",
     "body": "function ${1:nombre}(${2:params})\n    ${3}",
-    "description": "Helper de CLIENTE con cuerpo en varias líneas (a diferencia de var, que solo cabe en una línea)"
-  },
-  "async function": {
-    "prefix": "asyncfunction",
-    "body": "async function ${1:nombre}(${2:params})\n    var r = await ${3:fetch(url)}\n    return r",
-    "description": "Helper de CLIENTE que puede usar await dentro -- quien la llame también necesita await"
+    "description": "Helper de CLIENTE con cuerpo en varias líneas (a diferencia de var, que solo cabe en una línea). Siempre puede usar await dentro sin declarar nada especial -- se compila async solo si de verdad hace falta"
   },
   "style": {
     "prefix": "style",
@@ -119,6 +139,21 @@
     "body": "server wson ${1:nombre} =\n    -> to: ${2:\"http://...\"}\n    -> content: ${3:valor}\n    -> secret: ${4:\"clave-compartida\"}",
     "description": "server wson con firma HMAC -- WSON.send() firma el content automáticamente, el secreto nunca viaja por la red"
   },
+  "wson por WebSocket": {
+    "prefix": "wsonsocket",
+    "body": "${1|wson,server wson|} ${2:nombre} =\n    -> to: ${3:\"ws://localhost:3001/ruta\"}\n    -> via: \"socket\"\n    -> content: ${4:valor}",
+    "description": "WSON.send() con via:\"socket\" -- conecta como cliente WebSocket, manda content como un mensaje, espera una respuesta, cierra"
+  },
+  "WSON.parse dentro de ws function": {
+    "prefix": "wsonparsews",
+    "body": "server wson ${1:msg} = WSON.parse(${2:args}, headers(), ${3:\"clave-compartida\"})",
+    "description": "Punto de entrada del receptor DENTRO de una ws function -- headers() da las cabeceras del handshake (from/secret/id de un WSON.send con via:\"socket\")"
+  },
+  "wson de una expresión": {
+    "prefix": "wsonexpr",
+    "body": "${1|wson,server wson|} ${2:nombre} = ${3:expresión}",
+    "description": "Segunda forma de wson/server wson -- todo en una línea, como var/reactive, para cuando el valor YA es un WSON en tiempo de ejecución (ej. el resultado de WSON.parse())"
+  },
   "server wson cifrado": {
     "prefix": "serverwsonencrypt",
     "body": "server wson ${1:nombre} =\n    -> to: ${2:\"http://...\"}\n    -> content: ${3:valor}\n    -> secret: ${4:\"clave-compartida\"}\n    -> encrypt: true",
@@ -131,33 +166,43 @@
   },
   "WSON.parse": {
     "prefix": "wsonparse",
-    "body": "var ${1:msg} = WSON.parse(${2:args}, ${3:headers}, ${4:\"clave-compartida\"})",
-    "description": "Punto de entrada del receptor -- from/id de las cabeceras, y con secreto también verifica+descifra, todo en una llamada"
+    "body": "server wson ${1:msg} = WSON.parse(${2:args}, ${3:headers}, ${4:\"clave-compartida\"})",
+    "description": "Punto de entrada del receptor -- from/id de las cabeceras, y con secreto también verifica+descifra, todo en una llamada. El resultado ES un WSON -- se declara con \"wson\", no \"var\"."
   },
   "WSON.history": {
     "prefix": "wsonhistory",
     "body": "WSON.history()",
-    "description": "Historial de WSON enviados/recibidos -- GLOBAL a todo el proceso, no por sesión. Admite filtros opcionales: { direction, from, to, id }"
+    "description": "Historial de WSON enviados/recibidos -- persistido en fichero (JSONL), sobrevive a reinicios. GLOBAL a todo el proceso. Filtros opcionales: { direction, from, to, id, deadLetter }"
   },
   "WSON.verify": {
     "prefix": "wsonverify",
-    "body": "WSON.verify(${1:content}, ${2:headers['x-wson-signature']}, ${3:\"clave-compartida\"})",
-    "description": "Verifica en el receptor que la firma corresponde al content y al secreto compartido (comparación en tiempo constante)"
+    "body": "WSON.verify(${1:content}, WSON.getSignature(${2:headers}), ${3:\"clave-compartida\"}, WSON.getTimestamp(${2:headers}))",
+    "description": "Verifica en el receptor firma + frescura (protección contra reenvío/replay) -- comparación en tiempo constante. La marca de tiempo es obligatoria."
+  },
+  "WSON.getSignature": {
+    "prefix": "wsongetsignature",
+    "body": "WSON.getSignature(${1:headers})",
+    "description": "Atajo por headers['x-wson-signature'] -- mismo valor, sin transformar, sigue siendo válido como segundo argumento de WSON.verify()"
+  },
+  "WSON.getTimestamp": {
+    "prefix": "wsongettimestamp",
+    "body": "WSON.getTimestamp(${1:headers})",
+    "description": "Atajo por headers['x-wson-timestamp'] -- cuarto argumento que espera WSON.verify(), para la protección contra reenvío"
   },
   "server function": {
     "prefix": "serverfunction",
     "body": "server function ${1:nombre}(${2:args})\n    ${3}",
-    "description": "Helper de servidor síncrono, invisible al cliente (varias por archivo, sin await dentro)"
-  },
-  "async server function": {
-    "prefix": "asyncserverfunction",
-    "body": "async server function ${1:nombre}(${2:args})\n    var r = await ${3:http.get(url, {})}\n    return r",
-    "description": "Helper de servidor que puede usar await dentro (http.*, otra dependencia async de Node) -- quien la llame también necesita await"
+    "description": "Helper de servidor, invisible al cliente (varias por archivo). Siempre puede usar await dentro sin declarar nada especial -- se compila async solo si de verdad hace falta"
   },
   "get function": {
     "prefix": "getfunction",
     "body": "get function ${1:nombre}(${2:query})\n    ${3}",
     "description": "Corre en un GET a esta ruta -- SOLO válido en un archivo sin render() (ruta 'solo backend')"
+  },
+  "ws function": {
+    "prefix": "wsfunction",
+    "body": "ws function ${1:nombre}(${2:args})\n    ${3}",
+    "description": "Corre por cada mensaje entrante en la conexión WebSocket de esta ruta -- necesita \"ws-port\" en wconfig.json. Solo una por archivo."
   },
   "post function": {
     "prefix": "postfunction",
@@ -198,6 +243,11 @@
     "prefix": "whisper",
     "body": "whisper(${1:mensaje})",
     "description": "Equivalente a console.log() en el servidor"
+  },
+  "respond": {
+    "prefix": "respond",
+    "body": "return respond(${1:status}, ${2:{ }})",
+    "description": "Código de estado HTTP explícito en una get/post/put/delete function -- sin esto, siempre responde 200"
   },
   "import": {
     "prefix": "import",

@@ -13,6 +13,15 @@ Resaltado de sintaxis, snippets y ayuda contextual (hover) para archivos
   tema de iconos completo. También sirve como icono de la propia
   extensión en el *marketplace*.
 
+- **Validación de `wconfig.json`** (`schemas/wconfig.schema.json`,
+  conectado vía `jsonValidation` en `package.json`): al abrir un archivo
+  llamado exactamente `wconfig.json`, VS Code ofrece autocompletado de
+  las claves válidas (`http-port`, `ws-port`, `allow-acorn`,
+  `wson-history-route`, `cluster-workers`, `stylesheets`), con su
+  descripción, tipo esperado, y valor por defecto — y marca en rojo
+  cualquier clave desconocida o tipo incorrecto, directamente en el
+  editor, sin necesitar compilar para descubrirlo.
+
 - **Resaltado de sintaxis** (`syntaxes/webscript.tmLanguage.json`):
   - Palabras clave: `route`, `reactive`, `var`, `function`, `style`,
     `visual`, `render`, `server var`, `server reactive`, `server wson`,

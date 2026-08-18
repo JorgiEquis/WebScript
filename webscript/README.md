@@ -83,6 +83,14 @@ node src/cli.js build examples/contador.ws --out dist
 Esto genera `dist/index.html`, `dist/styles.css` y `dist/bundle.js`. Abre
 `index.html` en el navegador.
 
+Todos los comandos (`build`/`site`/`serve`/`run`) admiten un
+`wconfig.json` opcional, buscado junto a los `.ws` del proyecto — ver la
+sección dedicada "`wconfig.json`: configuración opcional del proyecto"
+más abajo para las claves disponibles (puerto HTTP, puerto WebSocket
+reservado, activar/forzar Acorn, ruta del historial de WSON, número de
+procesos en *cluster*, hojas de estilo externas). Sin él, todo sigue
+funcionando exactamente igual que siempre.
+
 ## Tests
 
 ```bash
@@ -90,7 +98,7 @@ npm test
 ```
 
 Corre la suite completa con el *test runner* nativo de Node (`node:test`,
-sin dependencias que instalar) — **228 tests, 64 suites** a estas alturas
+sin dependencias que instalar) — **324 tests, 94 suites** a estas alturas
 (el número ha ido creciendo turno a turno; ver `tests/` para el desglose
 completo, cada archivo nuevo se documenta en su sección correspondiente
 más abajo), cubriendo:
@@ -124,6 +132,11 @@ más abajo), cubriendo:
 - **`tests/ssr.test.js`** — renderizado SSR/SSG real, composición con
   *slot* en el servidor, *fallback* seguro cuando algo no se puede
   evaluar.
+- **`tests/config.test.js`** — `wconfig.json`: valores por defecto,
+  validación (JSON inválido, claves desconocidas, tipos incorrectos), y
+  la integración real con `buildSite()`/`serveSite()` (`allow-acorn`
+  reflejado en `jsAnalyzer.isAvailable()`, `wson-history-route`
+  propagado hasta el `server.js`, precedencia real de `http-port`).
 
 Esta suite formaliza en tests permanentes todo lo que fui comprobando a
 mano a lo largo de esta conversación — incluida la limitación real del
@@ -2069,6 +2082,937 @@ reconozca y verifique un WSON entrante sin que el desarrollador tenga
 que llamar a `WSON.verify()` a mano), reintentos con idempotencia, y
 validación de forma del `content`.
 
+## `WSON.parse()` debería devolver "un wson": segunda forma de declaración, y un fallo de seguridad real encontrado por el camino
+
+Pregunta que lo motivó: "¿por qué el ejemplo del README guarda
+`WSON.parse()` en un `var`, si conceptualmente es un WSON?" — buena
+observación. La gramática de `wson`/`server wson` **solo** entendía el
+bloque `-> clave: valor`, nunca una expresión normal — así que no había
+forma de escribir `server wson msg = WSON.parse(...)` tal cual.
+
+### Un fallo de seguridad real, encontrado revisando el código antes de tocarlo
+
+Antes de extender la gramática, al revisar `parseVarDecl` apareció algo
+inesperado: una función `tryParseWsonBlock`, conectada en **las cuatro**
+declaraciones (`reactive`/`var`/`server var`/`server reactive`) — un
+mecanismo genérico y anterior a que existiera la palabra clave dedicada
+`wson`/`server wson`, nunca limpiado tras la migración. Confirmado que
+seguía activo: `var x = -> a: 1` compilaba sin más. Y confirmado el
+problema real: `var x = -> to: "..." -> content: 1 -> secret: "se vería
+en el navegador"` **compilaba sin ningún rechazo** — el mecanismo
+genérico no pasaba por la validación de seguridad que sí tiene
+`wson`/`server wson` (que rechaza `secret` fuera del servidor). Un
+secreto real podía colarse al `bundle.js` sin que nada lo impidiera.
+
+**Arreglado eliminando el mecanismo viejo por completo** de las cuatro
+declaraciones — no tenía ninguna razón para seguir existiendo en
+paralelo a la palabra clave dedicada. Verificado que el fallo se cerró,
+y que la detección de una referencia real a una `server var` (el caso
+legítimo que sí debe seguir funcionando) no se debilitó.
+
+### La segunda forma, ya con la gramática limpia
+
+```
+server wson msg = WSON.parse(args, headers, "clave-compartida")
+```
+
+Igual de válido que la forma de bloque de siempre — se distingue
+mirando si hay algo después del `=` en la misma línea (forma nueva) o
+si la línea termina en `=` seguida de `->` debajo (forma de bloque,
+sin cambios). Todas las validaciones existentes (rechazo de
+`secret`/`encrypt` en cliente, no referenciar `server var` desde un
+`wson` de cliente) se extendieron para cubrir también esta segunda
+forma, no solo la de bloque.
+
+### Segundo bug real, encontrado probando el caso real de uso
+
+`server wson msg = WSON.parse(...)` **dentro** de un `post function`
+(el sitio donde de verdad tiene sentido usarlo) compilaba pero
+**reventaba al cargar el `server.js`** — `SyntaxError: Unexpected
+identifier 'wson'`. Causa: `wson`/`server wson` solo se reconocían como
+declaraciones de **nivel superior**; dentro de un cuerpo de función, ese
+texto se colaba literal (ni "wson" ni "server" son palabras clave de
+JS). Arreglado con una función de desazúcar
+(`desugarLocalWsonDecls`) que reescribe `wson NOMBRE = expr`/`server
+wson NOMBRE = expr` a un `let` normal, aplicada antes de cualquier otra
+sustitución, tanto en cuerpos de servidor (`post`/`put`/`delete`/`get
+function`, `server function`, `watch()`) como en el cliente
+(`onclick={...}`, `function` de cliente).
+
+Verificado de extremo a extremo con dos servidores reales: emisor firma
+y manda, receptor declara el resultado con `server wson msg =
+WSON.parse(...)` dentro de su propio `post function`, verifica la firma
+y lee `from`/`content` — todo correcto.
+
+## WebSockets: `ws function`, servidor real desde cero, y `via: "socket"` en WSON
+
+Petición directa: `ws function` igual que una HTTP asíncrona, solo una
+por archivo, y `via: "socket"` en WSON. Node no trae soporte de
+WebSocket nativo, y este entorno no tiene acceso a red para instalar
+`ws`/`socket.io` — se implementó el protocolo (RFC 6455) desde cero, con
+`http`/`crypto`/`net` nativos, coherente con la filosofía de cero
+dependencias que ya tiene el resto del proyecto (el *parser*, la
+reactividad, el servidor HTTP — todo hecho igual).
+
+### Verificado contra el propio estándar antes de construir nada encima
+
+El *handshake* (clave de aceptación, SHA-1 + base64) se probó contra el
+vector de ejemplo que trae el propio RFC 6455, no solo contra mis
+propias pruebas — coincide exactamente.
+
+### `ws function`
+
+```
+route("/chat")
+
+server var mensajesRecibidos = 0
+
+ws function entradaWS(args)
+    mensajesRecibidos = mensajesRecibidos + 1
+    return { eco: args.mensaje, total: mensajesRecibidos }
+```
+
+- **Async, como las cuatro HTTP** — corre por cada **mensaje** que
+  llega (no por cada conexión; una conexión persiste y trae muchos
+  mensajes a lo largo del tiempo). Lo que devuelva se manda de vuelta
+  por la misma conexión.
+- **Solo una por archivo** — mismo criterio, y la misma comprobación en
+  código, que ya tenían `post`/`put`/`delete`/`get function`.
+- **Comparte sesión con las peticiones HTTP normales de la misma
+  ruta** — el *handshake* de WebSocket ES una petición HTTP de verdad,
+  y puede llevar la cookie `wsid`. Verificado con `server var`: el
+  contador sube consistentemente entre mensajes de la **misma**
+  conexión (`total: 1, 2, 3`).
+- **`params()` funciona igual que en las HTTP normales** — una conexión
+  WS también llega a una ruta concreta, que puede tener sus propios
+  `:parámetros`.
+- **Puerto separado** (`ws-port` de `wconfig.json`, hasta ahora
+  reservado sin usar) — un `http.Server` normal no distingue "petición
+  normal" de "quiero pasar a WebSocket" salvo por la cabecera
+  `Upgrade`, y mezclar los dos casos en el mismo *listener* complicaba
+  el código sin necesidad real aquí.
+
+### Bug real encontrado antes de que llegara a funcionar
+
+`ws function` se compilaba correctamente dentro de `createSessionState()`
+— pero, a diferencia de las cuatro HTTP, **nunca se exponía** en el
+objeto que esa función devuelve. Primer intento de conexión real:
+`sessionState.entradaWS is not a function`. Localizado comparando línea
+por línea con cómo se exponen `post`/`put`/`delete`/`get`, y arreglado
+en el mismo sitio exacto.
+
+### Segundo bug real: el proceso se quedaba colgado al cerrar, con una conexión abierta
+
+Al escribir los tests permanentes, la suite completa dejó de terminar
+sola — colgada indefinidamente tras el último test, sin ningún error
+visible. Aislado con un repro mínimo: es una limitación **conocida de
+Node en sí, no de este proyecto** — `http.Server.close()` solo deja de
+**aceptar** conexiones nuevas, nunca cierra las que ya están abiertas.
+Con una conexión WebSocket persistente todavía viva, `.close()` nunca
+terminaba, y el proceso se quedaba esperando para siempre. Confirmado
+el diagnóstico con un repro aislado antes de arreglar nada (código de
+salida `124`, el proceso tuvo que matarse a la fuerza) — y confirmado
+el arreglo con el mismo repro exacto después (código de salida `0`).
+Arreglado rastreando explícitamente cada *socket* WS aceptado, y
+destruyéndolos a la fuerza al cerrar el servidor.
+
+### Errores dentro de una `ws function` no tumban la conexión
+
+Mismo espíritu que el resto del proyecto (un fallo puntual nunca debe
+tumbar más de lo estrictamente necesario) — un error se manda como
+mensaje de error por la misma conexión, que sigue viva para el
+siguiente mensaje. Verificado con dos mensajes seguidos: el primero
+provoca un error a propósito, el segundo funciona con normalidad en la
+misma conexión.
+
+### `WSON` con `via: "socket"`
+
+```
+var r = await WSON.send({ to: "ws://localhost:9600/eco", via: "socket", content: { mensaje: "hola" } })
+```
+
+Mismo patrón mental que `POST`/`PUT`/`DELETE` (un envío = una
+respuesta), aunque WebSocket en sí permita bastante más que eso — se
+mantiene simple y consistente con el resto de "vías" a propósito, en
+vez de inventar un modelo de interacción distinto solo para esta.
+Conecta como **cliente** WebSocket al destino, manda `content` como un
+mensaje, espera una respuesta, cierra. Reintentos, *backoff*, y
+registro en `WSON.history()` (incluido `deadLetter` si el destino no
+responde) funcionan exactamente igual que con las demás vías — mismo
+código compartido, solo cambia cómo se manda el mensaje en sí.
+
+Verificado de extremo a extremo entre **dos servidores reales**:
+emisor con `WSON.send(..., via: "socket")`, receptor con `ws function`
+— la respuesta llega correctamente, y un destino inalcanzable
+(`ws://localhost:1/...`) reintenta, falla, y queda registrado como
+`deadLetter`, igual que ya pasaba con HTTP.
+
+### "¿Cómo se comporta `WSON.send()` con WebSockets, cifrado, secretos…?" — pregunta que destapó dos bugs reales, no verificados hasta entonces
+
+Al construir `via: "socket"` en la respuesta anterior, verifiqué que
+funcionaba de extremo a extremo — pero nunca probé `secret`/`encrypt`/
+`from` juntos con esa vía en concreto. Preguntado directamente, se
+comprobó con código real en vez de asumir que "ya debería funcionar
+igual que con HTTP" — y no era así, en dos sitios distintos.
+
+**Bug real #1 — `WSON` no existía dentro de una `ws function`, en
+absoluto.** La detección de "¿hace falta generar el objeto `WSON` en
+este `server.js`?" recorre los cuerpos de `server function`, las cuatro
+HTTP, y `watch()` — pero nunca se añadió el cuerpo de `ws function` a
+esa misma lista al construirla. Cualquier `ws function` que usara
+`WSON.showContent()`/`WSON.verify()`/etc. daba `WSON is not defined` al
+ejecutar, aunque compilara sin ningún aviso. Mismo patrón exacto que
+otros bugs ya encontrados en esta conversación: una declaración nueva
+que se queda fuera de una colección existente en vez de añadirse a
+todas las que le corresponden.
+
+**Bug real #2 — `secret`/`from`/`id` se calculaban y se tiraban.** Para
+HTTP, esos tres viajan como cabeceras (`X-WSON-Signature`,
+`X-WSON-From`, `X-WSON-Correlation-Id`) que `WSON.send()` ya calculaba
+correctamente — pero el *handshake* de WebSocket que construye
+`via: "socket"` nunca las incluía en la petición. `encrypt` sí
+funcionaba (opera sobre el `payload` antes de decidir la vía, así que
+le era indiferente), pero la firma, el remitente, y el id de
+correlación se perdían sin ningún aviso ni error — simplemente nunca
+llegaban.
+
+**Arreglado con dos cambios, no uno:**
+
+1. El *handshake* saliente de `via: "socket"` ahora incluye esas
+   mismas cabeceras `X-WSON-*` (reutilizando el mismo objeto `headers`
+   que ya se calculaba para HTTP — no hubo que duplicar la lógica de
+   cálculo, solo transmitirlas también por este camino).
+2. `ws function` gana una función `headers()`, análoga a `params()` —
+   las cabeceras del *handshake* inicial, válidas para toda la conexión
+   (una conexión WS no tiene "cabeceras por mensaje", solo las del
+   *handshake* que la abrió). Con esto, `WSON.parse(args, headers(),
+   secreto)` funciona dentro de una `ws function` exactamente igual que
+   `WSON.parse(args, headers, secreto)` dentro de una `post function`.
+
+Verificado de extremo a extremo, con los dos bugs ya cerrados: un envío
+con `secret`+`encrypt`+`from` a la vez, por `via: "socket"`, llega al
+receptor con `from: "servicio-x"` correcto, `content` ya descifrado
+(`{ mensaje: "secreto" }`, no el bloque cifrado), y `signatureValid:
+true`. Y, para confirmar que la verificación de verdad comprueba algo
+(no solo que "no revienta"): un secreto incorrecto en el emisor da
+`signatureValid: false` en el receptor, no un `true` falso.
+
+### Una `route()` sirve HTTP y WebSocket a la vez — verificado en cuatro ángulos, no solo asumido
+
+Pregunta directa: "¿`route()` sirve tanto *endpoint* HTTP como
+*endpoint* WebSocket, ya que la idea es que cada ruta pueda abrir un
+WebSocket?" Comprobado con servidores reales, no solo revisando el
+código:
+
+1. **`post function` + `ws function` en el mismo archivo, misma sesión
+   compartida entre los dos protocolos** — una única `server var`,
+   incrementada alternando HTTP → WebSocket → HTTP, con la **misma**
+   cookie de sesión en las tres llamadas: `1, 2, 3`, con continuidad
+   estricta cruzando entre protocolos. No son dos sesiones distintas
+   por casualidad — es genuinamente el mismo contenedor de estado.
+   (Nota al margen: mi primera versión de esta prueba dio un resultado
+   raro — `1, 1, 1` en vez de `1, 2, 3` — pero era un artefacto de mi
+   propio script de prueba, que no reutilizaba la cookie entre
+   llamadas; cada `fetch()`/conexión WS por separado creaba su propia
+   sesión nueva. Confirmado el diagnóstico antes de tocar ningún
+   código, repitiendo la prueba con la cookie bien propagada.)
+2. **Una ruta CON `render()` (una página real) también puede tener `ws
+   function`** — sin ninguna validación bloqueándolo. La página se
+   sirve con SSR normal, y un cambio hecho por WebSocket en la misma
+   sesión se refleja correctamente en la siguiente carga de la página
+   (`Contador: 0` → WebSocket incrementa → `Contador: 1` en la
+   siguiente petición HTTP, misma cookie).
+3. **Varias rutas distintas, cada una con su propia `ws function`,
+   compartiendo el mismo `ws-port`** — distinguidas por *path*, cada
+   una respondiendo con su propia lógica, sin mezclarse entre sí.
+4. **Sin ninguna combinación bloqueada por validación** — ni "solo
+   backend" (`route()` sin `render()`) ni "con página" (`route()` con
+   `render()`) impiden tener `ws function` a la vez que las HTTP
+   normales.
+
+### `WSON.showContent()`/`verify()`/`getSignature()` con WebSocket — cada uno probado por separado, no solo a través de `WSON.parse()`
+
+Pregunta directa, tras la corrección de `secret`/`from` en `via:
+"socket"`: ¿los tres métodos sueltos funcionan bien con WebSocket, o
+solo se probó el atajo combinado `WSON.parse()`? Se habían probado
+juntos (`WSON.parse()`) y en un test de firma incorrecta, pero no cada
+uno aislado — así que se comprobó explícitamente, con datos que
+viajaron de verdad por una conexión WebSocket real, casos positivos y
+negativos:
+
+- **`WSON.getSignature(headers())`** — extrae correctamente la firma
+  de la cabecera del *handshake* (confirmando que Node minúsculiza las
+  cabeceras del *handshake* de WebSocket exactamente igual que en
+  peticiones HTTP normales, sin ninguna sorpresa ahí). En un mensaje
+  sin `secret`, da `undefined`, no un error.
+- **`WSON.verify(args, firma, secreto)`** — `true` con la clave
+  correcta, `false` con una incorrecta — no acepta a ciegas.
+- **`WSON.showContent(args, secreto)`** — descifra correctamente con
+  la clave correcta; con una incorrecta, da `null`, no basura
+  descifrada a medias ni un error que tumbe la conexión.
+
+Los tres, con AES-256-GCM real y HMAC-SHA256 real, sobre datos que
+recorrieron de verdad el *handshake* + un *frame* WebSocket — no
+simulados ni comprobados solo leyendo el código.
+
+### Otro bug real: `ws-port` de `wconfig.json` no se conectaba solo
+
+Todas las pruebas anteriores pasaban `wsPort` explícitamente a
+`startServer()`. Al revisar la conexión automática por CLI, apareció
+un hueco real: `serveSite()` (el camino que de verdad usa `serve`/`run
+--serve`) nunca leía `config['ws-port']` — solo funcionaba si alguien
+pasaba `wsPort` a mano. Un `ws-port` en `wconfig.json` no tenía ningún
+efecto real por CLI puro. Arreglado, y verificado con el CLI real, sin
+pasar nada a mano: `node src/cli.js serve <carpeta>` con `ws-port` en
+su `wconfig.json` arranca el servidor WebSocket solo, en el puerto
+configurado.
+
+### Límite reconocido y verificado, no solo supuesto: `ws function` + `cluster-workers` > 1
+
+Al conectar `ws-port` también en `startClusteredServer()`, apareció una
+pregunta real: ¿qué pasa si alguien combina `ws function` con varios
+procesos en *cluster*? Revisado antes de fingir que funciona: el
+*proxy* del frontal (`cluster-workers`) solo retransmite peticiones
+HTTP normales — no conexiones WebSocket, que necesitarían su propio
+mecanismo de reenvío con sesión pegajosa, no construido aquí. Con
+`cluster-workers: 1` (el valor por defecto), `ws function` funciona sin
+ningún problema, ya verificado. Con más de `1` y alguna `ws function`
+en el proyecto, ahora se avisa explícitamente por consola de que las
+conexiones WebSocket no funcionarán en ese modo — en vez de fallar en
+silencio, sin ninguna pista de por qué.
+
+### Límites reconocidos del protocolo en sí
+
+No es el RFC 6455 completo — cubre lo que hace falta para el caso
+normal (mensajes de texto completos, uno por *frame*): sin
+fragmentación de mensajes grandes en varios *frames*, sin control
+explícito de *ping*/*pong* más allá de ignorarlos (no hay
+*keepalive* activo). Suficiente para el uso normal, documentado
+honestamente como lo que falta, no como algo ya resuelto.
+
+## Seguridad: protección CSRF real (cookie de doble envío)
+
+Primera pieza de la lista de seguridad priorizada. Antes de esto, la
+cookie de sesión (`wsid`) ya llevaba `HttpOnly` + `SameSite=Lax`
+(confirmado revisando el código antes de asumir que faltaba del todo)
+— una protección parcial, no completa. Se añadió una capa explícita:
+patrón **cookie de doble envío** (*double-submit cookie*).
+
+### Cómo funciona
+
+- Una segunda cookie, `wcsrf`, se manda junto a `wsid` — pero **sin**
+  `HttpOnly`, a propósito: el valor se deriva con HMAC-SHA256 del id de
+  sesión y un secreto generado una vez por proceso (nunca expuesto
+  directamente). El propio código de cliente generado la lee y la
+  reenvía como cabecera `X-WebScript-CSRF` en cada `POST`/`PUT`/`DELETE`.
+- Un atacante en otro origen puede lograr que el navegador de la
+  víctima mande `wsid` automáticamente (ese es el problema que es CSRF
+  en sí) — pero **no puede leer** el valor de `wcsrf` (las cookies de
+  un origen no son legibles por JS de otro origen), así que no puede
+  construir la cabecera que hace falta para que el servidor acepte la
+  petición.
+- Verificación en **tiempo constante** (`crypto.timingSafeEqual`) —
+  mismo motivo que la firma de WSON: comparar con `===` filtraría por
+  temporización cuánto del token coincide.
+
+### Una excepción deliberada, razonada antes de implementarla
+
+La **primera** petición de una sesión completamente nueva (sin ninguna
+cookie `wsid` previa) **no** exige el token. Razón: CSRF explota una
+sesión **ya existente y autenticada** — una sesión recién creada, sin
+ningún estado de valor todavía, no es algo que un atacante pueda
+"secuestrar". Exigir el token también ahí solo forzaría a cualquier
+cliente (incluido uno legítimo sin navegador, como un móvil o un
+script) a hacer una petición de "calentamiento" antes de poder escribir
+nada, sin ganar protección real a cambio. Verificado explícitamente que
+esta excepción no abre ningún hueco: el atacante nunca controla si la
+víctima ya tiene o no una sesión existente — eso lo decide el navegador
+de la víctima, no el atacante.
+
+### El proceso real de depuración, no solo el resultado final
+
+Conectar esto rompió inicialmente **decenas** de tests existentes (81
+sitios llamando a `fetch()` con `POST`/`PUT`/`DELETE`, solo en
+`server.test.js`) — esperado, ninguno mandaba la cabecera nueva. En vez
+de tocar los 81 sitios a mano, se instaló un envoltorio de `fetch`
+global, a nivel de módulo, que rastrea cookies entre llamadas y añade
+la cabecera CSRF sola cuando corresponde.
+
+La primera versión de ese envoltorio introdujo un bug real de aislamiento
+entre tests: guardaba "la última cookie vista" para rellenar peticiones
+sin cookie explícita — funcionaba bien en un test aislado, pero con
+decenas de servidores **distintos** en el mismo archivo, la sesión de
+un servidor se filtraba a peticiones de otro servidor completamente
+distinto. Diagnosticado con trazas reales (no adivinado): se confirmó
+que una petición a un servidor recibía la cookie de sesión de otro
+servidor anterior, sin relación alguna. Arreglado quitando esa
+"adivinanza" por completo — el envoltorio solo actúa cuando el propio
+test ya trae una cookie explícita, nunca inventa una.
+
+Verificado, tras el arreglo, con 7 tests dedicados: la cookie `wcsrf`
+existe y no es `HttpOnly` (a diferencia de `wsid`); la primera petición
+de una sesión nueva no exige el token; una segunda petición sin el
+token da `403`; una segunda petición con un token **incorrecto**
+también da `403` (no basta con mandar cualquier cosa); con el token
+correcto, la sesión existente acumula estado con normalidad; `GET`
+nunca exige el token (solo las escrituras); y `PUT`/`DELETE` lo exigen
+igual que `POST`.
+
+### Un hueco real que casi se queda sin cerrar: el propio `bundle.js` nunca mandaba el token
+
+Todo lo anterior aseguraba el lado del **servidor** — pero el código de
+**cliente** generado (`postFnStub`, la función que se genera para cada
+`post`/`put`/`delete function` llamable desde un `visual`) seguía
+mandando `fetch()` sin la cabecera nueva. Sin arreglar esto, **cualquier
+aplicación real** generada por WebScript habría quedado rota en cuanto
+la sesión dejara de ser nueva — el propio código que WebScript genera
+habría chocado contra su propia protección.
+
+Arreglado añadiendo un `__wsGetCsrfToken()` al `bundle.js`, generado
+solo si hace falta (mismo criterio que el resto de *helpers*
+condicionales): lee `document.cookie`, extrae `wcsrf`, y el
+`postFnStub` la manda como `X-WebScript-CSRF` en cada llamada.
+
+Verificado de la forma más estricta posible: no solo revisando el texto
+generado, sino **ejecutando el `bundle.js` real** dentro de un `vm` de
+Node, con `document.cookie` conteniendo el valor real que un servidor
+real acababa de mandar, interceptando `fetch()` para confirmar que la
+cabecera que de verdad se manda coincide exactamente con el token real
+de esa sesión — no una prueba de humo, una ejecución completa del
+código compilado tal cual saldría a producción.
+
+## Seguridad: límite de tasa (*rate limiting*) por IP
+
+Segunda pieza de la lista de seguridad priorizada.
+
+```json
+{ "rate-limit-max": 300, "rate-limit-window-ms": 60000 }
+```
+
+- **Ventana fija por IP**, deliberadamente simple (no una ventana
+  deslizante ni un *token bucket*) — suficiente para frenar abuso
+  básico, sin la complejidad de un algoritmo más fino que este proyecto
+  no necesitaba todavía. Al superar `rate-limit-max` peticiones dentro
+  de `rate-limit-window-ms`, responde `429` con `Retry-After` y un
+  mensaje claro, hasta que la ventana se renueva.
+- **`rate-limit-max: 0` desactiva el límite por completo** — para quien
+  prefiera ponerlo delante, en un *proxy* real.
+- Se comprueba **antes que cualquier otra cosa** en cada petición,
+  incluso antes de asignar sesión — un cliente que se pasa del límite
+  no debería ni lograr crear sesiones nuevas sin parar.
+- La IP se obtiene de `X-Forwarded-For` si está presente (detrás de un
+  *proxy* real), o del socket directo si no — mismo criterio que ya se
+  usaba para detectar HTTPS (`x-forwarded-proto`).
+
+Verificado con servidor real: 7 peticiones con límite de 5 dan
+`[200,200,200,200,200,429,429]`; tras esperar a que pase la ventana,
+vuelve a aceptar; con el límite desactivado, ninguna se rechaza; y con
+el valor por defecto (300), un puñado de peticiones normales de un test
+no se ve afectado. Verificado también por CLI real, con `wconfig.json`
+puro, sin pasar nada a mano.
+
+### Límite reconocido en modo `cluster`
+
+Cada *worker* de `cluster-workers` cuenta las peticiones **por su
+cuenta** — no hay ningún contador compartido entre procesos (eso
+necesitaría coordinación real entre ellos, no construida aquí). Con N
+*workers*, el límite **efectivo** para una IP insistente puede llegar a
+ser hasta N veces `rate-limit-max`, no exactamente ese valor. Se
+documenta así, en vez de fingir que el límite configurado es exacto
+también en modo *cluster*.
+
+## `async`/`await` implícito: nunca hace falta escribirlos
+
+Petición directa: eliminar `async`/`await` de `function`/`server
+function`, que el compilador detecte solo dónde hace falta esperar.
+
+```
+function llamarFuera(url)
+    var r = http.get(url, {})
+    return r
+
+server function duplicar(x)
+    return x * 2
+
+post function usar(args)
+    var datos = llamarFuera(args.url)
+    var doble = duplicar(5)
+    return { recibido: datos, doble: doble }
+```
+
+Sin ningún `async`, sin ningún `await`, en ningún sitio. `get`/`post`/
+`put`/`delete`/`ws function` ya eran siempre `async` desde antes de
+esta petición — lo nuevo es que `function`/`server function` dejan de
+necesitar el prefijo, y **ninguna** llamada necesita `await` a mano,
+en ningún cuerpo de función.
+
+### El límite real, señalado antes de construir nada, no descubierto después
+
+Una función que recibe **otra función** como parámetro y la llama no
+puede determinarse en compilación — su color depende de qué le pasen
+en cada sitio donde se invoca, no de su propia definición (demostrado
+con código real antes de empezar). Se cubre igual, apoyándose en una
+propiedad real de JS: `await` sobre un valor que no es una promesa no
+hace nada malo, solo lo resuelve de inmediato. No es "detección" en
+ese caso concreto, es seguridad por si acaso — documentado así, no
+presentado como algo que no es.
+
+### Cómo funciona de verdad: punto fijo sobre el grafo de llamadas, no "marcar todo async"
+
+El primer diseño (compilar **toda** `function`/`server function` como
+`async`, sin excepción) se rompió con un caso real, no hipotético: una
+función genuinamente síncrona, llamada desde una interpolación de
+plantilla (`{calcularConBase(15)}`), mostraba `[object Promise]` en vez
+del valor — las interpolaciones no son un contexto `async`, y estaban
+fuera del alcance acordado para este cambio (se limitó explícitamente a
+cuerpos de función).
+
+Arreglado con un algoritmo de **punto fijo**: empieza por las funciones
+que llaman **directamente** a algo async conocido (`fetch`,
+`http.get`/`post`/`put`/`delete`, `WSON.send`, o a una de las
+HTTP/`ws function`, que siempre lo son), y va propagando — si A llama a
+B y B ya se determinó async, A también lo es — hasta que una vuelta
+entera no añada ninguna función nueva. Así no importa el orden de
+declaración ni las llamadas mutuas. **Solo** las funciones que de
+verdad lo necesitan se compilan `async`; las demás quedan como
+funciones normales, seguras de llamar desde cualquier sitio (una
+interpolación, un valor inicial de `reactive`/`var`/`const`).
+
+Verificado en el texto generado, no solo por ejecución: una función que
+llama a `fetch()` se compila `async function`; una que nunca llama a
+nada asíncrono, `function` a secas — confirmado con una cadena de tres
+funciones (A llama a B llama a C, C usa `fetch()`), las tres
+correctamente marcadas `async` sin importar en qué orden se declararon.
+
+### `WSON.enqueue()` excluido a propósito
+
+Su razón de ser es **no** esperar (*fire-and-forget*) — auto-esperarlo
+rompería justo lo que la función promete. Verificado que sigue
+comportándose así tras este cambio: el resultado real aparece después
+en `WSON.history()`, no de inmediato en la llamada.
+
+### `onclick`, solo `async` cuando de verdad hace falta
+
+Un manejador de evento que llama a una función síncrona se compila
+como `(event) => {...}` normal; uno que llama a algo que sí necesita
+esperar, `async (event) => {...}`, con el `await` insertado solo.
+Verificado ejecutando el `bundle.js` real: un clic síncrono actualiza
+el texto de inmediato; uno asíncrono devuelve una promesa de verdad, y
+el texto se actualiza tras resolverse.
+
+## Seguridad: protección contra reenvío (*replay*) en WSON
+
+Tercera y última pieza de la lista de seguridad priorizada. Antes de
+esto, un mensaje WSON firmado y capturado se podía reenviar tal cual,
+indefinidamente — `WSON.verify()` lo seguía aceptando como válido, sin
+ningún concepto de "frescura".
+
+### Dos capas, no una
+
+**1. Marca de tiempo, firmada JUNTO con el contenido, no aparte.**
+`WSON.send()` ahora firma `content + '.' + timestamp` como una sola
+pieza — si solo se transmitiera la marca al lado, sin firmar, cualquiera
+podría alargar la validez de un mensaje capturado reescribiendo esa
+cabecera sin más, sin tocar la firma en sí.
+`WSON.verify(payload, firma, secreto, marca)` gana un cuarto parámetro
+**obligatorio** — sin él, se rechaza directamente. Fuera de la ventana
+de validez (`wson-replay-window-ms` en `wconfig.json`, 5 minutos por
+defecto), una firma matemáticamente correcta se rechaza igual: la
+frescura importa tanto como la autenticidad.
+
+**2. Detección de duplicados exactos**, para el caso que la marca de
+tiempo por sí sola no cubre: un mensaje reenviado **dentro** de la
+ventana de validez seguiría siendo aceptado si solo se comprobara la
+firma y la frescura. `WSON.parse()` reutiliza `WSON.history()` (sin
+estructura de datos nueva) para comprobar si el `id` de correlación ya
+se recibió antes — si sí, `replayDetected: true`, aunque
+`signatureValid` siga siendo `true` (el mensaje no fue alterado, solo
+repetido).
+
+`WSON.getTimestamp(headers)` se añadió como atajo, análogo a
+`getSignature`.
+
+### Verificado con el ataque real simulado, no solo con las piezas sueltas
+
+Capturado un mensaje real (firma + marca + id), reenviado tal cual:
+primera vez, `signatureValid: true, replayDetected: false`; el mismo
+mensaje exacto, reenviado una segunda vez, `signatureValid: true,
+replayDetected: true` — la firma sigue siendo válida (correctamente,
+no se alteró nada), pero el reenvío se detecta. Una firma con marca de
+tiempo 10 minutos en el pasado (fuera de la ventana por defecto) se
+rechaza aunque sea matemáticamente correcta. Con una ventana muy corta
+configurada (500ms), el mismo mensaje es válido de inmediato y deja de
+serlo tras esperar a que pase — verificado también por CLI real, con
+`wconfig.json` puro, sin pasar nada a mano.
+
+### Ocho tests existentes actualizados, no solo tests nuevos
+
+Cambiar la firma de `WSON.verify()` (marca de tiempo ahora obligatoria)
+rompió ocho tests que ya llamaban a `WSON.verify()` directamente en la
+suite existente — todos localizados y actualizados para pasar la marca
+real, no solo los tests nuevos escritos para esta pieza.
+
+## Librerías CSS externas (Bootstrap y similares): `stylesheets` en `wconfig.json`
+
+Pregunta que lo motivó: "¿se puede usar una librería CSS ya hecha, como
+Bootstrap?" Comprobado antes de asumir nada:
+
+### Lo que ya funcionaba, confirmado con una prueba real
+
+Las clases de Bootstrap (`class="container mt-5"`, `class="btn
+btn-primary"`) **sobreviven perfectamente** en el HTML generado,
+incluida la SSG — WebScript nunca interfiere con nombres de clase
+literales, sean del framework que sean.
+
+### Lo que faltaba, también confirmado con una prueba real, no asumido
+
+No había forma de **cargar** el CSS de Bootstrap en sí: el `<head>`
+generado era fijo, sin ningún `<link>` extra posible, y el compilador
+**solo** descubre archivos `.ws` — cualquier otro archivo en el
+directorio fuente (como un `bootstrap.min.css` copiado a mano) nunca se
+copiaba a `outDir`. Confirmado con una compilación real: el CSS externo
+simplemente desaparecía, no llegaba a ningún sitio.
+
+### La solución: `stylesheets` en `wconfig.json`
+
+```json
+{
+  "stylesheets": [
+    "https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+  ]
+}
+```
+
+Cada URL se inyecta como `<link rel="stylesheet">` en el `<head>`,
+**antes** del CSS propio del proyecto — así el CSS del proyecto puede
+sobreescribir reglas de la librería si hace falta, respetando el orden
+normal de cascada de CSS. Es la forma más directa de empezar (por CDN,
+como recomienda la propia documentación de Bootstrap), sin necesitar
+montar infraestructura de copiado de archivos estáticos.
+
+Verificado de extremo a extremo, con `wconfig.json` real y `site-builder`
+completo (SSG incluida): el `<link>` aparece en el HTML compilado, en el
+orden correcto respecto al CSS propio, y las clases de Bootstrap siguen
+sobreviviendo en el HTML pre-renderizado. También verificado que una URL
+con caracteres especiales (`&`, comillas) se escapa correctamente al
+insertarse en el atributo.
+
+### Un camino de código que se me había vuelto a escapar
+
+`cli.js`'s `build` (un solo archivo) llama a `compile()` **directamente**,
+sin pasar por `buildSite()` — el mismo camino que ya se me había
+escapado antes con `wson-history-route`. Encontrado y arreglado antes de
+dar esto por terminado, no después.
+
+### Honesto sobre el límite real de este entorno
+
+No tengo acceso a red aquí, así que no puedo confirmar que Bootstrap
+**se vea** realmente estilizado al cargar la URL del CDN de verdad — lo
+que sí puedo confirmar, y confirmé, es que el **mecanismo** genera el
+HTML correcto: la URL exacta que configures aparece como `<link>` real,
+en el sitio correcto. Si la URL es válida (y las de un CDN público como
+jsDelivr lo son), el navegador la cargará sin que WebScript tenga que
+hacer nada más.
+
+### Lo que queda pendiente, con el motivo explícito
+
+Servir un archivo CSS **local** (en vez de por CDN) necesitaría además
+copiar archivos estáticos arbitrarios de `srcDir` a `outDir` durante la
+compilación — algo que hoy no existe (el compilador solo descubre
+`.ws`). Es una extensión razonable, pero más grande que lo que se pidió
+aquí — documentado como pendiente, no construido a medias.
+
+## `query()`: la query string en páginas con `render()` — y dos bugs reales encontrados por el camino
+
+Pregunta que lo motivó: "¿se puede obtener la *query string* en un `.ws`
+con `render()`? Si no, habrá que implementar un `query()` similar a
+`params()`." Se comprobó primero, en vez de asumir — y no, no se podía
+de verdad.
+
+### Lo que había antes de esto: roto de una forma real, no solo ausente
+
+La SSR (`renderRouteToHtml`) solo recibía `serverScope` (los valores de
+`server.X`) — nada de la *query string*. Y aunque el código de cliente
+SÍ puede leer `window.location.search` directamente (JS normal, nada
+se lo impide), probarlo confirmó algo peor que "no está documentado":
+**rompe la SSG por completo**. Una página con
+`reactive pagina = new URLSearchParams(window.location.search)...`
+generaba un `<div id="app"></div>` completamente **vacío** — la
+evaluación en tiempo de compilación falla (`window` no existe en Node)
+y cae al *fallback* seguro, perdiendo el pre-renderizado entero, no
+solo esa variable.
+
+### `query()`, con SSR real, no solo un parche de cliente
+
+```
+route("/")
+
+reactive pagina = query().page || "1"
+
+visual v =
+<p>Página: {pagina}</p>
+
+render(
+    v
+)
+```
+
+- **Sin ningún `fetch` asíncrono** — a diferencia de `server.X`, la
+  *query string* ya está disponible de forma síncrona en el navegador,
+  así que el cliente no necesita ningún dato adicional para arrancar.
+- **Pero sí fuerza que la página se renderice fresca en cada
+  petición**, no una vez en tiempo de compilación (SSG) — la *query*
+  cambia entre peticiones, no se puede fijar de antemano. Detectado con
+  la misma lógica que `server.X` (`usesQueryParams`, análoga a
+  `usesServerData`), pero **sin** activar el mecanismo de `fetch` que sí
+  activa `server.X` — son dos cosas separadas a propósito.
+- **Convive sin problema con `server.X`** en la misma página —
+  verificado con las dos cosas a la vez, ambas pre-renderizadas
+  correctamente en la misma petición.
+
+Verificado de extremo a extremo con servidor real: tres peticiones con
+distinto `?page=N`, cada una con el HTML pre-renderizado reflejando el
+valor **real** de esa petición concreta — no el mismo valor fijo, no
+algo que solo aparece tras cargar el JS del cliente. Y confirmado que la
+hidratación del cliente coincide exactamente con lo que la SSR ya había
+renderizado, sin parpadeo.
+
+### Bug real #1: `const` nunca se evaluaba en la SSR
+
+Revisando el mismo bloque de `renderRouteToHtml` para añadir `query()`,
+apareció algo que llevaba roto desde que se implementó `const`: los
+`const` globales **nunca se evaluaban** en el `scope` de SSR. Cualquier
+plantilla que usara una `const` fallaba en el pre-renderizado (con un
+literal tan simple como `const pi = 3.14`, sin ninguna razón real para
+no poder evaluarse) y caía al *fallback* vacío. Arreglado en el mismo
+lugar, con su propio test.
+
+### Bug real #2: un hueco de detección compartido, encontrado por mi propia prueba
+
+Al probar `query()` con `reactive pagina = query()...` (no `var`), la
+llamada se generó en el `bundle.js`, pero la función `query()` **nunca
+se definió** — `ReferenceError` real al ejecutar. Causa: la colección
+de "cuerpos de cliente a revisar" para decidir qué *helpers*
+condicionales generar (`usesQueryClient`, y también `WSON.send()`/
+`enqueue()`, que comparten la misma colección) **no incluía los `init`
+de `reactive`/`const` globales, ni las `reactive`/`var` locales dentro
+de un `visual`** — solo `var` globales, funciones y plantillas.
+Arreglado de raíz, cerrando el mismo riesgo para `WSON.send()` de paso
+(nunca confirmado como roto ahí, pero con el mismo hueco estructural).
+
+## `const`/`server const`: valores fijos, con inmutabilidad real, no simulada
+
+Petición directa: constantes que no se puedan reasignar y que nunca
+puedan ser reactivas.
+
+```
+const pi = 3.14
+server const tasa = 0.21
+```
+
+- **Compilan a un `const` real de JS**, no a un `let` — reasignarlas
+  **no es algo que WebScript detecte y rechace a mano**, es un
+  `TypeError: Assignment to constant variable.` que lanza el propio
+  motor de JavaScript. Verificado ejecutando de verdad, no solo
+  compilando: un clic real que intenta reasignar una `const` de cliente
+  lanza el error; una petición HTTP real que intenta reasignar una
+  `server const` responde `500` con ese mismo mensaje — y el proceso
+  **sigue vivo** para el resto de peticiones, la misma resiliencia que
+  ya teníamos para cualquier `server.js` roto.
+- **Nunca pueden ser reactivas** — no existe `const reactive`, son dos
+  conceptos que no tiene sentido combinar (una nunca cambia; la otra
+  existe precisamente para que algo sí pueda cambiar y disparar
+  re-render). Al ser una palabra clave completamente aparte de
+  `reactive`, no hace falta ninguna validación para impedir la
+  combinación — sencillamente no existe la sintaxis para escribirla.
+- **`server const` exige un valor inicial** — a diferencia de `server
+  var`/`server reactive` (que sí pueden arrancar en `undefined`), una
+  constante sin valor nunca podría recibir uno después, así que se
+  quedaría permanentemente indefinida. Rechazado en compilación con un
+  mensaje claro.
+- Todas las validaciones de seguridad existentes (prohibición dentro de
+  un `visual`, código muerto en una ruta solo-backend, referenciar una
+  `server var`/`server const` sin el prefijo `server.`) se extendieron
+  para cubrir también `const`/`server const`, no solo `var`/`reactive`.
+- `watch(unaServerConst)` da un mensaje explicando por qué no tiene
+  sentido: nunca cambia, así que nunca dispararía.
+
+## Parámetros de ruta (`:id`) y `params()`
+
+Petición directa, con un ejemplo concreto:
+
+```
+route("/monedas/:id")
+
+get function obtener(query)
+    const {id} = params()
+    return { moneda: id }
+```
+
+### Cómo funciona el emparejamiento por debajo
+
+Antes, cada ruta se comparaba con la URL entrante por igualdad exacta de
+*string*. Ahora, cada ruta con `:algo` se compila **una sola vez**, al
+arrancar el servidor (no en cada petición), a una expresión regular con
+un grupo de captura por cada segmento `:nombre`. Al llegar una petición:
+primero se prueba coincidencia **exacta** (más barato, y evita
+ambigüedad real); solo si ninguna ruta literal encaja, se prueban los
+patrones dinámicos.
+
+**Las rutas literales ganan siempre sobre las dinámicas que también
+encajarían** — verificado con un caso real: `route("/monedas/:id")` y
+`route("/monedas/nuevo")` a la vez, y una petición a `/monedas/nuevo`
+responde con la ruta literal, nunca interpretándose como `id="nuevo"`.
+
+### `params()`: por qué es una función, no un parámetro más que declarar
+
+El despachador manda los parámetros de la URL como el **último**
+argumento de la llamada, siempre — sin importar cuántos parámetros
+nombrados declare la función (`args`, `args, query`, o ninguno).
+`params()` se genera **dentro** de cada función que la usa (solo si de
+verdad se usa, mismo criterio que `respond()`/`whisper()`), capturando
+ese último argumento vía `arguments` — así no hace falta declarar nada
+extra a mano, ni arriesgarse a que el orden de parámetros existente
+cambie de significado.
+
+Verificado con varios casos reales: dos parámetros en la misma ruta
+(`/tienda/:categoria/:producto`), incluso con una función que no
+declara **ningún** parámetro nombrado; `POST` recibiendo tanto el
+`body` como los parámetros de la URL a la vez; y `params()` en una ruta
+sin ningún `:` devolviendo `{}` en vez de fallar.
+
+### Un hueco real, cerrado antes de que llegara a pasar
+
+Un nombre de parámetro repetido en la misma ruta (`/x/:id/y/:id`)
+perdería el primer valor en silencio — el segundo simplemente pisaría
+al primero dentro del objeto que devuelve `params()`. Rechazado en
+compilación, con el mismo criterio de siempre: mejor un error claro
+aquí que un dato perdido sin ningún aviso.
+
+### Detalle técnico menor, pero real
+
+`:` no es válido en nombres de archivo en todos los sistemas (Windows,
+en particular) — el nombre de archivo generado para `/monedas/:id`
+sanea los dos puntos a `_` (`monedas/_id.server.js`), sin afectar en
+nada al patrón real de la ruta usado para el emparejamiento.
+
+## `cluster-workers`: varios procesos Node reales, con sesiones pegajosas
+
+Motivado por una idea larga de discutir: repartir peticiones entre
+varios procesos para usar varios núcleos de verdad. El camino hasta
+llegar aquí importa tanto como el resultado — se descartaron por el
+camino un array de puertos con reparto al azar (reinventaba, peor, lo
+que `cluster` ya hace solo) y `worker_threads` para el servidor entero
+(necesitaría serializar estado de sesión arbitrario a binario, mucho
+más grande de construir que lo que hacía falta).
+
+```json
+{ "cluster-workers": 4 }
+```
+
+```
+node src/cli.js serve mi-proyecto --out dist
+```
+
+Con `cluster-workers > 1`, un proceso "frontal" escucha el puerto
+público y reenvía cada petición a uno de N procesos *worker* reales
+(`cluster.fork()`), cada uno un clon completo del sitio, escuchando en
+su propio puerto interno (nunca expuesto). Con `cluster-workers: 1` (o
+sin especificarlo), cero coste — arranca exactamente igual que siempre.
+
+### Sesiones pegajosas — el porqué, no solo el qué
+
+Cada *worker* tiene su propia memoria, separada de los demás — el
+estado de una sesión (`server var`/`server reactive`) solo vive en
+**uno** de ellos. Si dos peticiones de la misma sesión cayeran en
+*workers* distintos, verían estados desincronizados. La solución: la
+**misma** cookie de sesión **siempre** llega al **mismo** *worker* — no
+al azar, no por turnos.
+
+### Bug real encontrado y arreglado antes de dar esto por bueno
+
+La primera implementación fallaba de una forma sutil, verificada
+concretamente: `[1, 1, 2, 3, 4]` en vez de `[1, 2, 3, 4, 5]` en peticiones
+consecutivas de la misma sesión. Causa: la **primera** petición (sin
+cookie todavía) se reparte por turnos, sin relación con el *hash* de la
+cookie que ese *worker* generará después — así que la **segunda**
+petición, calculando el *worker* solo por *hash*, caía en uno distinto
+al que de verdad creó la sesión. Arreglado con una tabla real
+(`sesión → worker`), construida sobre la marcha: al ver la cabecera
+`Set-Cookie` de una sesión nueva, el *frontal* recuerda explícitamente
+qué *worker* la creó, en vez de fiarlo todo al *hash*.
+
+Verificado tras el arreglo, con servidor real: una sesión con 6
+peticiones seguidas, secuencia exacta `[1,2,3,4,5,6]`; seis sesiones
+distintas simultáneas, cada una consistente por separado
+(`[1,2,3]` las seis); y que `cluster-workers: 1` sigue sin ningún
+proceso ni proxy de más.
+
+### Límite reconocido
+
+La tabla de asignación sesión→*worker* vive en el proceso *frontal*, con
+un tope simple (100000 entradas) para no crecer sin límite — pero, como
+el resto de límites de este tipo en el proyecto, no hay una estrategia
+de expiración más fina (por tiempo, por ejemplo) todavía.
+
+## `wconfig.json`: configuración opcional del proyecto
+
+Propuesta directa: un archivo de configuración, buscado junto a los
+`.ws` del proyecto.
+
+```json
+{
+  "http-port": 3000,
+  "ws-port": 3001,
+  "allow-acorn": true,
+  "wson-history-route": null,
+  "cluster-workers": 1,
+  "stylesheets": [],
+  "rate-limit-max": 300,
+  "rate-limit-window-ms": 60000,
+  "wson-replay-window-ms": 300000
+}
+```
+
+- **`http-port`** — puerto por defecto del servidor HTTP. Precedencia:
+  `--port` explícito en el CLI > `http-port` de `wconfig.json` > `3000`
+  si no hay ninguno de los dos. Verificado con los tres casos reales,
+  arrancando el servidor de verdad por CLI, no solo llamando a la
+  función suelta.
+- **`ws-port`** — reservado para cuando se implemente WebSocket. Se
+  valida y se guarda, pero no hace nada todavía — documentado así a
+  propósito, para no fingir una capacidad que no existe.
+- **`allow-acorn`** — `false` fuerza el motor de respaldo por regex
+  aunque Acorn esté instalado. Verificado con Acorn simulado como
+  instalado (ya que este entorno no lo tiene) que el interruptor sí lo
+  desactiva de verdad.
+- **`wson-history-route`** — ruta configurable para el historial de WSON
+  (ver sección de `WSON.history()` más arriba), en vez de la ubicación
+  por defecto junto al `server.js`. Relativa se resuelve contra el
+  directorio del `server.js`; absoluta se usa tal cual. Verificado
+  escribiendo de verdad en la ruta configurada, con un servidor real.
+- **`cluster-workers`** — `1` por defecto (sin *clustering*, comportamiento
+  de siempre). Con más de `1`, arranca varios procesos Node reales con
+  sesiones pegajosas — ver sección dedicada más arriba.
+
+Sin `wconfig.json`, todo sigue funcionando exactamente igual que antes
+— es completamente opcional. Si el archivo **existe** pero está mal
+escrito (JSON inválido, clave desconocida, tipo equivocado), se
+**rechaza con un error claro**, señalando la clave concreta y las
+válidas — nunca se ignora en silencio, para que un error de escritura
+en la configuración no se traduzca en un comportamiento equivocado sin
+ningún aviso.
+
+### Un camino de código que se había quedado descolgado, encontrado revisando la integración
+
+`run <archivo.ws> --serve` (un solo archivo, no un directorio) no pasa
+por `serveSite()` — tiene su propia llamada directa a `startServer()`.
+Al conectar la precedencia de puerto en `serveSite()`, este otro camino
+se habría quedado sin la misma lógica si no se hubiera revisado
+explícitamente. Detectado probando ese camino concreto por CLI real
+(no solo los otros tres), y corregido para que aplique la misma
+precedencia.
+
 ## `WSON.history()` reinventado: fichero real (JSONL), no memoria — con un bug real encontrado en el proceso
 
 Encargo directo: rediseñar `WSON.history()` para que vuelque a un
@@ -2378,7 +3322,7 @@ En el receptor, un solo punto de entrada en vez de tres pasos sueltos
 (leer cabeceras a mano + `WSON.verify()` + `WSON.showContent()`):
 ```
 post function recibir(args, query, headers)
-    var msg = WSON.parse(args, headers, "clave-compartida")
+    server wson msg = WSON.parse(args, headers, "clave-compartida")
     // msg.from, msg.id, msg.content (ya verificado y descifrado si hacía falta), msg.signatureValid
 ```
 
@@ -3261,8 +4205,8 @@ secciones narrativas de cada ronda:
   pensado pero **no implementado**: necesitaría conectar un servicio
   real (SMTP, o una API tipo Twilio/SendGrid) con credenciales, algo que
   no se puede construir ni probar sin red en este entorno. `via` rechaza
-  en compilación cualquier valor que no sea `POST`/`PUT`/`DELETE`, con
-  el motivo explicado en el propio mensaje.
+  en compilación cualquier valor que no sea `POST`/`PUT`/`DELETE`/`SOCKET`,
+  con el motivo explicado en el propio mensaje.
 - **Sin protección contra reenvío (*replay*)** — un atacante que capture
   un mensaje válido y firmado podría reenviarlo tal cual, y
   `WSON.verify()` lo aceptaría de nuevo, porque la firma sigue siendo
@@ -3273,7 +4217,9 @@ secciones narrativas de cada ronda:
   en memoria anterior (que tenía un tope de 1000 entradas), la versión
   en fichero no tiene ninguno. En un proceso muy longevo con mucho
   tráfico, el fichero puede crecer indefinidamente — no hay rotación de
-  *logs* implementada.
+  *logs* implementada. La **ubicación** del fichero sí es configurable
+  (`wson-history-route` en `wconfig.json`, ver sección dedicada), pero
+  eso no resuelve el crecimiento en sí, solo dónde crece.
 - **Sin publicación/suscripción ni *broker* real** — `WSON.send()` sigue
   siendo punto-a-punto (una URL concreta por mensaje, o varias en
   paralelo con un array), no un modelo de "temas" con varios

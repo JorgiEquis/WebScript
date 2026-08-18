@@ -36,6 +36,12 @@
         "language": "webscript",
         "path": "./snippets/webscript.json"
       }
+    ],
+    "jsonValidation": [
+      {
+        "fileMatch": "wconfig.json",
+        "url": "./schemas/wconfig.schema.json"
+      }
     ]
   }
 }

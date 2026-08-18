@@ -339,40 +339,57 @@ describe('function (cliente) -- equivalente a server function, cuerpo en varias 
   });
 });
 
-describe('async opcional en function/server function; watch() siempre async', () => {
-  test('async function se parsea con isAsync=true, function normal con isAsync=false', () => {
-    const ast1 = parseSource('async function llamar(url)\n    var r = await fetch(url)\n    return r');
-    assert.equal(ast1.body[0].isAsync, true);
-    const ast2 = parseSource('function duplicar(x)\n    return x * 2');
-    assert.equal(ast2.body[0].isAsync, false);
+describe('async/await implícito en function/server function: la palabra clave "async" ya no existe, "await" nunca hace falta escribirlo', () => {
+  test('"async function"/"async server function" se rechazan en compilación, con un mensaje que explica el porqué', () => {
+    assert.throws(
+      () => parseSource('async function llamar(url)\n    var r = await fetch(url)\n    return r'),
+      /"async" ya no hace falta delante de "function"/
+    );
+    assert.throws(
+      () => parseSource('async server function consultar()\n    var r = await http.get("x", {})\n    return r'),
+      /"async" ya no hace falta delante de "server function"/
+    );
   });
 
-  test('async server function se parsea con isAsync=true, server function normal con isAsync=false', () => {
-    const ast1 = parseSource('async server function consultar()\n    var r = await http.get("x", {})\n    return r');
-    assert.equal(ast1.body[0].isAsync, true);
+  test('"function"/"server function" normales se parsean bien, sin ningún campo isAsync (ya no existe esa distinción)', () => {
+    const ast1 = parseSource('function duplicar(x)\n    return x * 2');
+    assert.equal(ast1.body[0].type, 'FunctionDecl');
+    assert.equal('isAsync' in ast1.body[0], false);
+
     const ast2 = parseSource('server function duplicar(x)\n    return x * 2');
-    assert.equal(ast2.body[0].isAsync, false);
+    assert.equal(ast2.body[0].type, 'ServerFunctionDecl');
+    assert.equal('isAsync' in ast2.body[0], false);
+  });
+
+  test('"await" dentro de function/server function normales -- ya no hace falta declarar nada especial, se acepta tal cual', () => {
+    const ast = parseSource('server function consultar()\n    var r = await http.get("x", {})\n    return r');
+    assert.doesNotThrow(() => ast);
   });
 });
 
-describe('WSON: bloque -> clave: valor como valor inicial de reactive/var/server var/server reactive', () => {
-  test('server var con bloque WSON se sintetiza como objeto literal', () => {
-    const src = 'server var message = "Hola"\n\nserver var sender =\n    -> from: "yo"\n    -> to: "/x"\n    -> via: "POST"\n    -> content: message';
+describe('WSON: "wson"/"server wson" tienen su propia palabra clave dedicada, no un mecanismo genérico en reactive/var', () => {
+  test('server wson con bloque -> se sintetiza como objeto literal', () => {
+    const src = 'server var message = "Hola"\n\nserver wson sender =\n    -> from: "yo"\n    -> to: "/x"\n    -> via: "POST"\n    -> content: message';
     const ast = parseSource(src);
     const sender = ast.body[1];
-    assert.equal(sender.type, 'ServerVarDecl');
-    assert.equal(sender.init, '{ from: "yo", to: "/x", via: "POST", content: message }');
+    assert.equal(sender.type, 'ServerWsonDecl');
+    assert.equal(sender.fields.find(f => f.key === 'content').value, 'message');
   });
 
-  test('funciona igual en reactive/var/server reactive, no solo server var', () => {
+  test('reactive/var/server reactive con un bloque "-> clave: valor" ya NO se reconoce -- ese mecanismo genérico se eliminó (era un fallo de seguridad real: "secret" colaba sin la validación de wson/server wson)', () => {
     const src1 = 'reactive sender =\n    -> to: "/x"\n    -> content: "hola"';
-    assert.match(parseSource(src1).body[0].init, /to: "\/x"/);
+    assert.throws(() => parseSource(src1), /se esperaba "reactive \[tipo\] NOMBRE = valor"/);
 
     const src2 = 'var sender =\n    -> to: "/x"\n    -> content: "hola"';
-    assert.match(parseSource(src2).body[0].init, /to: "\/x"/);
+    assert.throws(() => parseSource(src2), /se esperaba "var \[tipo\] NOMBRE = valor"/);
 
     const src3 = 'server reactive sender =\n    -> to: "/x"\n    -> content: "hola"';
-    assert.match(parseSource(src3).body[0].init, /to: "\/x"/);
+    assert.throws(() => parseSource(src3), /se esperaba "server var NOMBRE", "server reactive NOMBRE"/);
+  });
+
+  test('bug real cerrado: "secret" ya no puede colarse en un var de CLIENTE por el mecanismo genérico viejo', () => {
+    const src = 'var x =\n    -> to: "http://x"\n    -> content: 1\n    -> secret: "esto-se-veria-en-el-navegador"\n\nvisual v =\n<p>x</p>\n\nrender(\n    v\n)';
+    assert.throws(() => parseSource(src)); // ya no compila -- "secret" nunca llega ni siquiera a evaluarse como campo WSON
   });
 
   test('sin bloque WSON (una sola línea normal), sigue funcionando exactamente igual que antes', () => {
@@ -388,5 +405,70 @@ describe('WSON: bloque -> clave: valor como valor inicial de reactive/var/server
   test('WSON dentro de un cuerpo de función -- rechazado, no genera JS roto', () => {
     const src = 'route("/x")\n\npost function f(args)\n    var sender =\n        -> to: "/x"\n        -> content: "hola"\n    return {}';
     assert.throws(() => parseSource(src), /contiene algo que parece un bloque WSON/);
+  });
+});
+
+describe('WSON: segunda forma "wson NOMBRE = expresión" -- para cuando el valor YA es un WSON en tiempo de ejecución, no un literal', () => {
+  test('server wson con expresión, a nivel de archivo', () => {
+    const ast = parseSource('route("/x")\n\nserver wson msg = { to: "http://x", content: 1 }\n\npost function f(args)\n    return msg');
+    const decl = ast.body.find(n => n.type === 'ServerWsonDecl');
+    assert.equal(decl.fields, null);
+    assert.equal(decl.init, '{ to: "http://x", content: 1 }');
+  });
+
+  test('wson con expresión, a nivel de archivo (cliente)', () => {
+    const ast = parseSource('wson msg = construirWson()\n\nvisual v =\n<p>x</p>\n\nrender(\n    v\n)');
+    const decl = ast.body.find(n => n.type === 'WsonDecl');
+    assert.equal(decl.init, 'construirWson()');
+  });
+
+  test('el caso real que motivó esto: "server wson msg = WSON.parse(...)" DENTRO de un post function', () => {
+    const src = 'route("/x")\n\npost function recibir(args, query, headers)\n    server wson msg = WSON.parse(args, headers, "clave")\n    return { from: msg.from }';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('bug real encontrado y arreglado: sin desazucarar, "wson"/"server" dentro de una función colaban literal y rompían el JS generado', () => {
+    const { compile } = require('../src/compiler');
+    const ast = parseSource('route("/x")\n\npost function recibir(args, query, headers)\n    server wson msg = WSON.parse(args, headers, "clave")\n    return { from: msg.from }');
+    const { server } = compile(ast, { routePath: '/' });
+    assert.doesNotMatch(server, /\bserver wson msg\b/, 'no debe quedar "server wson" literal en el JS generado');
+    assert.match(server, /let msg = WSON\.parse\(/, 'debe haberse reescrito a un "let" normal');
+    assert.doesNotThrow(() => new Function(server.replace(/^module\.exports.*$/m, '')));
+  });
+
+  test('bug de seguridad real, ya cerrado: "secret" ya no puede colarse en un wson de CLIENTE usando la segunda forma tampoco', () => {
+    const src = 'wson msg =\n    -> to: "http://x"\n    -> content: 1\n    -> secret: "malo"\n\nvisual v =\n<p>x</p>\n\nrender(\n    v\n)';
+    assert.throws(() => parseSource(src), /solo tiene sentido en "server wson"/);
+  });
+
+  test('la validación de "no referenciar server var desde cliente" sigue aplicando en la segunda forma', () => {
+    const src = 'server var secreto = 1\n\nwson msg = { to: "http://x", content: secreto }\n\nvisual v =\n<p>x</p>\n\nrender(\n    v\n)';
+    assert.throws(() => parseSource(src), /referencia "secreto"/);
+  });
+});
+
+describe('ws function: parseo, y solo una por archivo', () => {
+  test('parsea correctamente, igual que las cuatro HTTP', () => {
+    const ast = parseSource('route("/chat")\n\nws function entradaWS(args)\n    return { eco: args.mensaje }');
+    const decl = ast.body.find(n => n.type === 'WsFunctionDecl');
+    assert.equal(decl.name, 'entradaWS');
+    assert.equal(decl.params, 'args');
+  });
+
+  test('dos "ws function" en el mismo archivo -- rechazado, mismo criterio que post/put/delete/get', () => {
+    const src = 'route("/x")\n\nws function a(args)\n    return {}\n\nws function b(args)\n    return {}';
+    assert.throws(() => parseSource(src), /Solo puede haber una "ws function" por archivo/);
+  });
+});
+
+describe('WSON via:"socket" -- validación', () => {
+  test('"via: socket" es un valor aceptado, no rechazado', () => {
+    const src = 'server wson msg =\n    -> to: "ws://localhost:9999/x"\n    -> via: "socket"\n    -> content: 1';
+    assert.doesNotThrow(() => parseSource(src));
+  });
+
+  test('un verbo inventado sigue rechazándose, con el mensaje actualizado mencionando SOCKET', () => {
+    const src = 'server wson msg =\n    -> to: "http://x"\n    -> via: "PATCH"\n    -> content: 1';
+    assert.throws(() => parseSource(src), /POST.*PUT.*DELETE.*SOCKET/);
   });
 });

@@ -98,12 +98,17 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parseGetFunction(lines, i);
       body.push(r.node);
       i = r.next;
-    } else if (trimmed.startsWith('async server function ')) {
-      const r = parseServerFunction(lines, i, true);
+    } else if (trimmed.startsWith('ws function ')) {
+      const r = parseWsFunction(lines, i);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('async server function ')) {
+      throw new SyntaxError(
+        `Línea ${lines[i].num}: "async" ya no hace falta delante de "server function" -- toda "server function"/` +
+        `"function" puede usar await (o llamar a otra que lo necesite) sin declarar nada especial. Quita "async " y usa "server function" a secas.`
+      );
     } else if (trimmed.startsWith('server function ')) {
-      const r = parseServerFunction(lines, i, false);
+      const r = parseServerFunction(lines, i);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('server wson ')) {
@@ -126,12 +131,17 @@ function parseProgram(source, filePath = null, resolving = new Set()) {
       const r = parseVarDecl(lines, i);
       body.push(r.node);
       i = r.next;
-    } else if (trimmed.startsWith('async function ')) {
-      const r = parseFunctionDecl(lines, i, true);
+    } else if (trimmed.startsWith('const ')) {
+      const r = parseConst(lines, i);
       body.push(r.node);
       i = r.next;
+    } else if (trimmed.startsWith('async function ')) {
+      throw new SyntaxError(
+        `Línea ${lines[i].num}: "async" ya no hace falta delante de "function" -- toda "function"/"server function" ` +
+        `puede usar await (o llamar a otra que lo necesite) sin declarar nada especial. Quita "async " y usa "function" a secas.`
+      );
     } else if (trimmed.startsWith('function ')) {
-      const r = parseFunctionDecl(lines, i, false);
+      const r = parseFunctionDecl(lines, i);
       body.push(r.node);
       i = r.next;
     } else if (trimmed.startsWith('wson ')) {
@@ -299,6 +309,19 @@ function parseRoute(lines, i) {
   if (!routePath.startsWith('/')) {
     throw new SyntaxError(`Línea ${lines[i].num}: la ruta debe empezar con "/", recibido "${routePath}"`);
   }
+  // Nombres de parámetro (":id") repetidos en la misma ruta ("/x/:id/y/:id") perderían
+  // el primer valor en silencio -- el segundo simplemente pisaría al primero en el
+  // objeto que devuelve params(). Se rechaza en compilación, con el mismo criterio de
+  // siempre: mejor un error claro aquí que un dato perdido sin ningún aviso.
+  const paramNames = routePath.split('/').filter(seg => seg.startsWith(':')).map(seg => seg.slice(1));
+  const dupParam = paramNames.find((p, idx) => paramNames.indexOf(p) !== idx);
+  if (dupParam) {
+    throw new SyntaxError(
+      `Línea ${lines[i].num}: la ruta "${routePath}" repite el parámetro ":${dupParam}" -- ` +
+      `cada nombre de parámetro debe ser único dentro de la misma ruta (si no, el segundo ` +
+      `pisaría al primero en silencio dentro de params()).`
+    );
+  }
   return { node: { type: 'RouteDecl', path: routePath, line: lines[i].num }, next: i + 1 };
 }
 
@@ -315,38 +338,7 @@ function parseRoute(lines, i) {
 // cualquiera cuyo valor inicial resulta ser un objeto.
 // Devuelve null si esta línea no es un bloque WSON (para que el llamador siga con el
 // parseo normal de una sola línea).
-function tryParseWsonBlock(lines, i, headerRe) {
-  const header = lines[i].text.trim().match(headerRe);
-  if (!header) return null;
-  const baseIndent = lines[i].indent;
-
-  let j = i + 1;
-  const props = [];
-  while (j < lines.length) {
-    if (isBlank(lines[j])) { j++; continue; }
-    if (lines[j].indent <= baseIndent) break;
-    const t = lines[j].text.trim();
-    if (!t.startsWith('->')) break;
-    const propMatch = t.slice(2).trim().match(/^([A-Za-z_$][\w$]*)\s*:\s*(.+)$/);
-    if (!propMatch) throw new SyntaxError(`Línea ${lines[j].num}: propiedad WSON inválida -> "${t}"`);
-    props.push(`${propMatch[1].trim()}: ${propMatch[2].trim()}`);
-    j++;
-  }
-
-  if (props.length === 0) return null; // "NOMBRE =" sin nada detrás NI -> debajo -- no es WSON, es un error normal de "falta el valor"
-
-  return { header, init: `{ ${props.join(', ')} }`, next: j };
-}
-
 function parseReactive(lines, i) {
-  const headerRe = /^reactive\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*$/;
-  const wson = tryParseWsonBlock(lines, i, headerRe);
-  if (wson) {
-    return {
-      node: { type: 'ReactiveDecl', name: wson.header[2], init: wson.init, varType: wson.header[1] || null, line: lines[i].num },
-      next: wson.next,
-    };
-  }
   const m = lines[i].text.trim().match(/^reactive\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+)$/);
   if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "reactive [tipo] NOMBRE = valor"`);
   return {
@@ -358,18 +350,25 @@ function parseReactive(lines, i) {
 // var [tipo] NAME = EXPR -- NO reactivo: se calcula una sola vez, no re-renderiza nada
 // al cambiar. Mismo tipado opcional que "reactive".
 function parseVarDecl(lines, i) {
-  const headerRe = /^var\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*$/;
-  const wson = tryParseWsonBlock(lines, i, headerRe);
-  if (wson) {
-    return {
-      node: { type: 'VarDecl', name: wson.header[2], init: wson.init, varType: wson.header[1] || null, line: lines[i].num },
-      next: wson.next,
-    };
-  }
   const m = lines[i].text.trim().match(/^var\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+)$/);
   if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "var [tipo] NOMBRE = valor"`);
   return {
     node: { type: 'VarDecl', name: m[2], init: m[3].trim(), varType: m[1] || null, line: lines[i].num },
+    next: i + 1,
+  };
+}
+
+// const [tipo] NAME = EXPR -- como "var", pero además INMUTABLE: se compila a un
+// "const" real de JS, no a un "let" -- reasignarla es un error de JS de verdad
+// (comprobado más abajo, no solo documentado), no algo que WebScript deba rastrear a
+// mano. Nunca puede ser "reactive" -- no existe "const reactive", son dos conceptos
+// que no tiene sentido combinar (una nunca cambia, la otra existe precisamente para
+// que algo SÍ pueda cambiar y disparar re-render).
+function parseConst(lines, i) {
+  const m = lines[i].text.trim().match(/^const\s+(?:(string|number|boolean)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+)$/);
+  if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "const [tipo] NOMBRE = valor"`);
+  return {
+    node: { type: 'ConstDecl', name: m[2], init: m[3].trim(), varType: m[1] || null, line: lines[i].num },
     next: i + 1,
   };
 }
@@ -408,6 +407,15 @@ function parseDeleteFunction(lines, i) {
 function parseGetFunction(lines, i) {
   return parseHttpMethodFunction(lines, i, 'get', 'GetFunctionDecl');
 }
+// ws function NOMBRE(args) -- async, igual que las cuatro HTTP -- corre por cada
+// mensaje que llegue por WebSocket a la ruta de este archivo. "args" es el mensaje
+// entrante ya parseado (JSON.parse), y lo que devuelva se manda de vuelta por la MISMA
+// conexión, como el siguiente mensaje -- mismo patrón mental que post/put/delete
+// (recibe, procesa, responde), adaptado a una conexión persistente en vez de una
+// petición-respuesta de una vez.
+function parseWsFunction(lines, i) {
+  return parseHttpMethodFunction(lines, i, 'ws', 'WsFunctionDecl');
+}
 
 // function NOMBRE(params)
 //     cuerpo...
@@ -417,27 +425,24 @@ function parseGetFunction(lines, i) {
 // compila a bundle.js en vez de server.js. Puede llamarse desde cualquier handler o
 // desde el valor inicial de otra reactive/var (las funciones en JS quedan "hoisted",
 // así que el orden de declaración no importa).
-// function NOMBRE(params) / async function NOMBRE(params)
+// function NOMBRE(params)
 //     cuerpo...
-// "async" es OPCIONAL: por defecto (sin él) sigue siendo síncrona, exactamente como
-// antes -- necesario porque llamarla SIN "await" esperando su valor de vuelta directo
-// es un patrón ya en uso (ej. "duplicar(contador)"), y si fuera async siempre, ese
-// valor pasaría a ser una Promise en vez del valor real. Con "async" delante, sí puede
-// usar "await" dentro (fetch, u otra dependencia asíncrona) -- a cambio, quien la llame
-// tiene que usar "await" también, o recibirá una Promise en vez del valor.
-function parseFunctionDecl(lines, i, isAsync) {
-  const re = isAsync
-    ? /^async\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/
-    : /^function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/;
-  const header = lines[i].text.trim().match(re);
-  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${isAsync ? 'async ' : ''}function NOMBRE(params)"`);
+// Siempre puede usar await dentro (sin "async" delante -- ya no hace falta, no existe
+// esa forma). Toda "function"/"server function" se compila como async por debajo,
+// y toda llamada a otra "function"/"server function" (o a fetch/http.*/WSON.send)
+// lleva su "await" insertado automáticamente por el compilador -- nunca hay que
+// escribirlo a mano. Quien llama nunca necesita preocuparse de si recibe una Promise
+// o el valor directo: siempre recibe el valor ya resuelto.
+function parseFunctionDecl(lines, i) {
+  const header = lines[i].text.trim().match(/^function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "function NOMBRE(params)"`);
   const [, name, params] = header;
   const baseIndent = lines[i].indent;
 
   const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
 
   return {
-    node: { type: 'FunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), isAsync: !!isAsync, line: lines[i].num },
+    node: { type: 'FunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
     next: j,
   };
 }
@@ -448,20 +453,18 @@ function parseFunctionDecl(lines, i, isAsync) {
 // "post function" nunca se expone al cliente: no genera stub, no tiene endpoint HTTP
 // propio, y está prohibida en cualquier "visual" (igual que server var). Solo es
 // llamable desde otro código de servidor -- típicamente desde dentro de una
-// "post function" del mismo archivo.
-function parseServerFunction(lines, i, isAsync) {
-  const re = isAsync
-    ? /^async\s+server\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/
-    : /^server\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/;
-  const header = lines[i].text.trim().match(re);
-  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${isAsync ? 'async ' : ''}server function NOMBRE(params)"`);
+// "post function" del mismo archivo. Igual que "function": siempre puede usar await,
+// sin "async" delante.
+function parseServerFunction(lines, i) {
+  const header = lines[i].text.trim().match(/^server\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*([^)]*)\)\s*$/);
+  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "server function NOMBRE(params)"`);
   const [, name, params] = header;
   const baseIndent = lines[i].indent;
 
   const { bodyLines, next: j } = collectIndentedBody(lines, i + 1, baseIndent);
 
   return {
-    node: { type: 'ServerFunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), isAsync: !!isAsync, line: lines[i].num },
+    node: { type: 'ServerFunctionDecl', name, params: params.trim(), body: bodyLines.join('\n'), line: lines[i].num },
     next: j,
   };
 }
@@ -479,21 +482,21 @@ function parseServerFunction(lines, i, isAsync) {
 function parseServerDecl(lines, i) {
   const t = lines[i].text.trim();
 
-  const reactiveWsonRe = /^server\s+reactive\s+([A-Za-z_$][\w$]*)\s*=\s*$/;
-  const wsonReactive = tryParseWsonBlock(lines, i, reactiveWsonRe);
-  if (wsonReactive) {
+  const constMatch = t.match(/^server\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)$/);
+  if (constMatch) {
+    const [, name, init] = constMatch;
     return {
-      node: { type: 'ServerReactiveDecl', name: wsonReactive.header[1], init: wsonReactive.init, line: lines[i].num },
-      next: wsonReactive.next,
+      node: { type: 'ServerConstDecl', name, init: init.trim(), line: lines[i].num },
+      next: i + 1,
     };
   }
-  const varWsonRe = /^server\s+var\s+([A-Za-z_$][\w$]*)\s*=\s*$/;
-  const wsonVar = tryParseWsonBlock(lines, i, varWsonRe);
-  if (wsonVar) {
-    return {
-      node: { type: 'ServerVarDecl', name: wsonVar.header[1], init: wsonVar.init, line: lines[i].num },
-      next: wsonVar.next,
-    };
+  // "server const NOMBRE" sin "= valor" -- a diferencia de "server var"/"server
+  // reactive" (que sí admiten arrancar en undefined), una constante sin valor inicial
+  // no tiene ningún sentido: nunca podría asignársele uno después, así que se
+  // quedaría permanentemente indefinida -- casi seguro un error, se rechaza en
+  // compilación con un mensaje claro en vez de dejarlo pasar en silencio.
+  if (/^server\s+const\s+([A-Za-z_$][\w$]*)\s*$/.test(t)) {
+    throw new SyntaxError(`Línea ${lines[i].num}: "server const" necesita un valor inicial -- "server const NOMBRE = valor". A diferencia de "server var"/"server reactive", no puede arrancar en undefined (nunca podría asignársele nada después).`);
   }
 
   const reactiveMatch = t.match(/^server\s+reactive\s+([A-Za-z_$][\w$]*)\s*(?:=\s*(.+))?$/);
@@ -510,7 +513,7 @@ function parseServerDecl(lines, i) {
     };
   }
   const m = t.match(/^server\s+var\s+([A-Za-z_$][\w$]*)\s*(?:=\s*(.+))?$/);
-  if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "server var NOMBRE" o "server reactive NOMBRE" (con o sin "= valor")`);
+  if (!m) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "server var NOMBRE", "server reactive NOMBRE" (con o sin "= valor"), o "server const NOMBRE = valor"`);
   const [, name, init] = m;
   return {
     node: {
@@ -577,10 +580,32 @@ function parseStyle(lines, i) {
 // falta llamar a WSON.send(nombre) explícitamente. Mismo patrón exacto que "style"
 // (cabecera con "=" vacío, bindings "->" indentados debajo), reutilizado a propósito
 // para quedar consistente con el resto del lenguaje -- no una sintaxis nueva de cero.
+//
+// SEGUNDA FORMA: "wson NOMBRE = expresión" (todo en una línea, como "var"/"reactive")
+// -- para cuando el valor no es un literal escrito a mano, sino algo que YA es un WSON
+// en tiempo de ejecución, como "server wson msg = WSON.parse(args, headers, secreto)".
+// Sin esto, la única forma de guardar ese resultado habría sido un "var" normal, aunque
+// conceptualmente sí es un WSON -- la palabra clave debe reflejar lo que la variable
+// representa, no solo cómo se construyó.
 function parseWson(lines, i, isServer) {
   const keyword = isServer ? 'server\\s+wson' : 'wson';
-  const header = lines[i].text.trim().match(new RegExp(`^${keyword}\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*$`));
-  if (!header) throw new SyntaxError(`Línea ${lines[i].num}: se esperaba "${isServer ? 'server ' : ''}wson NOMBRE ="`);
+  const t = lines[i].text.trim();
+
+  const exprMatch = t.match(new RegExp(`^${keyword}\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(.+)$`));
+  if (exprMatch) {
+    return {
+      node: { type: isServer ? 'ServerWsonDecl' : 'WsonDecl', name: exprMatch[1], init: exprMatch[2].trim(), fields: null, line: lines[i].num },
+      next: i + 1,
+    };
+  }
+
+  const header = t.match(new RegExp(`^${keyword}\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*$`));
+  if (!header) {
+    throw new SyntaxError(
+      `Línea ${lines[i].num}: se esperaba "${isServer ? 'server ' : ''}wson NOMBRE =" (bloque -> clave: valor debajo) ` +
+      `o "${isServer ? 'server ' : ''}wson NOMBRE = expresión" (ej. el resultado de WSON.parse(...)).`
+    );
+  }
   const baseIndent = lines[i].indent;
   const name = header[1];
   const fields = [];
@@ -589,12 +614,12 @@ function parseWson(lines, i, isServer) {
   while (j < lines.length) {
     if (isBlank(lines[j])) { j++; continue; }
     if (lines[j].indent <= baseIndent) break;
-    const t = lines[j].text.trim();
-    if (!t.startsWith('->')) break;
-    const fieldMatch = t.slice(2).trim().match(/^(from|to|via|content|secret|encrypt|id|retries|retryDelayMs)\s*:\s*(.+)$/);
+    const tt = lines[j].text.trim();
+    if (!tt.startsWith('->')) break;
+    const fieldMatch = tt.slice(2).trim().match(/^(from|to|via|content|secret|encrypt|id|retries|retryDelayMs)\s*:\s*(.+)$/);
     if (!fieldMatch) {
       throw new SyntaxError(
-        `Línea ${lines[j].num}: campo de WSON inválido -> "${t}" -- las únicas claves ` +
+        `Línea ${lines[j].num}: campo de WSON inválido -> "${tt}" -- las únicas claves ` +
         `válidas son "from", "to", "via", "content", "secret", "encrypt", "id", "retries" y "retryDelayMs".`
       );
     }
@@ -615,7 +640,7 @@ function parseWson(lines, i, isServer) {
   }
 
   return {
-    node: { type: isServer ? 'ServerWsonDecl' : 'WsonDecl', name, fields, line: lines[i].num },
+    node: { type: isServer ? 'ServerWsonDecl' : 'WsonDecl', name, fields, init: null, line: lines[i].num },
     next: j,
   };
 }

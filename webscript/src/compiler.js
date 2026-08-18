@@ -2,17 +2,35 @@ const fs = require('fs');
 const path = require('path');
 const jsAnalyzer = require('./js-analyzer');
 
+// "wson NOMBRE = expr" / "server wson NOMBRE = expr", cuando aparecen DENTRO de un
+// cuerpo de función (post/put/delete/get/server function, un manejador onclick={...},
+// o una "function" de cliente) -- por ejemplo, "server wson msg = WSON.parse(...)".
+// "wson"/"server" no son palabras clave de JS -- sin esto, ese texto se colaría literal
+// en el JS generado y reventaría con un SyntaxError real al cargar. Se reescribe a un
+// "let" normal antes de cualquier otra sustitución -- la palabra clave "wson" en este
+// contexto es solo semántica para quien lee el código WebScript, no cambia nada de cómo
+// se compila. Solo cubre la forma de una línea -- el bloque "-> clave: valor" dentro de
+// una función ya se rechaza aparte, en validate.js.
+function desugarLocalWsonDecls(body) {
+  return body
+    .split('\n')
+    .map(line => line.replace(/^(\s*)(?:server\s+)?wson\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)$/, '$1let $2 = $3'))
+    .join('\n');
+}
+
 function compile(ast, options = {}) {
-  const { cssFilename = 'styles.css', jsFilename = 'bundle.js', serverDataUrl = null, routePath = null } = options;
+  const { cssFilename = 'styles.css', jsFilename = 'bundle.js', serverDataUrl = null, routePath = null, wsonHistoryRoute = null, stylesheets = [], wsonReplayWindowMs = 5 * 60 * 1000 } = options;
 
   const reactives = ast.body.filter(n => n.type === 'ReactiveDecl');
   const globalVars = ast.body.filter(n => n.type === 'VarDecl');
+  const globalConsts = ast.body.filter(n => n.type === 'ConstDecl');
   const functions = ast.body.filter(n => n.type === 'FunctionDecl');
   const wsons = ast.body.filter(n => n.type === 'WsonDecl');
   const styles = ast.body.filter(n => n.type === 'StyleDecl');
   const visuals = ast.body.filter(n => n.type === 'VisualDecl');
   const renderCall = ast.body.find(n => n.type === 'RenderCall');
   const serverVars = ast.body.filter(n => n.type === 'ServerVarDecl');
+  const serverConsts = ast.body.filter(n => n.type === 'ServerConstDecl');
   const serverReactives = ast.body.filter(n => n.type === 'ServerReactiveDecl');
   const watchDecls = ast.body.filter(n => n.type === 'WatchDecl');
   const serverFunctions = ast.body.filter(n => n.type === 'ServerFunctionDecl');
@@ -21,6 +39,7 @@ function compile(ast, options = {}) {
   const putFn = ast.body.find(n => n.type === 'PutFunctionDecl') || null;
   const deleteFn = ast.body.find(n => n.type === 'DeleteFunctionDecl') || null;
   const getFn = ast.body.find(n => n.type === 'GetFunctionDecl') || null;
+  const wsFn = ast.body.find(n => n.type === 'WsFunctionDecl') || null;
   // "get" NO se incluye aquí -- compileJS solo genera stubs de cliente para
   // post/put/delete. Una "get function" solo existe en rutas sin render() (validado
   // aparte), que nunca generan bundle.js -- no hay ningún cliente que pudiera llamarla,
@@ -32,9 +51,9 @@ function compile(ast, options = {}) {
   const visualNames = new Set(visuals.map(v => v.name));
 
   const css = compileCSS(styles);
-  const js = compileJS(reactives, globalVars, functions, wsons, visuals, renderCall, globalNames, visualNames, serverDataUrl, httpFns, routePath, styles.map(s => s.name));
-  const html = compileHTML(cssFilename, jsFilename);
-  const server = compileServerJS(serverVars, serverFunctions, serverHttpFns, serverReactives, watchDecls, serverWsons);
+  const js = compileJS(reactives, globalVars, functions, wsons, visuals, renderCall, globalNames, visualNames, serverDataUrl, httpFns, routePath, styles.map(s => s.name), globalConsts);
+  const html = compileHTML(cssFilename, jsFilename, stylesheets);
+  const server = compileServerJS(serverVars, serverFunctions, serverHttpFns, serverReactives, watchDecls, serverWsons, wsonHistoryRoute, serverConsts, wsFn, wsonReplayWindowMs);
 
   return { html, css, js, server };
 }
@@ -45,9 +64,9 @@ function compile(ast, options = {}) {
 function usesServerData(ast) {
   const exprs = [];
   for (const n of ast.body) {
-    if (n.type === 'ReactiveDecl' || n.type === 'VarDecl') exprs.push(n.init);
+    if (n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'ConstDecl') exprs.push(n.init);
     if (n.type === 'FunctionDecl') exprs.push(n.body);
-    if (n.type === 'WsonDecl') { for (const f of n.fields) exprs.push(f.value); }
+    if (n.type === 'WsonDecl') { if (n.fields) { for (const f of n.fields) exprs.push(f.value); } else if (n.init) { exprs.push(n.init); } }
     if (n.type === 'VisualDecl') {
       for (const r of n.localReactives) exprs.push(r.init);
       for (const v of n.localVars) exprs.push(v.init);
@@ -55,6 +74,26 @@ function usesServerData(ast) {
     }
   }
   return exprs.some(e => /\bserver\.[A-Za-z_$][\w$]*/.test(e));
+}
+
+// ¿Este archivo lee la query string de la propia URL vía "query()" en algún sitio
+// (reactive/var globales, locales de un visual, plantillas, onclick, function de
+// cliente)? A diferencia de "server.NOMBRE", esto NO necesita ningún fetch async --
+// la query string ya está disponible de forma síncrona en el navegador -- pero SÍ
+// necesita que el HTML inicial se renderice en el SERVIDOR por petición (no una vez
+// en tiempo de compilación vía SSG), porque la query cambia en cada petición.
+function usesQueryParams(ast) {
+  const exprs = [];
+  for (const n of ast.body) {
+    if (n.type === 'ReactiveDecl' || n.type === 'VarDecl' || n.type === 'ConstDecl') exprs.push(n.init);
+    if (n.type === 'FunctionDecl') exprs.push(n.body);
+    if (n.type === 'VisualDecl') {
+      for (const r of n.localReactives) exprs.push(r.init);
+      for (const v of n.localVars) exprs.push(v.init);
+      collectAllTemplateExprs(n.template, exprs);
+    }
+  }
+  return exprs.some(e => /\bquery\s*\(/.test(e));
 }
 
 function collectAllTemplateExprs(node, exprs) {
@@ -84,7 +123,7 @@ function collectAllTemplateExprs(node, exprs) {
 // a nivel de módulo. Cada sesión (identificada por cookie en el servidor HTTP) llama a
 // createSessionState() UNA vez y se queda con su propia instancia -- así dos visitantes
 // nunca comparten el mismo "let totalConIva", cada uno tiene la suya.
-function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverReactives = [], watchDecls = [], serverWsons = []) {
+function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverReactives = [], watchDecls = [], serverWsons = [], wsonHistoryRoute = null, serverConsts = [], wsFn = null, wsonReplayWindowMs = 5 * 60 * 1000) {
   const { post: postFn = null, put: putFn = null, delete: deleteFn = null, get: getFn = null } = httpFns;
   const allHttpFns = [
     ['get', 'GET', getFn],
@@ -93,17 +132,45 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     ['delete', 'DELETE', deleteFn],
   ].filter(([, , fn]) => fn);
 
-  if (serverVars.length === 0 && serverFunctions.length === 0 && allHttpFns.length === 0 && serverReactives.length === 0 && serverWsons.length === 0) return null;
+  if (serverVars.length === 0 && serverConsts.length === 0 && serverFunctions.length === 0 && allHttpFns.length === 0 && serverReactives.length === 0 && serverWsons.length === 0 && !wsFn) return null;
 
   const serverReactiveNames = serverReactives.map(d => d.name);
 
   // Sustituye referencias sueltas a nombres "server reactive" por acceso a través del
   // Proxy __serverReactive -- necesario para que asignarlas (x = ...) dispare los
-  // watch() registrados. Las "server var" normales NO se tocan -- siguen siendo
-  // variables "let" normales, nadie las observa, no necesitan Proxy.
+  // watch() registrados. Las "server var"/"server const" normales NO se tocan -- siguen
+  // siendo variables "let"/"const" normales, nadie las observa, no necesitan Proxy.
+  // NO inserta await -- para eso está substituteReactiveRefsInFunctionBody, más abajo.
+  // Se usa para valores iniciales (server const, server wson de una expresión), que se
+  // evalúan a nivel superior de createSessionState() -- una función normal, NO async;
+  // insertar await ahí sería un SyntaxError real (confirmado con un bug real
+  // encontrado así: una interpolación de plantilla en el cliente tenía el mismo
+  // problema, ver compileJS).
   function substituteReactiveRefs(body) {
-    if (serverReactiveNames.length === 0) return body;
-    return injectVars(body, serverReactiveNames, '__serverReactive');
+    const desugared = desugarLocalWsonDecls(body);
+    if (serverReactiveNames.length === 0) return desugared;
+    return injectVars(desugared, serverReactiveNames, '__serverReactive');
+  }
+
+  // Determina, con punto fijo, cuáles "server function" de verdad necesitan
+  // compilarse como "async" -- las 4 HTTP y la ws function SIEMPRE lo son (eso no
+  // cambia), y sirven de semilla: si una "server function" llama a una de ellas, o a
+  // fetch/http.*/WSON.send directamente, o a OTRA server function ya determinada
+  // async, se marca también. Las que nunca llaman a nada de eso se quedan como
+  // funciones normales, síncronas -- importante para que llamarlas desde un sitio que
+  // NO es async (valores iniciales de reactive/var, interpolaciones de plantilla) siga
+  // dando el valor directo, no una Promise sin resolver.
+  const alwaysAsyncSeedNames = [
+    ...allHttpFns.map(([, , fn]) => fn.name),
+    ...(wsFn ? [wsFn.name] : []),
+  ];
+  const asyncServerFunctionNames = computeAsyncFunctionNames(serverFunctions, alwaysAsyncSeedNames);
+
+  // Igual que substituteReactiveRefs, pero AÑADE auto-await -- solo para usar dentro
+  // de cuerpos de función de verdad (server function/las HTTP/ws function/watch),
+  // que siempre se compilan como "async" -- ahí sí es seguro.
+  function substituteReactiveRefsInFunctionBody(body) {
+    return autoAwaitCalls(substituteReactiveRefs(body), [...asyncServerFunctionNames]);
   }
 
   const inner = [];
@@ -111,11 +178,28 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     inner.push(`  let ${v.name} = ${v.init}; // server var`);
   }
 
+  if (serverConsts.length > 0) {
+    inner.push('', '  // server const -- valor fijo, compilado a un "const" real de JS: reasignarlo es');
+    inner.push('  // un error de JS de verdad (comprobado por el propio motor, no rastreado a mano).');
+    inner.push('  // Nunca reactivo -- no dispara ningún re-render ni watch(), no puede hacerlo.');
+    for (const c of serverConsts) {
+      inner.push(`  const ${c.name} = ${substituteReactiveRefs(c.init)}; // server const`);
+    }
+  }
+
   if (serverWsons.length > 0) {
     inner.push('', '  // wson -- estructura de datos para describir un mensaje saliente (from/to/via/content). Declararla NO envía nada -- hace falta llamar a WSON.send(NOMBRE) explícitamente.');
     for (const w of serverWsons) {
-      const objLit = w.fields.map(f => `${f.key}: ${substituteReactiveRefs(f.value)}`).join(', ');
-      inner.push(`  let ${w.name} = { ${objLit} }; // server wson`);
+      if (w.fields) {
+        const objLit = w.fields.map(f => `${f.key}: ${substituteReactiveRefs(f.value)}`).join(', ');
+        inner.push(`  let ${w.name} = { ${objLit} }; // server wson`);
+      } else {
+        // Segunda forma: "server wson NOMBRE = expresión" -- ej. el resultado de
+        // WSON.parse(...). Se trata exactamente igual que un "server var" normal --
+        // la palabra clave "wson" aquí es solo semántica, no cambia nada de cómo se
+        // compila.
+        inner.push(`  let ${w.name} = ${substituteReactiveRefs(w.init)}; // server wson (de una expresión)`);
+      }
     }
   }
 
@@ -137,28 +221,68 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
   }
 
   for (const fn of serverFunctions) {
+    const isAsync = asyncServerFunctionNames.has(fn.name);
     inner.push(
       '',
-      fn.isAsync
-        ? `  // server function ASYNC -- puede usar "await" dentro (fetch/http.*/otra dependencia`
-        : `  // server function -- NO se expone al cliente ni tiene endpoint propio. Síncrona`,
-      fn.isAsync
-        ? `  // asíncrona de Node). Quien la llame debe usar "await" también, o recibirá una`
-        : `  // (no puede usar "await" dentro) -- si necesitas eso, declárala "async server function".`,
-      fn.isAsync ? `  // Promise en vez del valor real.` : `  // No se expone al cliente ni tiene endpoint propio.`,
-      `  ${fn.isAsync ? 'async ' : ''}function ${fn.name}(${fn.params}) {`,
-      ...substituteReactiveRefs(fn.body).split('\n').map(l => `    ${l}`),
+      `  // server function -- helper de servidor, NO se expone al cliente ni tiene`,
+      `  // endpoint propio. ${isAsync ? 'Esta SÍ usa (directa o transitivamente) algo asíncrono' : 'Esta no usa nada asíncrono'}`,
+      `  // (fetch/http.*/WSON.send/otra function que lo necesite) -- nunca hace falta`,
+      `  // declarar "async" a mano, ni tampoco "await" al llamarla: si resulta ser`,
+      `  // asíncrona, el compilador ya insertó el "await" que hiciera falta en quien la llama.`,
+      `  ${isAsync ? 'async ' : ''}function ${fn.name}(${fn.params}) {`,
+      ...substituteReactiveRefsInFunctionBody(fn.body).split('\n').map(l => `    ${l}`),
       `  }`
     );
   }
   for (const [verb, method, fn] of allHttpFns) {
+    // params() -- SOLO se genera si de verdad se usa (mismo criterio que respond()/
+    // whisper()/WSON.*). El despachador (site-builder.js) SIEMPRE manda los parámetros
+    // de la propia URL (":id" en la ruta) como el ÚLTIMO argumento, sin importar cuántos
+    // parámetros nombrados declare la función -- por eso se capturan vía "arguments" en
+    // vez de como un parámetro más que el desarrollador tendría que declarar a mano.
+    const usesParams = /\bparams\s*\(/.test(fn.body);
     inner.push(
       '',
       `  // ${verb} function -- corre cuando llega un ${method} a la URL de la propia ruta.`,
       `  // Async: puede hacer "await" a fetch()/http.* para llamar a otros sistemas y esperar`,
       `  // su respuesta antes de devolver la suya.`,
       `  async function ${fn.name}(${fn.params}) {`,
-      ...substituteReactiveRefs(fn.body).split('\n').map(l => `    ${l}`),
+      ...(usesParams ? [
+        '    const __wsArgs = arguments;',
+        '    function params() { return __wsArgs[__wsArgs.length - 1] || {}; } // parámetros de la URL (":id")',
+      ] : []),
+      ...substituteReactiveRefsInFunctionBody(fn.body).split('\n').map(l => `    ${l}`),
+      `  }`
+    );
+  }
+
+  if (wsFn) {
+    // ws function -- corre por cada MENSAJE que llegue por la conexión WebSocket
+    // (no por cada conexión -- una conexión persiste y puede traer muchos mensajes).
+    // "args" es el mensaje ya parseado (JSON.parse); lo que devuelva se manda de
+    // vuelta por la MISMA conexión, como el siguiente mensaje.
+    //
+    // params()/headers() -- el despachador (site-builder.js) manda un objeto
+    // { params, headers } como ÚLTIMO argumento, siempre -- distinto de las cuatro
+    // HTTP (que solo mandan "params" a secas), porque aquí hacen falta las DOS cosas
+    // a la vez: los parámetros de la URL (":id") Y las cabeceras del handshake
+    // (necesarias para leer "X-WSON-Signature"/"X-WSON-From" de un WSON.send() con
+    // via:"socket" -- una conexión WS no tiene "cabeceras por mensaje", solo las del
+    // handshake inicial, válidas para toda la conexión).
+    const usesParams = /\bparams\s*\(/.test(wsFn.body);
+    const usesHeaders = /\bheaders\s*\(/.test(wsFn.body);
+    inner.push(
+      '',
+      `  // ws function -- corre por cada mensaje entrante en la conexión WebSocket de`,
+      `  // esta ruta. Lo que devuelva se manda de vuelta por la misma conexión.`,
+      `  async function ${wsFn.name}(${wsFn.params}) {`,
+      ...(usesParams || usesHeaders ? [
+        '    const __wsArgs = arguments;',
+        '    function __wsLast() { return __wsArgs[__wsArgs.length - 1] || {}; }',
+      ] : []),
+      ...(usesParams ? ['    function params() { return __wsLast().params || {}; }'] : []),
+      ...(usesHeaders ? ['    function headers() { return __wsLast().headers || {}; }'] : []),
+      ...substituteReactiveRefsInFunctionBody(wsFn.body).split('\n').map(l => `    ${l}`),
       `  }`
     );
   }
@@ -172,7 +296,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       `  // ningún prefijo especial) -- nada captura su valor de retorno, así que hacerla`,
       `  // async no rompe ningún patrón existente, a diferencia de "function"/"server function".`,
       `  __watchers.${w.name}.push(async () => {`,
-      ...substituteReactiveRefs(w.body).split('\n').map(l => `    ${l}`),
+      ...substituteReactiveRefsInFunctionBody(w.body).split('\n').map(l => `    ${l}`),
       `  });`
     );
   }
@@ -183,6 +307,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
     ...serverVars.map(v => `    get ${v.name}() { return ${v.name}; },\n    set ${v.name}(v) { ${v.name} = v; },`),
     ...serverReactives.map(r => `    get ${r.name}() { return __serverReactive.${r.name}; },\n    set ${r.name}(v) { __serverReactive.${r.name} = v; },`),
     ...allHttpFns.map(([, , fn]) => `    ${fn.name},`),
+    ...(wsFn ? [`    ${wsFn.name},`] : []),
     '  };'
   );
 
@@ -191,7 +316,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
   // "WSON.history(" -- solo se incluye la definición si de verdad se usa, igual que con
   // los stubs de cliente. Cualquiera de los WSON.* también activa "http" aunque el
   // código del usuario no escriba "http." en ningún sitio -- lo usan por dentro.
-  const allBodies = [...serverFunctions, ...allHttpFns.map(([, , fn]) => fn), ...watchDecls].map(fn => fn.body);
+  const allBodies = [...serverFunctions, ...allHttpFns.map(([, , fn]) => fn), ...watchDecls, ...(wsFn ? [wsFn] : [])].map(fn => fn.body);
   const usesWson = allBodies.some(body => /\bWSON\.(send|enqueue|verify|showContent|parse|history|getSignature)\s*\(/.test(body));
   const usesHttpObject = allBodies.some(body => /\bhttp\s*\./.test(body));
   const usesWhisper = allBodies.some(body => /\bwhisper\s*\(/.test(body));
@@ -290,7 +415,23 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       'function __wsonDeriveKey(secret, salt) {',
       "  return require('crypto').createHash('sha256').update(secret + ':' + salt).digest();",
       '}',
-      "const __wsonHistoryFile = require('path').join(__dirname, 'wson-history.jsonl');",
+      // Ruta configurable vía "wson-history-route" en wconfig.json -- si no se
+      // configura (null), se usa el valor por defecto de siempre (junto al propio
+      // server.js). Si la ruta configurada es absoluta, se usa tal cual; si es
+      // relativa, se resuelve respecto a __dirname igual que el valor por defecto,
+      // para que el comportamiento sea predecible sin importar desde qué directorio
+      // se arranque el proceso Node.
+      `const __wsonHistoryFile = (() => {`,
+      "  const p = require('path');",
+      `  const configurado = ${JSON.stringify(wsonHistoryRoute)};`,
+      '  if (!configurado) return p.join(__dirname, \'wson-history.jsonl\');',
+      '  return p.isAbsolute(configurado) ? configurado : p.join(__dirname, configurado);',
+      '})();',
+      // Ventana de validez para la firma de un WSON recibido -- configurable vía
+      // "wson-replay-window-ms" en wconfig.json. Una firma correcta pero fuera de
+      // esta ventana se trata como inválida (protección contra reenvío/replay: un
+      // mensaje firmado capturado y reenviado más tarde deja de aceptarse).
+      `const __WSON_REPLAY_WINDOW_MS = ${JSON.stringify(wsonReplayWindowMs)};`,
       'function __wsonRecord(entry) {',
       '  const line = JSON.stringify(Object.assign({ timestamp: Date.now() }, entry)) + \'\\n\';',
       '  try {',
@@ -302,11 +443,52 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       "    console.error('WSON: no se pudo escribir en el historial (' + __wsonHistoryFile + '): ' + e.message);",
       '  }',
       '}',
+      // Helpers mínimos del protocolo WebSocket (RFC 6455), inline -- igual que el resto
+      // de WSON, generados como texto autocontenido, sin depender de ningún archivo del
+      // propio proyecto (el server.js compilado debe ser portable por sí solo). Cubren
+      // solo lo que hace falta para "via: socket": handshake de CLIENTE + un frame de
+      // texto de ida y otro de vuelta -- no la implementación completa del RFC.
+      "function __wsonWsEncodeFrame(payloadBuffer) {",
+      '  // Frame de CLIENTE -- el enmascarado es obligatorio en esta dirección (RFC 6455).',
+      '  const len = payloadBuffer.length;',
+      "  const maskKey = require('crypto').randomBytes(4);",
+      '  let header;',
+      '  if (len < 126) {',
+      '    header = Buffer.from([0x81, 0x80 | len]);',
+      '  } else if (len < 65536) {',
+      '    header = Buffer.alloc(4);',
+      '    header[0] = 0x81; header[1] = 0x80 | 126;',
+      '    header.writeUInt16BE(len, 2);',
+      '  } else {',
+      '    header = Buffer.alloc(10);',
+      '    header[0] = 0x81; header[1] = 0x80 | 127;',
+      '    header.writeBigUInt64BE(BigInt(len), 2);',
+      '  }',
+      '  const masked = Buffer.alloc(len);',
+      '  for (let i = 0; i < len; i++) masked[i] = payloadBuffer[i] ^ maskKey[i % 4];',
+      '  return Buffer.concat([header, maskKey, masked]);',
+      '}',
+      'function __wsonWsDecodeFrame(buffer) {',
+      '  // Frame de SERVIDOR -- nunca enmascarado (el servidor no enmascara sus respuestas).',
+      '  if (buffer.length < 2) return null;',
+      '  const opcode = buffer[0] & 0x0f;',
+      '  let payloadLen = buffer[1] & 0x7f;',
+      '  let offset = 2;',
+      '  if (payloadLen === 126) {',
+      '    if (buffer.length < offset + 2) return null;',
+      '    payloadLen = buffer.readUInt16BE(offset); offset += 2;',
+      '  } else if (payloadLen === 127) {',
+      '    if (buffer.length < offset + 8) return null;',
+      '    payloadLen = Number(buffer.readBigUInt64BE(offset)); offset += 8;',
+      '  }',
+      '  if (buffer.length < offset + payloadLen) return null;',
+      '  return { opcode, payload: Buffer.from(buffer.subarray(offset, offset + payloadLen)), bytesConsumed: offset + payloadLen };',
+      '}',
       'const WSON = {',
       '  send: async (wson) => {',
       "    const via = (wson.via || 'POST').toUpperCase();",
-      "    if (via !== 'POST' && via !== 'PUT' && via !== 'DELETE') {",
-      "      throw new Error('WSON.send(): via \"' + wson.via + '\" no soportado todavía -- solo POST/PUT/DELETE por ahora (email y teléfono, pendientes de conectar un servicio real).');",
+      "    if (via !== 'POST' && via !== 'PUT' && via !== 'DELETE' && via !== 'SOCKET') {",
+      "      throw new Error('WSON.send(): via \"' + wson.via + '\" no soportado todavía -- POST/PUT/DELETE/SOCKET por ahora (email y teléfono, pendientes de conectar un servicio real).');",
       '    }',
       '    const crypto_ = require(\'crypto\');',
       '    let payload = wson.content;',
@@ -327,7 +509,13 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       "    const headers = { 'X-WSON-Correlation-Id': correlationId };",
       "    if (wson.from) headers['X-WSON-From'] = wson.from;",
       '    if (wson.secret) {',
-      "      const sig = crypto_.createHmac('sha256', wson.secret).update(JSON.stringify(payload)).digest('hex');",
+      '      const timestamp = Date.now();',
+      "      headers['X-WSON-Timestamp'] = String(timestamp);",
+      // La marca de tiempo se firma JUNTO con el contenido -- no aparte -- para que
+      // no se pueda cambiar sin invalidar la firma entera. Si solo se transmitiera al
+      // lado, sin firmar, cualquiera podría alargar la validez de un mensaje
+      // capturado con solo reescribir esa cabecera, sin tocar la firma en sí.
+      "      const sig = crypto_.createHmac('sha256', wson.secret).update(JSON.stringify(payload) + '.' + timestamp).digest('hex');",
       "      headers['X-WSON-Signature'] = 'sha256=' + sig;",
       '    }',
       '    async function __wsonFetchOnce(url) {',
@@ -347,13 +535,68 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '      }',
       '      return parsed;',
       '    }',
+      // "via: socket" -- conecta como CLIENTE WebSocket a "destino" (una URL ws://),
+      // manda "content" como UN mensaje de texto, espera UNA respuesta, cierra. Mismo
+      // patrón mental que POST/PUT/DELETE (un envío = una respuesta), aunque WebSocket
+      // en sí permita bastante más que eso -- se mantiene simple y consistente con el
+      // resto de "vías" a propósito.
+      '    async function __wsonSocketSendOnce(destino) {',
+      '      return await new Promise((resolve, reject) => {',
+      "        const net_ = require('net');",
+      '        let urlObj;',
+      '        try { urlObj = new URL(destino); } catch (e) { reject(new Error(\'WSON.send(): "\' + destino + \'" no es una URL válida para via:"socket" (se espera algo como ws://host:puerto/ruta).\')); return; }',
+      "        const wsPort = urlObj.port || 80;",
+      '        const wsPath = urlObj.pathname + urlObj.search;',
+      '        const socket = net_.connect(wsPort, urlObj.hostname, () => {',
+      "          const clientKey = crypto_.randomBytes(16).toString('base64');",
+      "          const extraHeaders = Object.keys(headers).map((k) => k + ': ' + headers[k] + '\\r\\n').join('');",
+      '          socket.write(',
+      "            'GET ' + wsPath + ' HTTP/1.1\\r\\n' +",
+      "            'Host: ' + urlObj.hostname + ':' + wsPort + '\\r\\n' +",
+      "            'Upgrade: websocket\\r\\n' +",
+      "            'Connection: Upgrade\\r\\n' +",
+      "            'Sec-WebSocket-Key: ' + clientKey + '\\r\\n' +",
+      "            'Sec-WebSocket-Version: 13\\r\\n' +",
+      '            extraHeaders +',
+      "            '\\r\\n'",
+      '          );',
+      '        });',
+      '        let handshakeDone = false;',
+      '        let buffer = Buffer.alloc(0);',
+      '        const timeoutId = setTimeout(() => {',
+      "          socket.destroy();",
+      "          reject(new Error('WSON.send(): tiempo de espera agotado esperando respuesta por WebSocket de \\\"' + destino + '\\\"'));",
+      '        }, 10000);',
+      "        socket.on('data', (chunk) => {",
+      '          buffer = Buffer.concat([buffer, chunk]);',
+      '          if (!handshakeDone) {',
+      "            const headerEnd = buffer.indexOf('\\r\\n\\r\\n');",
+      '            if (headerEnd === -1) return;',
+      '            buffer = buffer.subarray(headerEnd + 4);',
+      '            handshakeDone = true;',
+      "            socket.write(__wsonWsEncodeFrame(Buffer.from(JSON.stringify(payload), 'utf8')));",
+      '          }',
+      '          if (handshakeDone) {',
+      '            const decoded = __wsonWsDecodeFrame(buffer);',
+      '            if (decoded) {',
+      '              clearTimeout(timeoutId);',
+      '              socket.end();',
+      '              let parsed;',
+      "              try { parsed = JSON.parse(decoded.payload.toString('utf8')); } catch (e) { parsed = decoded.payload.toString('utf8'); }",
+      '              resolve(parsed);',
+      '            }',
+      '          }',
+      '        });',
+      "        socket.on('error', (e) => { clearTimeout(timeoutId); reject(e); });",
+      '      });',
+      '    }',
       '    async function __sendOne(destino) {',
       '      const maxAttempts = 1 + (wson.retries || 0);',
       '      const baseDelay = wson.retryDelayMs || 500;',
       '      let lastError;',
       '      for (let attempt = 1; attempt <= maxAttempts; attempt++) {',
       '        try {',
-      '          const result = await __wsonFetchOnce(destino);',
+      "          const result = via === 'SOCKET' ? await __wsonSocketSendOnce(destino) : await __wsonFetchOnce(destino);",
       "          __wsonRecord({ direction: 'sent', from: wson.from, to: destino, via: via, content: wson.content, id: correlationId, attempts: attempt });",
       '          return result;',
       '        } catch (e) {',
@@ -377,9 +620,16 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '    WSON.send(Object.assign({}, wson, { id: correlationId })).catch(() => {});',
       '    return correlationId;',
       '  },',
-      '  verify: (payload, signatureHeader, secret) => {',
-      '    if (!signatureHeader) return false;',
-      "    const expected = 'sha256=' + require('crypto').createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');",
+      '  verify: (payload, signatureHeader, secret, timestamp) => {',
+      '    if (!signatureHeader || timestamp === undefined || timestamp === null) return false;',
+      // Ventana de validez: una firma válida hace demasiado tiempo se trata igual que
+      // una inválida -- rechaza tanto un mensaje capturado y reenviado más tarde
+      // (reenvío/replay) como una marca de tiempo puesta muy en el futuro (para
+      // intentar alargar la validez de un reenvío). __WSON_REPLAY_WINDOW_MS se
+      // genera arriba, a partir de "wson-replay-window-ms" en wconfig.json.
+      '    const ts = Number(timestamp);',
+      '    if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > __WSON_REPLAY_WINDOW_MS) return false;',
+      "    const expected = 'sha256=' + require('crypto').createHmac('sha256', secret).update(JSON.stringify(payload) + '.' + ts).digest('hex');",
       '    const a = Buffer.from(signatureHeader);',
       '    const b = Buffer.from(expected);',
       '    if (a.length !== b.length) return false;',
@@ -405,12 +655,23 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       "    const id = headers ? headers['x-wson-correlation-id'] : undefined;",
       '    let content = payload;',
       '    let signatureValid;',
+      '    let replayDetected = false;',
       '    if (secret) {',
-      "      signatureValid = WSON.verify(payload, headers ? headers['x-wson-signature'] : undefined, secret);",
+      "      const timestamp = headers ? headers['x-wson-timestamp'] : undefined;",
+      "      signatureValid = WSON.verify(payload, headers ? headers['x-wson-signature'] : undefined, secret, timestamp);",
       '      content = WSON.showContent(payload, secret);',
+      // Detección de duplicados EXACTOS: si este mismo id ya se registró antes como
+      // recibido, es un reenvío del mismo mensaje -- aunque la firma y la ventana de
+      // tiempo sean válidas (un mensaje reenviado DENTRO de la ventana de validez
+      // sigue siendo un reenvío). Reutiliza WSON.history(), que ya registra cada
+      // recepción -- sin necesitar una estructura de datos nueva aparte.
+      '      if (id && signatureValid) {',
+      "        const previos = WSON.history({ direction: 'received', id: id });",
+      '        if (previos.length > 0) replayDetected = true;',
+      '      }',
       '    }',
-      "    __wsonRecord({ direction: 'received', from: from, content: content, id: id, signatureValid: signatureValid });",
-      '    return { from: from, id: id, content: content, signatureValid: signatureValid };',
+      "    __wsonRecord({ direction: 'received', from: from, content: content, id: id, signatureValid: signatureValid, replayDetected: replayDetected });",
+      '    return { from: from, id: id, content: content, signatureValid: signatureValid, replayDetected: replayDetected };',
       '  },',
       '  history: (filtros) => {',
       '    let entries = [];',
@@ -433,6 +694,7 @@ function compileServerJS(serverVars, serverFunctions = [], httpFns = {}, serverR
       '    return results.slice();',
       '  },',
       '  getSignature: (headers) => (headers ? headers[\'x-wson-signature\'] : undefined),',
+      '  getTimestamp: (headers) => (headers ? headers[\'x-wson-timestamp\'] : undefined),',
       '};',
       '',
     ]
@@ -698,6 +960,92 @@ function usesAny(expr, names) {
   return names.some(name => findIdentifierMatches(expr, name).length > 0);
 }
 
+// Inserta "await" automáticamente delante de cualquier llamada a algo que puede
+// tardar -- para que nunca haga falta escribirlo a mano. Dos categorías:
+//
+// 1. Built-ins conocidos con "." (fetch, http.get/post/put/delete, WSON.send) --
+//    detectados con una regex fija, ya que no son identificadores simples.
+//    WSON.enqueue() se excluye A PROPÓSITO: su razón de ser es NO esperar (fire-and-
+//    forget), auto-esperarlo rompería justo lo que la función promete.
+// 2. Llamadas a "function"/"server function" declaradas por el propio desarrollador,
+//    identificadas por nombre con findIdentifierMatches (el mismo mecanismo cuidadoso
+//    con límites de identificador que ya usa injectVars -- respeta cadenas de texto,
+//    posiciones de clave de objeto, etc.)
+//
+// Se apoya en una propiedad real de JS: "await" sobre un valor que NO es una promesa
+// no hace nada malo, solo lo resuelve de inmediato -- así que si una función
+// determinada resulta ser síncrona en la práctica, "esperarla" no cambia su
+// resultado, solo añade un tic de microtarea insignificante. Por eso no hace falta
+// que el compilador sepa con certeza absoluta qué es async y qué no -- basta con
+// saber qué NOMBRES podrían serlo.
+const KNOWN_ASYNC_CALL_RE = /\b(fetch|http\.(?:get|post|put|delete)|WSON\.send)\s*\(/g;
+
+// Determina, para un conjunto de funciones declaradas (function/server function),
+// CUÁLES de verdad necesitan compilarse como "async" -- no todas, a ciegas. Una
+// función que nunca llama a nada async (ni directamente, ni a través de otra que sí
+// lo haga) puede quedarse como función normal, síncrona -- importante porque hay
+// sitios donde SÍ se puede llamar (interpolaciones de plantilla, valores iniciales de
+// reactive/var) que NO son "async" y nunca podrían usar su resultado con "await"
+// (fuera del alcance de esta función). Si TODA function se compilara siempre como
+// async, llamarla desde uno de esos sitios devolvería la Promise sin resolver en vez
+// del valor -- bug real, encontrado así, antes de llegar a esta solución.
+//
+// Punto fijo sobre el grafo de llamadas: empieza por las que llaman DIRECTAMENTE a
+// algo async conocido (fetch/http.*/WSON.send), y va propagando -- si A llama a B y B
+// ya se determinó async, A también lo es -- hasta que una vuelta entera no añada
+// ninguna función nueva. Así no importa el orden de declaración ni las llamadas
+// mutuas/circulares.
+function computeAsyncFunctionNames(functionDecls, seedAsyncNames = []) {
+  const asyncSet = new Set(seedAsyncNames);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const fn of functionDecls) {
+      if (asyncSet.has(fn.name)) continue;
+      const callsKnownBuiltin = new RegExp(KNOWN_ASYNC_CALL_RE.source).test(fn.body);
+      const callsAsyncFn = [...asyncSet].some(name => {
+        const matches = findIdentifierMatches(fn.body, name);
+        return matches.some(m => /^\s*\(/.test(fn.body.slice(m.index + name.length)));
+      });
+      if (callsKnownBuiltin || callsAsyncFn) {
+        asyncSet.add(fn.name);
+        changed = true;
+      }
+    }
+  }
+  return asyncSet;
+}
+
+function autoAwaitCalls(body, userAsyncNames = []) {
+  let out = body;
+
+  // 1. Built-ins con "." -- de una pasada, de atrás hacia adelante para no invalidar
+  // índices al insertar texto.
+  const builtinMatches = [...out.matchAll(KNOWN_ASYNC_CALL_RE)];
+  for (let k = builtinMatches.length - 1; k >= 0; k--) {
+    const m = builtinMatches[k];
+    const before = out.slice(0, m.index);
+    if (/\bawait\s*$/.test(before)) continue; // ya tiene await, no se duplica
+    out = out.slice(0, m.index) + 'await ' + out.slice(m.index);
+  }
+
+  // 2. Nombres declarados por el desarrollador -- uno por uno, con el mismo mecanismo
+  // de límites de identificador que ya usa injectVars.
+  for (const name of userAsyncNames) {
+    const matches = findIdentifierMatches(out, name);
+    for (let k = matches.length - 1; k >= 0; k--) {
+      const m = matches[k];
+      const afterName = out.slice(m.index + name.length);
+      if (!/^\s*\(/.test(afterName)) continue; // no es una llamada, es solo una referencia al nombre
+      const before = out.slice(0, m.index);
+      if (/\bawait\s*$/.test(before)) continue;
+      out = out.slice(0, m.index) + 'await ' + out.slice(m.index);
+    }
+  }
+
+  return out;
+}
+
 function injectVars(expr, names, prefix) {
   let out = expr;
   for (const name of names) {
@@ -751,7 +1099,7 @@ function injectVarsAsStringLiterals(expr, names) {
 }
 
 // -------- JS: genera funciones create_NAME(state, effect, props) para cada visual --------
-function compileJS(reactives, globalVars, functions, wsons, visuals, renderCall, globalNames, visualNames, serverDataUrl = null, httpFns = {}, routePath = null, styleNames = []) {
+function compileJS(reactives, globalVars, functions, wsons, visuals, renderCall, globalNames, visualNames, serverDataUrl = null, httpFns = {}, routePath = null, styleNames = [], globalConsts = []) {
   const { post: postFn = null, put: putFn = null, delete: deleteFn = null } = httpFns;
   const allHttpFns = [
     ['post', 'POST', postFn],
@@ -790,8 +1138,25 @@ function compileJS(reactives, globalVars, functions, wsons, visuals, renderCall,
     return bound.length === 0 ? names : names.filter(n => !bound.includes(n));
   }
 
+  // Nombres que PODRÍAN necesitar "await" al llamarlos, en el cliente -- todas las
+  // "function" del archivo, más los stubs de post/put/delete (que SIEMPRE son async
+  // de verdad, usan fetch() por debajo). Misma lógica que en el servidor: no hace
+  // falta saber con certeza cuáles son async, "await" sobre un valor que no lo es no
+  // hace nada malo.
+  // Determina, con punto fijo, cuáles "function" de cliente de verdad necesitan
+  // compilarse como "async" -- los stubs de post/put/delete SIEMPRE lo son (usan
+  // fetch() por debajo), y sirven de semilla; si una "function" llama a uno de esos
+  // stubs, a fetch()/WSON.send directamente, o a OTRA function ya determinada async,
+  // se marca también. Las que nunca llaman a nada de eso se quedan como funciones
+  // normales -- importante para poder llamarlas desde una interpolación de plantilla
+  // (que nunca es "async"): si TODA function fuera siempre async, el resultado sería
+  // la Promise sin resolver ahí, no el valor -- bug real, encontrado así.
+  const alwaysAsyncSeedNamesClient = Object.values(httpFns).filter(Boolean).map(fn => fn.name);
+  const clientAsyncNames = computeAsyncFunctionNames(functions, alwaysAsyncSeedNamesClient);
+
   function transform(expr, ctx) {
-    let out = injectVars(expr, effectiveNames(ctx.localNames, ctx), 'localState');
+    let out = desugarLocalWsonDecls(expr);
+    out = injectVars(out, effectiveNames(ctx.localNames, ctx), 'localState');
     out = injectVars(out, effectiveNames(globalNames, ctx), 'state');
     return out;
   }
@@ -1047,20 +1412,16 @@ function compileJS(reactives, globalVars, functions, wsons, visuals, renderCall,
   // "await" explícito -- ej. WSON.send()) e inyecta "await" delante de las llamadas a
   // RPC que el usuario no haya puesto ya.
   function emitEventListener(lines, varName, eventName, body, ctx) {
-    const rpcNames = allHttpFns.map(([, , fn]) => fn.name);
-    const rpcPattern = rpcNames.length > 0 ? rpcNames.map(n => `\\b${n}\\s*\\(`).join('|') : null;
-    const usesRpc = rpcPattern ? new RegExp(rpcPattern).test(body) : false;
-    const usesExplicitAwait = /\bawait\b/.test(body);
-    const needsAsync = usesRpc || usesExplicitAwait;
-    const injected = transform(body, ctx)
+    // transform() ya NO inserta await (eso rompería otros usos compartidos, como
+    // interpolaciones de plantilla, que no son async) -- aquí, en cambio, SÍ es
+    // seguro, porque el propio manejador puede volverse "async" si hace falta.
+    const injected = autoAwaitCalls(transform(body, ctx), clientAsyncNames)
       .split('\n')
       .map(l => '    ' + l)
       .join('\n');
+    const needsAsync = /\bawait\b/.test(injected);
     const asyncKw = needsAsync ? 'async ' : '';
-    const awaitedInjected = usesRpc
-      ? injected.replace(new RegExp(`(?<!await\\s)(${rpcPattern})`, 'g'), 'await $1')
-      : injected;
-    lines.push(`  ${varName}.addEventListener(${JSON.stringify(eventName)}, ${asyncKw}(event) => {\n${awaitedInjected}\n  });`);
+    lines.push(`  ${varName}.addEventListener(${JSON.stringify(eventName)}, ${asyncKw}(event) => {\n${injected}\n  });`);
   }
 
   const visualFns = visuals.map(v => {
@@ -1094,34 +1455,73 @@ function compileJS(reactives, globalVars, functions, wsons, visuals, renderCall,
     .map(v => `let ${v.name} = ${transform(v.init, { localNames: [] })};`)
     .join('\n');
 
+  // "const NOMBRE = valor" -- global, no reactivo, INMUTABLE. Compilado a un "const"
+  // real de JS -- reasignarlo revienta con un TypeError real del propio motor, no algo
+  // que WebScript necesite rastrear a mano.
+  const globalConstLines = globalConsts
+    .map(c => `const ${c.name} = ${transform(c.init, { localNames: [] })};`)
+    .join('\n');
+
   // "function NOMBRE(params)" de cliente -- helper con cuerpo en varias líneas, algo
   // que "var NOMBRE = (params) => valor" no puede dar (esa solo cabe en una línea). Se
   // declara con "function" normal de JS (no una const con arrow) para que quede
   // "hoisted" -- se puede llamar desde cualquier sitio del bundle, sin importar el
   // orden de declaración, igual que ya pasa con "server function" en server.js.
   const functionLines = functions
-    .map(fn => `${fn.isAsync ? 'async ' : ''}function ${fn.name}(${fn.params}) {\n${transform(fn.body, { localNames: [] }).split('\n').map(l => '  ' + l).join('\n')}\n}`)
+    .map(fn => `${clientAsyncNames.has(fn.name) ? 'async ' : ''}function ${fn.name}(${fn.params}) {\n${autoAwaitCalls(transform(fn.body, { localNames: [] }), [...clientAsyncNames]).split('\n').map(l => '  ' + l).join('\n')}\n}`)
     .join('\n\n');
 
   // "wson NOMBRE = -> ..." de cliente -- estructura de datos (from/to/via/content).
-  // Declararla nunca envía nada, solo WSON.send(NOMBRE) lo hace.
+  // Declararla nunca envía nada, solo WSON.send(NOMBRE) lo hace. Admite también la
+  // segunda forma "wson NOMBRE = expresión" (sin campos "->", ej. un objeto construido
+  // dinámicamente) -- se trata igual que un "var" normal en ese caso.
   const wsonLines = wsons
-    .map(w => `let ${w.name} = { ${w.fields.map(f => `${f.key}: ${transform(f.value, { localNames: [] })}`).join(', ')} }; // wson`)
+    .map(w => w.fields
+      ? `let ${w.name} = { ${w.fields.map(f => `${f.key}: ${transform(f.value, { localNames: [] })}`).join(', ')} }; // wson`
+      : `let ${w.name} = ${transform(w.init, { localNames: [] })}; // wson (de una expresión)`)
     .join('\n');
 
   // ¿Se usa WSON.send( en algún sitio de cliente (reactive/var/function/wson/plantillas,
   // incluyendo atributos en línea como onclick={...})? Solo se genera el objeto WSON si
   // de verdad se usa, igual que el resto de helpers condicionales del proyecto.
+  // Bug real encontrado construyendo query(): esta colección no incluía los "init" de
+  // "reactive" (ni de "const") -- solo "var", funciones y plantillas. Una "reactive"
+  // que llamara a query() (o a WSON.send(), que comparte esta misma colección) se colaba
+  // sin que el helper correspondiente se generara -- ReferenceError real al ejecutar.
   const clientBodiesForWsonCheck = [
+    ...reactives.map(r => r.init),
     ...globalVars.map(v => v.init),
+    ...globalConsts.map(c => c.init),
     ...functions.map(fn => fn.body),
     ...visuals.flatMap(v => {
       const exprs = [];
+      for (const r of v.localReactives) exprs.push(r.init);
+      for (const vr of v.localVars) exprs.push(vr.init);
       collectAllTemplateExprs(v.template, exprs);
       return exprs;
     }),
   ];
   const usesWsonSendClient = clientBodiesForWsonCheck.some(body => /\bWSON\.(send|enqueue)\s*\(/.test(body));
+
+  // query() -- la query string de la propia URL, como objeto (análogo a params(), pero
+  // para "?a=1&b=2" en vez de "/ruta/:id"). A diferencia de server.NOMBRE, no necesita
+  // ningún fetch async -- window.location.search ya está disponible de forma síncrona
+  // en el navegador. Solo se genera si de verdad se usa, mismo criterio que el resto.
+  const usesQueryClient = clientBodiesForWsonCheck.some(body => /\bquery\s*\(/.test(body));
+  const queryClientDef = usesQueryClient
+    ? [
+      '// query() -- la query string de la propia URL ("?a=1&b=2"), como objeto plano --',
+      '// { a: "1", b: "2" }. Síncrono, sin necesitar ningún fetch -- window.location.search',
+      '// ya está disponible de inmediato en el navegador.',
+      'function query() {',
+      "  const __q = {};",
+      "  for (const [k, v] of new URLSearchParams(window.location.search)) __q[k] = v;",
+      '  return __q;',
+      '}',
+      '',
+    ].join('\n')
+    : '';
+
   const wsonSendClientDef = usesWsonSendClient
     ? [
       '// WSON.send(wson) -- envía un objeto WSON ({ from?, to, via?, content, retries?,',
@@ -1224,7 +1624,7 @@ async function ${fn.name}(${clientParams}) {
 ${urlLine}
   return fetch(__url, {
     method: '${method}',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-WebScript-CSRF': __wsGetCsrfToken() },
     body: JSON.stringify(${primaryParam} || {}),
   }).then(r => r.json());
 }
@@ -1232,14 +1632,31 @@ ${urlLine}
     });
   const postFnStub = stubs.join('');
 
+  // Lee la cookie "wcsrf" (protección CSRF -- ver site-builder.js/ensureCsrfCookie) y
+  // la devuelve tal cual, para mandarla como cabecera en cada POST/PUT/DELETE del
+  // cliente. Sin esta pieza, CUALQUIER escritura desde el propio código generado
+  // fallaría con 403 en cuanto la sesión dejara de ser nueva -- se generaba el
+  // rechazo del lado del servidor, pero se olvidó conectar el lado del cliente hasta
+  // que se revisó explícitamente. Se genera SOLO si hace falta (si hay algún stub de
+  // post/put/delete que la necesite), mismo criterio que el resto de helpers
+  // condicionales del proyecto.
+  const csrfHelperDef = postFnStub
+    ? `function __wsGetCsrfToken() {
+  const m = document.cookie.match(/(?:^|;\\s*)wcsrf=([^;]+)/);
+  return m ? m[1] : '';
+}
+
+`
+    : '';
+
   // Si el archivo lee algún "server.NOMBRE", el montaje tiene que esperar a un fetch
   // antes de crear el estado (sus valores iniciales pueden depender de datos de servidor).
   // Si no, se mantiene el montaje síncrono de siempre -- cero coste extra para páginas estáticas.
   const mountBlock = serverDataUrl
     ? `
-let server = {};
+${queryClientDef}let server = {};
 let state, effect;
-${postFnStub}
+${csrfHelperDef}${postFnStub}
 async function __wsInit() {
   if (location.protocol === 'file:') {
     document.getElementById('app').innerHTML =
@@ -1261,7 +1678,7 @@ ${initialGlobalState}
   state = store.store;
   effect = store.effect;
 
-${globalVarLines.split('\n').filter(Boolean).map(l => '  ' + l).join('\n')}
+${globalConstLines ? globalConstLines.split('\n').filter(Boolean).map(l => '  ' + l).join('\n') + '\n' : ''}${globalVarLines.split('\n').filter(Boolean).map(l => '  ' + l).join('\n')}
 ${wsonLines ? '\n' + wsonLines.split('\n').map(l => '  ' + l).join('\n') : ''}
 
   const app = document.getElementById('app');
@@ -1271,16 +1688,18 @@ ${wsonLines ? '\n' + wsonLines.split('\n').map(l => '  ' + l).join('\n') : ''}
 document.addEventListener('DOMContentLoaded', () => { __wsInit(); });
 `
     : `
-// ---- estado reactivo GLOBAL (compartido entre todos los visuales) ----
+${queryClientDef}// ---- estado reactivo GLOBAL (compartido entre todos los visuales) ----
 ${initLocalLines.join('\n')}
 const { store: state, effect } = createStore({
 ${initialGlobalState}
 });
 
+// ---- constantes globales (no reactivas, INMUTABLES -- const real de JS) ----
+${globalConstLines}
 // ---- variables NO reactivas globales (se calculan una vez, no re-renderizan nada) ----
 ${globalVarLines}
 ${wsonLines}
-${postFnStub}
+${csrfHelperDef}${postFnStub}
 // ---- montaje ----
 document.addEventListener('DOMContentLoaded', () => {
   const app = document.getElementById('app');
@@ -1297,13 +1716,18 @@ ${mountBlock}`;
 }
 
 // -------- HTML esqueleto --------
-function compileHTML(cssFilename = 'styles.css', jsFilename = 'bundle.js') {
+function compileHTML(cssFilename = 'styles.css', jsFilename = 'bundle.js', stylesheets = []) {
+  // Hojas de estilo externas (ej. Bootstrap por CDN, vía wconfig.json) -- van ANTES
+  // del <link> del propio CSS generado, para que las reglas propias del proyecto
+  // puedan sobreescribir a las de la librería si hace falta (el orden en cascada de
+  // CSS importa: lo que se declara después gana en caso de mismo peso/especificidad).
+  const externalLinks = stylesheets.map(url => `  <link rel="stylesheet" href="${escapeHtmlAttr(url)}">`).join('\n');
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <title>WebScript App</title>
-  <link rel="stylesheet" href="${cssFilename}">
+${externalLinks ? externalLinks + '\n' : ''}  <link rel="stylesheet" href="${cssFilename}">
 </head>
 <body>
   <div id="app"></div>
@@ -1313,4 +1737,16 @@ function compileHTML(cssFilename = 'styles.css', jsFilename = 'bundle.js') {
 `;
 }
 
-module.exports = { compile, usesServerData };
+// Escape mínimo para insertar una URL configurada por el desarrollador dentro de un
+// atributo HTML -- wconfig.json es un archivo que el propio desarrollador controla
+// (no input de un usuario final de la app), pero igualmente conviene no confiar a
+// ciegas en que nunca contendrá comillas ni "<"/">" sin querer.
+function escapeHtmlAttr(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+module.exports = { compile, usesServerData, usesQueryParams };

@@ -30,8 +30,8 @@
     "declarations": {
       "patterns": [
         {
-          "comment": "reactive/var [tipo] NOMBRE (locales o globales) -- el tipo (string/number/boolean) es opcional",
-          "match": "^\\s*(reactive|var)\\s+(?:(string|number|boolean)\\s+)?([A-Za-z_$][\\w$]*)",
+          "comment": "reactive/var/const [tipo] NOMBRE (locales o globales) -- el tipo (string/number/boolean) es opcional",
+          "match": "^\\s*(reactive|var|const)\\s+(?:(string|number|boolean)\\s+)?([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.type.webscript" },
             "2": { "name": "support.type.webscript" },
@@ -39,16 +39,7 @@
           }
         },
         {
-          "comment": "async function NOMBRE(...) -- helper de CLIENTE async, puede usar await dentro",
-          "match": "^\\s*(async)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
-          "captures": {
-            "1": { "name": "storage.modifier.webscript" },
-            "2": { "name": "storage.type.webscript" },
-            "3": { "name": "entity.name.function.webscript" }
-          }
-        },
-        {
-          "comment": "function NOMBRE(...) -- helper de CLIENTE, sin prefijo, cuerpo en varias líneas",
+          "comment": "function NOMBRE(...) -- helper de CLIENTE, cuerpo en varias líneas. Siempre puede usar await dentro sin declarar nada especial -- el compilador detecta solo si de verdad hace falta compilarla async (ver README, \"async/await implícito\")",
           "match": "^\\s*(function)\\s+([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.type.webscript" },
@@ -56,18 +47,8 @@
           }
         },
         {
-          "comment": "async server function NOMBRE(...) -- puede usar await dentro (http.*, fetch, dependencias async de Node)",
-          "match": "^\\s*(async)\\s+(server)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
-          "captures": {
-            "1": { "name": "storage.modifier.webscript" },
-            "2": { "name": "storage.modifier.webscript" },
-            "3": { "name": "storage.type.webscript" },
-            "4": { "name": "entity.name.function.webscript" }
-          }
-        },
-        {
-          "comment": "server var / server reactive / server wson / server function NOMBRE",
-          "match": "^\\s*(server)\\s+(var|reactive|wson|function)\\s+([A-Za-z_$][\\w$]*)",
+          "comment": "server var / server const / server reactive / server wson / server function NOMBRE. Toda server function puede usar await dentro, sin declarar nada especial",
+          "match": "^\\s*(server)\\s+(var|const|reactive|wson|function)\\s+([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.modifier.webscript" },
             "2": { "name": "storage.type.webscript" },
@@ -75,8 +56,8 @@
           }
         },
         {
-          "comment": "get/post/put/delete function NOMBRE(...) -- las cuatro funciones HTTP",
-          "match": "^\\s*(get|post|put|delete)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
+          "comment": "get/post/put/delete/ws function NOMBRE(...) -- las cuatro funciones HTTP y ws function",
+          "match": "^\\s*(get|post|put|delete|ws)\\s+(function)\\s+([A-Za-z_$][\\w$]*)",
           "captures": {
             "1": { "name": "storage.modifier.webscript" },
             "2": { "name": "storage.type.webscript" },
@@ -218,7 +199,7 @@
         { "include": "#numbers" },
         {
           "name": "keyword.other.webscript",
-          "match": "\\b(props|state|server|http|whisper|WSON|await|true|false|null|undefined|this)\\b"
+          "match": "\\b(props|state|server|http|whisper|respond|params|query|WSON|await|true|false|null|undefined|this)\\b"
         },
         {
           "name": "keyword.control.webscript",

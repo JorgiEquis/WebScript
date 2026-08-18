@@ -230,11 +230,13 @@ render(
       const r1 = await fetch(`http://localhost:${port}/dinamica`);
       const html1 = await r1.text();
       assert.match(html1, /<h1>Visitas: 100<\/h1>/, 'primera visita: valor inicial de verdad, no concha vacía');
-      const cookie = r1.headers.get('set-cookie').split(';')[0];
+      const setCookies = r1.headers.getSetCookie();
+      const cookie = setCookies.find(c => c.startsWith('wsid=')).split(';')[0];
+      const csrfToken = setCookies.find(c => c.startsWith('wcsrf=')).split(';')[0].split('=')[1];
 
       await fetch(`http://localhost:${port}/dinamica`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        headers: { 'Content-Type': 'application/json', Cookie: cookie, 'X-WebScript-CSRF': csrfToken },
         body: JSON.stringify({ nuevoValor: 250 }),
       });
 
@@ -246,5 +248,61 @@ render(
       fs.rmSync(srcDir, { recursive: true, force: true });
       fs.rmSync(outDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('query(): la query string real de la petición, disponible en la SSR', () => {
+  test('query() en el scope de evaluación devuelve queryParams tal cual', () => {
+    const src = `
+reactive pagina = query().page || "1"
+
+visual v =
+<p>{pagina}</p>
+
+render(
+    v
+)
+`;
+    const r1 = renderRouteToHtml(ast(src), { queryParams: {} });
+    assert.equal(r1.ok, true);
+    assert.match(r1.html, />1</, 'sin query, debe usar el valor por defecto');
+
+    const r2 = renderRouteToHtml(ast(src), { queryParams: { page: '7' } });
+    assert.equal(r2.ok, true);
+    assert.match(r2.html, />7</, 'con queryParams, debe usar el valor real de la petición');
+  });
+
+  test('sin queryParams en absoluto (ej. SSG en tiempo de compilación), query() da un objeto vacío, no falla', () => {
+    const src = `
+reactive tienePagina = query().page !== undefined
+
+visual v =
+<p>{tienePagina}</p>
+
+render(
+    v
+)
+`;
+    const r = renderRouteToHtml(ast(src));
+    assert.equal(r.ok, true);
+    assert.match(r.html, />false</);
+  });
+});
+
+describe('bug real encontrado construyendo query(): "const" nunca se evaluaba en la SSR', () => {
+  test('una plantilla que usa una const global se pre-renderiza de verdad, no cae al fallback vacío', () => {
+    const src = `
+const pi = 3.14
+
+visual v =
+<p>{pi}</p>
+
+render(
+    v
+)
+`;
+    const r = renderRouteToHtml(ast(src));
+    assert.equal(r.ok, true, 'antes de este arreglo, esto daba ok:false y caía a la concha vacía');
+    assert.match(r.html, />3\.14</);
   });
 });

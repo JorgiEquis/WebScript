@@ -15,8 +15,17 @@ try {
   acorn = null;
 }
 
+// "allow-acorn": false en wconfig.json fuerza el motor de respaldo por regex,
+// aunque Acorn esté instalado -- útil para comparar el comportamiento de los dos
+// motores a propósito, o si algún día aparece un caso donde el AST se comporta peor
+// que el regex (poco probable, pero mejor tener la vía de escape explícita).
+let allowAcorn = true;
+function setAllowAcorn(value) {
+  allowAcorn = !!value;
+}
+
 function isAvailable() {
-  return !!acorn;
+  return !!acorn && allowAcorn;
 }
 
 // Intenta parsear `code` como una única expresión (interpolaciones, condiciones de
@@ -300,4 +309,4 @@ function analyzeReferences(code) {
   return refs;
 }
 
-module.exports = { isAvailable, analyzeReferences };
+module.exports = { isAvailable, analyzeReferences, setAllowAcorn };

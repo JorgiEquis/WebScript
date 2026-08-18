@@ -3,10 +3,18 @@ const fs = require('fs');
 const path = require('path');
 const { parseProgram } = require('./parser');
 const { compile, usesServerData } = require('./compiler');
-const { buildSite, buildSingleFileAsSite, serveSite, startServer } = require('./site-builder');
+const { buildSite, buildSingleFileAsSite, serveSite, startServer, startClusteredServer } = require('./site-builder');
 const { renderRouteToHtml, injectIntoShell } = require('./ssr-renderer');
+const jsAnalyzer = require('./js-analyzer');
+const { loadConfig } = require('./config');
 
 function build(inputFile, outDir) {
+  // "build" compila directamente con compile(), sin pasar por buildSite() -- necesita
+  // su propia carga de wconfig.json (buscado junto al propio archivo) para que
+  // "allow-acorn"/"wson-history-route" también apliquen aquí, no solo en site/serve/run.
+  const config = loadConfig(path.dirname(path.resolve(inputFile)));
+  jsAnalyzer.setAllowAcorn(config['allow-acorn']);
+
   const source = fs.readFileSync(inputFile, 'utf8');
   const ast = parseProgram(source, path.resolve(inputFile));
 
@@ -15,7 +23,7 @@ function build(inputFile, outDir) {
   // Sin render(): archivo "solo backend" -- ni HTML, ni CSS, ni bundle.js, solo
   // server.js (si tiene algo de servidor). Mismo criterio que "site"/"run".
   if (!hasRender) {
-    const { server } = compile(ast, { routePath: '/' });
+    const { server } = compile(ast, { routePath: '/', wsonHistoryRoute: config['wson-history-route'], wsonReplayWindowMs: config['wson-replay-window-ms'] });
     fs.mkdirSync(outDir, { recursive: true });
     if (server) {
       fs.writeFileSync(path.join(outDir, 'index.server.js'), server);
@@ -33,6 +41,9 @@ function build(inputFile, outDir) {
   const { html, css, js, server } = compile(ast, {
     serverDataUrl: dynamic ? '/index.server-data.json' : null,
     routePath: '/',
+    wsonHistoryRoute: config['wson-history-route'],
+    stylesheets: config.stylesheets,
+    wsonReplayWindowMs: config['wson-replay-window-ms'],
   });
 
   // SSG (solo si NO es dinámica -- ver src/ssr-renderer.js para el porqué)
@@ -83,13 +94,18 @@ function printTable(table, skipped, outDir) {
 // Comando "todo en uno": detecta solo si `target` es un archivo o un directorio y hace
 // lo que corresponda -- compilar un directorio entero (varias rutas, cada .ws declara
 // su route(...)) o un solo archivo (siempre servido en "/", como "build"). Con --serve
-// además levanta un servidor Node real en el puerto indicado (por defecto 3000).
-function run(target, outDir, { serve, port }) {
+// además levanta un servidor Node real en el puerto indicado (por defecto 3000, o el
+// "http-port" de wconfig.json si existe y no se pasó --port explícito) -- y, si
+// "cluster-workers" > 1 en wconfig.json, en varios procesos con sesiones pegajosas
+// (ver startClusteredServer en site-builder.js).
+async function run(target, outDir, { serve, port }) {
   const stat = fs.statSync(target);
 
   if (stat.isDirectory()) {
     if (serve) {
-      serveSite(target, outDir, port);
+      const config = loadConfig(target);
+      const resolvedPort = (port === undefined || port === null) ? config['http-port'] : port;
+      await startClusteredServer(target, outDir, resolvedPort, config['cluster-workers']);
       return;
     }
     const { table, skipped } = buildSite(target, outDir);
@@ -97,15 +113,17 @@ function run(target, outDir, { serve, port }) {
     return;
   }
 
-  const { table } = buildSingleFileAsSite(target, outDir);
   if (serve) {
-    startServer(table, outDir, port);
+    const config = loadConfig(path.dirname(target));
+    const resolvedPort = (port === undefined || port === null) ? config['http-port'] : port;
+    await startClusteredServer(target, outDir, resolvedPort, config['cluster-workers']);
     return;
   }
+  const { table } = buildSingleFileAsSite(target, outDir);
   printTable(table, [], outDir);
 }
 
-function main() {
+async function main() {
   const [, , cmd, target] = process.argv;
   const outFlagIndex = process.argv.indexOf('--out');
   const outDir = path.resolve(process.cwd(), outFlagIndex !== -1 ? process.argv[outFlagIndex + 1] : 'dist');
@@ -115,20 +133,31 @@ function main() {
   } else if (cmd === 'site' && target) {
     site(path.resolve(process.cwd(), target), outDir);
   } else if (cmd === 'serve' && target) {
+    // Sin valor por defecto aquí a propósito -- si no se pasa --port, se deja
+    // "undefined" para que la precedencia real se resuelva más abajo (explícito >
+    // wconfig.json > 3000), en vez de que este 3000 "de aquí" gane siempre sin
+    // dejarle nunca sitio a la configuración.
     const portFlagIndex = process.argv.indexOf('--port');
-    const port = portFlagIndex !== -1 ? parseInt(process.argv[portFlagIndex + 1], 10) : 3000;
-    serveSite(path.resolve(process.cwd(), target), outDir, port);
+    const port = portFlagIndex !== -1 ? parseInt(process.argv[portFlagIndex + 1], 10) : undefined;
+    const resolvedTarget = path.resolve(process.cwd(), target);
+    const config = loadConfig(resolvedTarget);
+    const resolvedPort = (port === undefined || port === null) ? config['http-port'] : port;
+    await startClusteredServer(resolvedTarget, outDir, resolvedPort, config['cluster-workers']);
   } else if (cmd === 'run' && target) {
     const portFlagIndex = process.argv.indexOf('--port');
-    const port = portFlagIndex !== -1 ? parseInt(process.argv[portFlagIndex + 1], 10) : 3000;
+    const port = portFlagIndex !== -1 ? parseInt(process.argv[portFlagIndex + 1], 10) : undefined;
     const serve = process.argv.includes('--serve');
-    run(path.resolve(process.cwd(), target), outDir, { serve, port });
+    await run(path.resolve(process.cwd(), target), outDir, { serve, port });
   } else {
     console.log('Uso:');
     console.log('  node src/cli.js build <archivo.ws> [--out dist]');
     console.log('  node src/cli.js site <directorio-src> [--out dist]');
     console.log('  node src/cli.js serve <directorio-src> [--out dist] [--port 3000]');
     console.log('  node src/cli.js run <archivo.ws | directorio-src> [--out dist] [--serve] [--port 3000]');
+    console.log();
+    console.log('Todos los comandos admiten un "wconfig.json" opcional junto a los .ws --');
+    console.log('ver README, sección "wconfig.json". Con "cluster-workers" > 1, "serve"/"run --serve"');
+    console.log('levantan varios procesos Node con sesiones pegajosas por cookie.');
     process.exit(1);
   }
 }

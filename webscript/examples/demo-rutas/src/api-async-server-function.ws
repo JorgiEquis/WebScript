@@ -1,9 +1,9 @@
 route("/api/consultar-externo")
 
-async server function llamarFuera(url)
-    var r = await http.get(url, {})
+server function llamarFuera(url)
+    var r = http.get(url, {})
     return r
 
 post function usar(args)
-    var datos = await llamarFuera(args.url)
+    var datos = llamarFuera(args.url)
     return { recibido: datos }
