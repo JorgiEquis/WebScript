@@ -1,0 +1,182 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "WebScript",
+	"scopeName": "source.webscript",
+	"patterns": [
+		{ "include": "#comments" },
+		{ "include": "#strings" },
+		{ "include": "#numbers" },
+		{ "include": "#arrow-metadata" },
+		{ "include": "#wson-classes" },
+		{ "include": "#keywords-declaration" },
+		{ "include": "#keywords-control" },
+		{ "include": "#types" },
+		{ "include": "#tag" },
+		{ "include": "#interpolation" }
+	],
+	"repository": {
+		"comments": {
+			"patterns": [
+				{
+					"name": "comment.line.double-slash.webscript",
+					"match": "//.*$"
+				}
+			]
+		},
+		"strings": {
+			"patterns": [
+				{
+					"name": "string.quoted.double.webscript",
+					"begin": "\"",
+					"end": "\"",
+					"patterns": [{ "name": "constant.character.escape.webscript", "match": "\\\\." }]
+				},
+				{
+					"name": "string.quoted.single.webscript",
+					"begin": "'",
+					"end": "'",
+					"patterns": [{ "name": "constant.character.escape.webscript", "match": "\\\\." }]
+				},
+				{
+					"name": "string.template.webscript",
+					"begin": "`",
+					"end": "`",
+					"patterns": [{ "name": "constant.character.escape.webscript", "match": "\\\\." }]
+				}
+			]
+		},
+		"numbers": {
+			"patterns": [
+				{
+					"name": "constant.numeric.webscript",
+					"match": "\\b\\d+(\\.\\d+)?\\b"
+				}
+			]
+		},
+		"arrow-metadata": {
+			"patterns": [
+				{
+					"comment": "-> clave: valor  (style, WSON, .wson)",
+					"match": "(->)\\s*([\\w-]+)\\s*(:)",
+					"captures": {
+						"1": { "name": "keyword.operator.arrow.webscript" },
+						"2": { "name": "variable.other.property.webscript" },
+						"3": { "name": "punctuation.separator.key-value.webscript" }
+					}
+				},
+				{
+					"name": "keyword.operator.arrow.webscript",
+					"match": "->"
+				}
+			]
+		},
+		"keywords-declaration": {
+			"patterns": [
+				{
+					"name": "storage.type.webscript",
+					"match": "\\b(reactive|var|const|style|visual|function|import|export|from)\\b"
+				},
+				{
+					"name": "keyword.other.webscript",
+					"match": "\\b(useRoute|watch|params|query)\\b"
+				}
+			]
+		},
+		"keywords-control": {
+			"patterns": [
+				{
+					"name": "keyword.control.webscript",
+					"match": "\\b(if|else|for|in)\\b"
+				}
+			]
+		},
+		"types": {
+			"patterns": [
+				{
+					"name": "support.type.webscript",
+					"match": "\\b(string|integer|decimal|boolean|object|any)\\b"
+				},
+				{
+					"comment": "tipo(array)",
+					"match": "\\b(\\w+)(\\()(array)(\\))",
+					"captures": {
+						"1": { "name": "support.type.webscript" },
+						"3": { "name": "support.type.webscript" }
+					}
+				},
+				{
+					"comment": "campo opcional en .wson: tipo/",
+					"match": "\\b(string|integer|decimal|boolean|object)(/)$",
+					"captures": {
+						"1": { "name": "support.type.webscript" },
+						"2": { "name": "keyword.operator.optional.webscript" }
+					}
+				}
+			]
+		},
+		"wson-classes": {
+			"patterns": [
+				{
+					"name": "support.class.webscript",
+					"match": "\\b(WSON|Visual)\\b"
+				},
+				{
+					"comment": "WSON.metodo( / Visual.metodo(",
+					"match": "\\b(WSON|Visual)(\\.)(\\w+)(?=\\()",
+					"captures": {
+						"1": { "name": "support.class.webscript" },
+						"3": { "name": "support.function.webscript" }
+					}
+				},
+				{
+					"name": "variable.language.wson-field.webscript",
+					"match": "\\b(to|via|from|content|secret|encrypt|id|createdAt|httpCode)(?=\\s*:)"
+				}
+			]
+		},
+		"tag": {
+			"patterns": [
+				{
+					"comment": "apertura o autocierre de tag: <nombre ...> o <nombre .../>",
+					"begin": "(<)([\\w-]+)",
+					"beginCaptures": {
+						"1": { "name": "punctuation.definition.tag.begin.webscript" },
+						"2": { "name": "entity.name.tag.webscript" }
+					},
+					"end": "(/?>)",
+					"endCaptures": { "1": { "name": "punctuation.definition.tag.end.webscript" } },
+					"patterns": [{ "include": "#tag-attributes" }, { "include": "#interpolation" }, { "include": "#strings" }]
+				},
+				{
+					"comment": "cierre de tag: </nombre>",
+					"match": "(</)([\\w-]+)(>)",
+					"captures": {
+						"1": { "name": "punctuation.definition.tag.begin.webscript" },
+						"2": { "name": "entity.name.tag.webscript" },
+						"3": { "name": "punctuation.definition.tag.end.webscript" }
+					}
+				}
+			]
+		},
+		"tag-attributes": {
+			"patterns": [
+				{
+					"name": "entity.other.attribute-name.webscript",
+					"match": "\\b[a-zA-Z-]+(?==)"
+				}
+			]
+		},
+		"interpolation": {
+			"patterns": [
+				{
+					"name": "meta.embedded.expression.webscript",
+					"begin": "\\{",
+					"end": "\\}",
+					"beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.webscript" } },
+					"endCaptures": { "0": { "name": "punctuation.section.embedded.end.webscript" } },
+					"patterns": [{ "include": "#interpolation" }, { "include": "#strings" }, { "include": "#numbers" }]
+				}
+			]
+		}
+	}
+}

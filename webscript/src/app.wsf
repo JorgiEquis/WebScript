@@ -1,0 +1,25 @@
+import { contadorItem } from "./contador.wsf"
+import { formatearNombre } from "./utils.ws"
+
+reactive frutas = ["manzana", "pera", "plátano"]
+reactive contadores = [{ valor: 0 }, { valor: 0 }]
+
+style contenedor = -> background-color: #f4f4f4
+				   -> padding: 16px
+
+visual app =
+<div class={contenedor}>
+	<h1>{formatearNombre("mi app webscript")}</h1>
+
+	for (item in contadores)
+		<contadorItem item={item} />
+
+	<ul>
+		for (fruta in frutas)
+			<li>{fruta}</li>
+	</ul>
+</div>
+
+Visual.render(app)
+
+useRoute('/personas/:id')

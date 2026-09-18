@@ -1,0 +1,4 @@
+# Vendorizado por `websc init` — regenerable con `websc update`
+lib/
+compiler/
+node_modules/

@@ -1,0 +1,28 @@
+{
+	"name": "webscript-language",
+	"displayName": "WebScript Language Support",
+	"description": "Sintaxis, descripciones al pasar el ratón e 'ir a definición' para WebScript (.wsf, .wsb, .ws, .wson)",
+	"version": "0.1.0",
+	"publisher": "webscript-local",
+	"engines": { "vscode": "^1.80.0" },
+	"categories": ["Programming Languages"],
+	"main": "./src/extension.js",
+	"activationEvents": ["onLanguage:webscript"],
+	"contributes": {
+		"languages": [
+			{
+				"id": "webscript",
+				"aliases": ["WebScript", "webscript"],
+				"extensions": [".wsf", ".wsb", ".ws", ".wson"],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "webscript",
+				"scopeName": "source.webscript",
+				"path": "./syntaxes/webscript.tmLanguage.json"
+			}
+		]
+	}
+}
