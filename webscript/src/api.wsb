@@ -1,0 +1,36 @@
+import { Persona } from "./persona.wson"
+
+// Estado por sesión — vive aquí por ser un .wsb, sin prefijo "server"
+var visitasSesion = 0
+
+const WSON wsonCrearPersona =
+	-> to: "/personas"
+	-> via: "POST"
+	-> secret: "clave-compartida-entre-sistemas"
+
+reactive any peticionPersona = WSON.listen(wsonCrearPersona)
+
+watch(peticionPersona)
+	visitasSesion++
+
+	var contenido = WSON.showContent(peticionPersona, "clave-compartida-entre-sistemas")
+	var nueva = new Persona(
+		contenido.nombre,
+		contenido.edad,
+		contenido.altura,
+		contenido.mayorEdad,
+		contenido.direccion,
+		contenido.listaPropiedades
+	)
+
+	// httpCode y WSON.send() no son obligatorios aquí — sin ellos, se
+	// responde 200 por defecto. Llamar a WSON.send(peticionPersona) en
+	// este contexto (dentro del watch de un listen) responde la propia
+	// petición entrante, no manda una llamada saliente nueva.
+	peticionPersona.httpCode = 201
+	WSON.send(peticionPersona)
+
+// GET /personas/:id — renderiza el visual con el id de la URL
+useRoute('/personas/:id')
+	var id = params().id
+	// ... cargar la persona con ese id y pasarla al visual

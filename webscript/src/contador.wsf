@@ -1,0 +1,12 @@
+visual contadorItem =
+<div>
+	<button onclick={props.item.valor++}>Sumar</button>
+	<button onclick={props.item.valor--}>Restar</button>
+
+	if (props.item.valor == 0)
+		<p>Aún no hay clicks</p>
+	else if (props.item.valor < 3)
+		<p>Vas por buen camino: {props.item.valor}</p>
+	else
+		<p>Ya son muchos clicks: {props.item.valor}</p>
+</div>

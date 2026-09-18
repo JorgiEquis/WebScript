@@ -1,0 +1,11 @@
+const WSON wsonCrearNota =
+	-> to: "/notas"
+	-> via: "POST"
+
+reactive any peticion = WSON.listen(wsonCrearNota)
+
+watch(peticion)
+	var contenido = WSON.showContent(peticion, null)
+	peticion.httpCode = 201
+	peticion.content = { mensaje: "recibido", texto: contenido.texto }
+	WSON.send(peticion)

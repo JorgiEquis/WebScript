@@ -1,0 +1,6 @@
+{
+	"port": 3000,
+	"rate-limit-max": 300,
+	"rate-limit-window-ms": 60000,
+	"stylesheets": []
+}

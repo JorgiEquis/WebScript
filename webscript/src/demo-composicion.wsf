@@ -1,0 +1,24 @@
+reactive contadores = [{ valor: 0 }, { valor: 0 }]
+
+visual contadorItem =
+<div class="item">
+	<button onclick={props.item.valor++}>Sumar</button>
+	<p>{props.item.valor}</p>
+</div>
+
+visual tarjeta =
+<div class="tarjeta">
+	<header><slot name="header" /></header>
+	<div class="cuerpo"><slot /></div>
+</div>
+
+visual app =
+<div>
+	<tarjeta>
+		<h3 slot="header">Contadores</h3>
+		for (item in contadores)
+			<contadorItem item={item} />
+	</tarjeta>
+</div>
+
+Visual.render(app)

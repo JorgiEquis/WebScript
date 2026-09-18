@@ -1,0 +1,12 @@
+-> from: "app"
+-> to: "/personas"
+-> via: "POST"
+-> content:
+	nombre: string
+	edad: integer
+	altura: decimal/
+	mayorEdad: boolean
+	direccion:
+		numero: integer
+		calle: string
+	listaPropiedades: string(array)

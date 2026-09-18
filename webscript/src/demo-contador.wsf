@@ -1,0 +1,22 @@
+reactive contador = 0
+
+visual app =
+<div>
+	<button onclick={contador++}>Sumar</button>
+	<button onclick={contador--}>Restar</button>
+	<p>Valor: {contador}</p>
+
+	if (contador == 0)
+		<p>Aún no hay clicks</p>
+	else if (contador < 3)
+		<p>Vas por buen camino</p>
+	else
+		<p>Ya son muchos clicks</p>
+
+	<ul>
+		for (n in [1, 2, 3])
+			<li>Elemento {n}</li>
+	</ul>
+</div>
+
+Visual.render(app)
