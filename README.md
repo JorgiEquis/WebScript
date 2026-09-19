@@ -28,9 +28,15 @@ Renderizado mediante `Visual.render(app1)`, que solo puede invocarse una vez por
 
 `class={estilo}` acepta cualquier expresión, no solo referencias estáticas a un `style` — el nombre de un `style` ya es literalmente su clase CSS, así que no hace falta ningún *lookup* en tiempo de ejecución.
 
-Se mantiene `useRoute('/getEjemplo')` para las llamadas al servidor.
+**`Visual.route(patron)`/`Visual.params(instancia)`/`Visual.query(instancia)`**: sustituyen a `useRoute()`. Misma API estática que `WSON` — instancia como argumento, nunca `instancia.metodo()`:
 
-`query()` y `params()` (globales, sin `WSON.` delante) están disponibles en rutas GET que renderizan un `visual` con parámetros en la URL (`:id`) — es la contraparte de `WSON.query()`/`WSON.params()`, que solo aplican dentro de un handler de `WSON.listen()`.
+```
+const Visual screen = Visual.route('/personas/:id')
+const {id} = Visual.params(screen)
+const {tab} = Visual.query(screen)
+```
+
+`Visual.route()` se declara al principio del script, sin cuerpo — solo compara el patrón contra la URL actual del navegador. No es reactivo: si la URL cambia sin recargar la página, hace falta un router aparte (pendiente). Es una declaración puramente de cliente, independiente de si hay un `WSON.listen()` sirviendo esa misma URL en el `.wsb` — no se validan cruzadas entre sí (ver más abajo, en `WSON.listen()`).
 
 ## Control de flujo en `visual`: `if`/`for`
 
@@ -132,7 +138,7 @@ watch(respuesta)
 `WSON.listen(wson)` lee la estructura del WSON y valida que `via` (method) y `to` coincidan con la petición entrante:
 
 - **`to`**: endpoint + params de ruta (`/getEjemplo/:id`). Cualquier segmento `:algo` se trata como comodín a efectos de matching y de la validación de colisiones — el nombre del parámetro no importa, solo su posición en la ruta. Se captura con `WSON.params(peticion)` dentro del `watch()`.
-- **`via`**: method (POST, PUT, DELETE). Para GET, el script se ejecuta tal cual; si no se llama a `WSON.send()` al final, se devuelve por defecto un JSON `{status: OK}`.
+- **`via`**: method — GET, POST, PUT o DELETE, todos tratados igual: pasan por `watch()`, y si no se llama a `WSON.send()` al final, se responde 200 por defecto. GET ya no tiene un caso especial ("ejecutar el script tal cual") — se unificó bajo `WSON.listen()`, lo cual lo mete gratis en la misma validación de colisión de rutas que el resto de métodos (antes, un GET vía `useRoute()` y un `WSON.listen()` con la misma URL nunca se comparaban entre sí).
 - La **query string no forma parte de `to`** — no identifica una ruta distinta, solo filtra/parametriza la misma ruta.
 - **`WSON.query(peticion)`** y **`WSON.params(peticion)`**: única vía de acceso a query string y params de ruta dentro del `watch()` — estáticos, como toda la API de `WSON`; se les pasa la instancia recibida. No hay inyección automática de esos valores en el content del WSON.
 - **El descifrado no es automático** — si el WSON recibido está cifrado, hay que llamar a `WSON.showContent()` explícitamente dentro del `watch()`.
@@ -268,7 +274,7 @@ Un proyecto puede tener solo ficheros `.wsb` y ningún `.wsf` — sirviendo solo
 
 Campos adicionales de un WSON, más allá de `from`/`to`/`via`/`content`:
 
-- **`secret`**: clave para firmar. Solo permitido en un WSON de servidor — rechazado en compilación si aparece en uno de cliente (el secreto quedaría expuesto en el bundle del navegador).
+- **`secret`**: clave para firmar. Solo permitido en un WSON de servidor — rechazado en compilación si aparece en uno de cliente (el secreto quedaría expuesto en el bundle del navegador). Implementado en `codegen-client.js`: un WSON ad-hoc de `.wsf` con `secret`/`encrypt: true` hace fallar la compilación con un error explícito.
 - **`encrypt: true`**: requiere `secret` (validado en compilación). Cifrado AES-256-GCM (autenticado: detecta manipulación en el mismo paso que descifra), con la clave derivada del secret usando una sal distinta a la de la firma.
 - **`id`**: de correlación, se genera en cada `.send()` si no se informa a mano (formato UUID), **antes de cifrar** — viaja dentro del payload cifrado si `encrypt: true`. Si el objeto se reutiliza en varias llamadas, cada envío tiene el suyo propio.
 - **`createdAt`**: igual que `id` — se autogenera en `WSON.ws` en el momento de `.send()`, de solo lectura.
@@ -303,7 +309,7 @@ En el caso del propio proyecto:
 
 - **No es obligatorio firmar ni cifrar** (`secret`/`encrypt`) — se mantiene HTTP simple, protegido solo por lo que ya proteja el transporte (HTTPS) y la sesión, no por el mecanismo de autenticidad de WSON.
 - El cliente puede **enviar** WSON al backend, pero **no recibir** — no hay `WSON.listen()` en el front.
-- `useRoute('/getEjemplo')` se mantiene enfocado en GET / renderizar visual; WSON es el mecanismo para el resto de comunicación cliente-servidor dentro del proyecto.
+- `useRoute()` ya no existe — `Visual.route()` cubre el enrutado de cliente, y `WSON.listen()` con `via: GET` cubre servir datos por GET, unificado con el resto de métodos.
 - Firma/cifrado siguen siendo necesarios (y obligatorios por las reglas de arriba) para comunicación **entre sistemas distintos**, no dentro del mismo proyecto.
 
 ## CLI: `websc update`

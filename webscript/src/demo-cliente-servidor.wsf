@@ -1,0 +1,13 @@
+const WSON wsonCrearNota =
+	-> to: "/notas"
+	-> via: "POST"
+
+reactive resultado = ""
+
+visual app =
+<div>
+	<button onclick={wsonCrearNota.content = { texto: "Hola desde el navegador" }; WSON.send(wsonCrearNota).then(r => resultado = JSON.stringify(r.body))}>Enviar</button>
+	<p>{resultado}</p>
+</div>
+
+Visual.render(app)
