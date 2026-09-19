@@ -30,7 +30,16 @@ watch(peticionPersona)
 	peticionPersona.httpCode = 201
 	WSON.send(peticionPersona)
 
-// GET /personas/:id — renderiza el visual con el id de la URL
-useRoute('/personas/:id')
-	var id = params().id
-	// ... cargar la persona con ese id y pasarla al visual
+// GET /personas/:id — mismo mecanismo que POST, vía WSON.listen()/watch()
+// (el renderizado del visual en el cliente es cosa de Visual.route(), en
+// el .wsf — esto de aquí es solo la API que le da los datos).
+const WSON wsonObtenerPersona =
+	-> to: "/personas/:id"
+	-> via: "GET"
+
+reactive any peticionObtenerPersona = WSON.listen(wsonObtenerPersona)
+
+watch(peticionObtenerPersona)
+	var id = WSON.params(peticionObtenerPersona).id
+	peticionObtenerPersona.content = { id: id, nombre: "Ana", edad: 30 }
+	WSON.send(peticionObtenerPersona)

@@ -1,6 +1,8 @@
 import { contadorItem } from "./contador.wsf"
 import { formatearNombre } from "./utils.ws"
 
+const Visual screen = Visual.route('/personas/:id')
+
 reactive frutas = ["manzana", "pera", "plátano"]
 reactive contadores = [{ valor: 0 }, { valor: 0 }]
 
@@ -21,5 +23,3 @@ visual app =
 </div>
 
 Visual.render(app)
-
-useRoute('/personas/:id')
