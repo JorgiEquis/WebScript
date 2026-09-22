@@ -54,6 +54,138 @@ test("integración real: componente importado de otro .wsf se genera de verdad, 
 	assert.equal(botonesSumar.length, 2); // uno por cada contadorItem generado por el for
 });
 
+test("integración real: diffing por clave — reordenar la lista MUEVE los nodos, no los recrea", () => {
+	const source = [
+		'reactive items = [{ id: 1, texto: "uno" }, { id: 2, texto: "dos" }, { id: 3, texto: "tres" }]',
+		"visual app =",
+		"<ul>",
+		"\tfor (item in items)",
+		"\t\t<li>{item.texto}</li>",
+		"</ul>",
+		"Visual.render(app)",
+	].join("\n");
+
+	const bundle = generateClientBundle(parse(source), {});
+	const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>", { runScripts: "dangerously" });
+	let error = null;
+	dom.window.onerror = (msg) => { error = msg; };
+	const script = dom.window.document.createElement("script");
+	script.textContent = bundle;
+	dom.window.document.body.appendChild(script);
+	if (error) throw new Error(error);
+
+	const doc = dom.window.document;
+	const liDos = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "dos");
+	liDos.__marca = "original";
+
+	dom.window.eval("state.items.reverse();");
+
+	const liDosTrasReorden = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "dos");
+	assert.equal(liDosTrasReorden.__marca, "original");
+	assert.deepEqual(Array.from(doc.querySelectorAll("li")).map((li) => li.textContent), ["tres", "dos", "uno"]);
+});
+
+test("integración real: diffing por clave — añadir un elemento nuevo no recrea los que ya existían", () => {
+	const source = [
+		'reactive items = [{ texto: "uno" }, { texto: "dos" }]',
+		"visual app =",
+		"<ul>",
+		"\tfor (item in items)",
+		"\t\t<li>{item.texto}</li>",
+		"</ul>",
+		"Visual.render(app)",
+	].join("\n");
+
+	const bundle = generateClientBundle(parse(source), {});
+	const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>", { runScripts: "dangerously" });
+	let error = null;
+	dom.window.onerror = (msg) => { error = msg; };
+	const script = dom.window.document.createElement("script");
+	script.textContent = bundle;
+	dom.window.document.body.appendChild(script);
+	if (error) throw new Error(error);
+
+	const doc = dom.window.document;
+	const uno = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "uno");
+	uno.__marca = "original";
+
+	dom.window.eval('state.items.unshift({ texto: "cero" });');
+
+	assert.deepEqual(Array.from(doc.querySelectorAll("li")).map((li) => li.textContent), ["cero", "uno", "dos"]);
+	const unoTrasAnadir = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "uno");
+	assert.equal(unoTrasAnadir.__marca, "original");
+});
+
+test("integración real: diffing por clave — quitar un elemento no recrea los que quedan", () => {
+	const source = [
+		'reactive items = [{ texto: "uno" }, { texto: "dos" }, { texto: "tres" }]',
+		"visual app =",
+		"<ul>",
+		"\tfor (item in items)",
+		"\t\t<li>{item.texto}</li>",
+		"</ul>",
+		"Visual.render(app)",
+	].join("\n");
+
+	const bundle = generateClientBundle(parse(source), {});
+	const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>", { runScripts: "dangerously" });
+	let error = null;
+	dom.window.onerror = (msg) => { error = msg; };
+	const script = dom.window.document.createElement("script");
+	script.textContent = bundle;
+	dom.window.document.body.appendChild(script);
+	if (error) throw new Error(error);
+
+	const doc = dom.window.document;
+	const uno = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "uno");
+	const tres = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "tres");
+	uno.__marca = "uno-original";
+	tres.__marca = "tres-original";
+
+	dom.window.eval('state.items.splice(state.items.findIndex((i) => i.texto === "dos"), 1);');
+
+	assert.deepEqual(Array.from(doc.querySelectorAll("li")).map((li) => li.textContent), ["uno", "tres"]);
+	const unoTrasQuitar = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "uno");
+	const tresTrasQuitar = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "tres");
+	assert.equal(unoTrasQuitar.__marca, "uno-original");
+	assert.equal(tresTrasQuitar.__marca, "tres-original");
+});
+
+test("integración real: diffing de if/else — la misma rama activa NO reconstruye el nodo", () => {
+	const source = [
+		"reactive contador = 0",
+		"visual app =",
+		"<div>",
+		"\tif (contador < 3)",
+		"\t\t<p>pocos</p>",
+		"\telse",
+		"\t\t<p>muchos</p>",
+		"</div>",
+		"Visual.render(app)",
+	].join("\n");
+
+	const bundle = generateClientBundle(parse(source), {});
+	const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>", { runScripts: "dangerously" });
+	let error = null;
+	dom.window.onerror = (msg) => { error = msg; };
+	const script = dom.window.document.createElement("script");
+	script.textContent = bundle;
+	dom.window.document.body.appendChild(script);
+	if (error) throw new Error(error);
+
+	const doc = dom.window.document;
+	const p = doc.querySelector("p");
+	p.__marca = "original";
+
+	dom.window.eval("state.contador = 1;"); // sigue en la misma rama ("pocos")
+	assert.equal(doc.querySelector("p").__marca, "original");
+	assert.equal(doc.querySelector("p").textContent, "pocos");
+
+	dom.window.eval("state.contador = 5;"); // cambia de rama de verdad
+	assert.equal(doc.querySelector("p").textContent, "muchos");
+	assert.notEqual(doc.querySelector("p").__marca, "original"); // este sí es un nodo nuevo
+});
+
 test("integración real: Visual.route()/params()/query() leen la URL real del navegador", () => {
 	const source = [
 		"const Visual screen = Visual.route('/personas/:id')",

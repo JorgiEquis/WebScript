@@ -171,6 +171,19 @@ test("import con varios nombres", () => {
 	assert.equal(ast.body[0].from, "./archivo.ws");
 });
 
+test("REGRESIÓN nueva capacidad: import por defecto (sin llaves) — pensado para JSON", () => {
+	const ast = parse('import posts from "./posts.json"');
+	assert.equal(ast.body[0].type, "Import");
+	assert.deepEqual(ast.body[0].names, ["posts"]);
+	assert.equal(ast.body[0].from, "./posts.json");
+	assert.equal(ast.body[0].isDefault, true);
+});
+
+test("import con llaves sigue sin marcarse como isDefault", () => {
+	const ast = parse('import { posts } from "./posts.json"');
+	assert.equal(ast.body[0].isDefault, undefined);
+});
+
 test("function con parámetros tipados y sin tipar (mezcla permitida)", () => {
 	const ast = parse("function saluda(string nombre, edad)\n\treturn nombre");
 	const fn = ast.body[0];
@@ -178,4 +191,24 @@ test("function con parámetros tipados y sin tipar (mezcla permitida)", () => {
 	assert.equal(fn.type, "FunctionDecl");
 	assert.deepEqual(fn.params[0], { paramType: "string", name: "nombre" });
 	assert.deepEqual(fn.params[1], { paramType: null, name: "edad" });
+});
+
+test("REGRESIÓN nueva capacidad: fichero .wsdb — \"-> schema:\" anidado, mismo formato de campo que \"-> content:\" en .wson", () => {
+	const source = ['-> collection: "usuarios"', "-> schema:", "\tnombre: string", "\tedad: integer"].join("\n");
+	const ast = parse(source, { isWsdbFile: true });
+
+	assert.equal(ast.type, "WsdbSchema");
+	assert.equal(ast.fields[0].type, "MetaField");
+	assert.equal(ast.fields[0].key, "collection");
+	assert.equal(ast.fields[0].value, '"usuarios"');
+	assert.equal(ast.fields[1].type, "ContentSchema");
+	assert.deepEqual(
+		ast.fields[1].fields.map((f) => f.name),
+		["nombre", "edad"]
+	);
+});
+
+test(".wson sigue usando \"-> content:\" igual que antes, sin verse afectado por \"-> schema:\"", () => {
+	const ast = parse('-> to: "/algo"\n-> content:\n\tx: string', { isWsonFile: true });
+	assert.equal(ast.fields[1].type, "ContentSchema");
 });

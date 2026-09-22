@@ -36,7 +36,19 @@ const {id} = Visual.params(screen)
 const {tab} = Visual.query(screen)
 ```
 
-`Visual.route()` se declara al principio del script, sin cuerpo — solo compara el patrón contra la URL actual del navegador. No es reactivo: si la URL cambia sin recargar la página, hace falta un router aparte (pendiente). Es una declaración puramente de cliente, independiente de si hay un `WSON.listen()` sirviendo esa misma URL en el `.wsb` — no se validan cruzadas entre sí (ver más abajo, en `WSON.listen()`).
+`Visual.route()` se declara al principio del script, sin cuerpo — solo compara el patrón contra la URL actual. Es reactivo: si la URL cambia (por `Visual.navigate()` o por el atrás/adelante del navegador), `id`/`tab`/cualquier cosa derivada de `Visual.route()` se actualiza sola, sin recargar la página — es una declaración puramente de cliente, independiente de si hay un `WSON.listen()` sirviendo esa misma URL en el `.wsb` (no se validan cruzadas entre sí, ver más abajo).
+
+**`Visual.navigate(url, opts)`**: navega sin recargar la página — `history.pushState()` (o `replaceState()` con `{ replace: true }`) más lo necesario para que `Visual.route()`/`params()`/`query()` se actualicen solos donde se usen. Un `<a href="...">` interno normal (mismo origen, sin `target`/`download`/`rel="external"`, ni ancla `#` de la propia página) ya navega así automáticamente, sin `onclick` — el clic se intercepta solo. `Visual.navigate()` sigue haciendo falta para navegar de forma programática (fuera de un clic en un enlace).
+
+**`Visual.staticPaths(instancia, valores)`**: solo tiene efecto en páginas con `:params` en su `Visual.route()`. Mismo criterio que `Visual.params()`/`Visual.query()` — la instancia de `Visual.route()` como primer argumento. `valores` es un array de objetos **ya resuelto en tiempo de compilación**, uno por cada combinación de `:params` a pre-renderizar como `.html` real — típicamente importado de un `.json`:
+
+```
+const Visual screen = Visual.route('/blog/:slug')
+import posts from "./posts.json"
+Visual.staticPaths(screen, posts)
+```
+
+`import nombre from "ruta"` (sin llaves) liga el contenido **entero** de un `.json` a `nombre` — se embebe como `const` literal en tiempo de compilación (JSON válido es JS válido), tanto en el bundle de cliente como en cualquier build; no es un `require()` en tiempo de ejecución. `import { campo } from "ruta"` (con llaves) liga solo esa propiedad del objeto JSON. Dado que `valores` es un valor ya resuelto (no una función a ejecutar), no hace falta ningún cuerpo aparte ni esperar nada — ni siquiera entra en juego "Async/await implícito" aquí. `websc build` se ejecuta una sola vez, en Node, y genera un `.html` real por cada combinación; la ruta dinámica original sigue registrada como respaldo, por si se visita una combinación que no estaba en la lista — así una página nueva, aún no incluida en el build, sigue respondiendo por SSR en vez de dar un 404 sorpresa.
 
 ## Control de flujo en `visual`: `if`/`for`
 
@@ -141,7 +153,35 @@ watch(respuesta)
 - **`via`**: method — GET, POST, PUT o DELETE, todos tratados igual: pasan por `watch()`, y si no se llama a `WSON.send()` al final, se responde 200 por defecto. GET ya no tiene un caso especial ("ejecutar el script tal cual") — se unificó bajo `WSON.listen()`, lo cual lo mete gratis en la misma validación de colisión de rutas que el resto de métodos (antes, un GET vía `useRoute()` y un `WSON.listen()` con la misma URL nunca se comparaban entre sí).
 - La **query string no forma parte de `to`** — no identifica una ruta distinta, solo filtra/parametriza la misma ruta.
 - **`WSON.query(peticion)`** y **`WSON.params(peticion)`**: única vía de acceso a query string y params de ruta dentro del `watch()` — estáticos, como toda la API de `WSON`; se les pasa la instancia recibida. No hay inyección automática de esos valores en el content del WSON.
+- **Al lado contrario, enviando**: `GET`/`HEAD` no llevan body (lo prohíbe HTTP en sí) — si `WSON.send(instancia)` se llama con `via: "GET"` (o `"HEAD"`) y `content` es un objeto, se codifica automáticamente como query string sobre `to` en vez de perderse. Un `:param` en `to` no tiene mecanismo propio de sustitución — se construye el string ya resuelto antes de enviarlo, igual para cualquier `via`.
 - **El descifrado no es automático** — si el WSON recibido está cifrado, hay que llamar a `WSON.showContent()` explícitamente dentro del `watch()`.
+
+### `watch()` no es exclusivo de `WSON.listen()`
+
+`watch(nombre)` observa **cualquier** `reactive` de nivel superior de un `.wsb` — `string`, `boolean`, un DTO, `tipo(array)`... no solo las atadas a `WSON.listen()`. La diferencia es solo **qué la dispara**:
+
+- Una `reactive` atada a `WSON.listen()` se dispara por una petición HTTP real que encaje con su ruta (como hasta ahora).
+- Cualquier otra `reactive` se dispara al **reasignarla**, venga de donde venga esa asignación — típicamente desde dentro de otro `watch()` (incluido el de una ruta). Si ese segundo `watch()` reasigna a su vez una tercera `reactive` con su propio `watch()`, se encadena — todo dentro de la misma petición que arrancó la cascada.
+
+```
+reactive boolean activo = false
+var vecesActivado = 0
+
+watch(activo)
+	vecesActivado = vecesActivado + 1
+
+const WSON wsonActivar = -> to: "/activar" -> via: "GET"
+reactive any peticion = WSON.listen(wsonActivar)
+
+watch(peticion)
+	activo = true          // dispara watch(activo) en cascada
+	peticion.content = { vecesActivado: vecesActivado }
+	WSON.send(peticion)
+```
+
+La `reactive` observada y su `watch()` pueden vivir en ficheros distintos — al importar una de otro `.wsb`, su `watch()` (si lo tiene en el fichero origen) viaja con ella; si no lo tiene, quien la importa puede declarar su propio `watch()` para ella en su lugar.
+
+**Coherente con "Async/await implícito"** (más arriba): el disparo de un `watch()` de una `reactive` sin `WSON.listen()` SÍ se espera de verdad, sin que el usuario escriba `await` en ningún sitio — reasignar una `reactive` con `watch()` propio inyecta, en el propio código compilado, un `await` a la función que dispara ese `watch()`; si ese `watch()` reasigna otra con su propio `watch()`, se encadena, cada nivel esperando de verdad al siguiente. Un `WSON.send()` también se espera aunque no sea la última sentencia del cuerpo — antes solo se esperaba si era la última. `WSON.enqueue()` es la única excepción, y a propósito: es fire-and-forget por diseño (esperar sus reintentos con backoff dentro de la misma petición sería contraproducente). Un `watch()` que falla no tumba la petición que arrancó la cascada — se registra, no se propaga.
 
 **Validación:** no pueden registrarse dos `WSON.listen()` con el mismo endpoint + method — se valida en compilación para evitar colisiones silenciosas. Rutas con params dinámicos (`/ruta/:id` vs `/ruta/:otroNombre`) deben normalizarse para detectar la colisión aunque el texto no coincida.
 
@@ -218,6 +258,28 @@ Las clases núcleo del propio lenguaje (`Visual.ws`, `WSON.ws`) viven en una car
 
 **Protección de `lib`:** el compilador deniega **completamente** la modificación de estos ficheros (en vez de cifrarlos), comparando contra lo generado originalmente por el CLI, sin excepción ni flag para saltarse la validación. Mantiene el código legible y evita la complejidad de un cifrado/descifrado en cada carga.
 
+**Un `.wsf` puede importar un DTO de un `.wson`** (`import { Persona } from "./persona.wson"`) igual que un `.wsb` — la clase se genera como texto JS embebido en el bundle (no la clase de Node que usa el servidor, que depende de `require()`), reutilizando `typeMismatch` del propio runtime de cliente para la validación. Mismo límite que cualquier `reactive` de tipo objeto en cliente: un campo anidado de tipo `object` no se valida en profundidad.
+
+## Import de paquetes npm y de `.js` normal
+
+Un specifier de `import` que no empiece por `.` ni `/` (`import { algo } from "chalk"`) se trata como un paquete de npm real (o nativo de Node, `"path"`, `"fs"`...) — se resuelve con la propia resolución de módulos de Node (camina por `node_modules` hacia arriba desde el fichero), no con las extensiones propias del lenguaje.
+
+- **En servidor** (`.wsb`, y en las funciones que un `.wsb` importa de un `.ws`): es un `require()` real, sin ningún riesgo — Node ya sabe resolverlo, y el código corre en Node de todas formas.
+- **En cliente** (`.wsf`): **rechazado explícitamente**, con un mensaje claro — no hay ningún bundler que resuelva las propias dependencias transitivas del paquete, e incrustar su código a ciegas podría producir un bundle roto de formas difíciles de prever. No es una limitación temporal a ignorar: es una frontera consciente entre "esto es seguro" (servidor) y "esto podría romperse en silencio" (cliente).
+
+**Un `.js` normal, ya existente** (sin sus propias dependencias externas) sí se puede importar desde cualquiera de los dos lados — es la vía de adopción incremental: meter WebScript fichero a fichero dentro de un proyecto Node ya existente, sin reescribirlo todo de golpe. En servidor es un `require()` real; en cliente, su código fuente se incrusta tal cual en el bundle, envuelto en un módulo CommonJS aislado (`module.exports`/`exports`) — si ese `.js` a su vez importara o requiriera otra cosa, eso no se resuelve (sin bundler, solo se admite un fichero suelto).
+
+`import nombre from "ruta"` (sin llaves) liga el `module.exports` **entero** a `nombre` — pensado para un paquete/fichero cuyo export es un único valor (`module.exports = fn`), coherente con cómo se consumiría con un `require()` normal. `import { a, b } from "ruta"` (con llaves) desestructura esos nombres del objeto exportado — pensado para un export con varias cosas (`module.exports = { a, b }`).
+
+## Import entre `.wsb` (composición de rutas)
+
+Un `.wsb` puede importar de otro `.wsb`, con el mismo `import`/`export` nativo de JS que ya usan los `.ws`. Dos casos:
+
+- **Función o valor exportado**: mismo criterio que importar de un `.ws` — se trae tal cual, resuelto contra su propia carpeta si a su vez importa algo.
+- **Una ruta completa**: si lo que se exporta es una `reactive` que hace `WSON.listen(...)`, se trae consigo su `WSON` — quien la importa la sirve como si estuviera escrita ahí mismo. Su `watch()` viaja con ella SI lo tiene en el fichero origen (es opcional: quien importa puede declarar el suyo propio para esa misma `reactive` en su lugar — ver la sección de `watch()` generalizado, más arriba). Lo que esa ruta importada necesite (un DTO `.wson`, otra función) se resuelve contra la carpeta del fichero **origen** de la ruta, no la de quien la importa — así una ruta reutilizable no depende de dónde acabe usándose. El resto de estado de nivel superior del fichero origen (y los `watch()` de ese estado) viaja también, sin condición.
+
+`export` no oculta nada dentro de su propio fichero: una ruta exportada se sigue sirviendo igual si nadie la importa, exactamente como en JS exportar algo no le impide seguir funcionando localmente.
+
 ## CLI (`websc init`)
 
 Comando para generar un proyecto WebScript desde cero, incluyendo:
@@ -255,6 +317,40 @@ Se mantienen sin cambios: `const`.
 ## Sesiones
 
 El estado por visitante vive en los `var`/`reactive` declarados dentro de un `.wsb` — ya no hace falta el prefijo `server`, lo da la propia extensión del fichero. Expiran por inactividad, con un límite máximo de sesiones y desalojo LRU, y cookie `Secure` condicional (activa si el servidor está detrás de un proxy con terminación TLS real).
+
+## Base de datos: `.wsdb`
+
+Un nuevo tipo de fichero, paralelo a `.wson` pero para colecciones persistentes (no mensajes puntuales) — mismo formato de líneas `-> clave: valor`, con `-> schema:` en vez de `-> content:` para el esquema de campos:
+
+```
+// usuarios.wsdb
+-> collection: "usuarios"
+-> schema:
+	nombre: string
+	edad: integer
+```
+
+Se importa desde un `.wsb` como una clase real, con el nombre que se le pida (igual criterio que un DTO de `.wson`):
+
+```
+import { Usuario } from "./usuarios.wsdb"
+
+const usuario = new Usuario("Ana", 30)   // validado en el constructor, como cualquier DTO
+usuario.save()                            // INSERT o UPDATE según tenga id o no
+
+const mayores = Usuario.find({ edad: { gt: 18 } })   // SELECT con operadores, no un escaneo lineal
+const alguien = Usuario.findOne({ nombre: "Ana" })
+const porId = Usuario.findById(usuario.id)
+usuario.delete()
+```
+
+Operadores de consulta soportados: igualdad directa (`{ campo: valor }`) y comparación (`{ campo: { gt, gte, lt, lte, ne } }`). El constructor y cada reasignación posterior (`usuario.edad = "texto"`) validan el tipo declarado, reutilizando la misma `validateField` de los DTO — no es una capa aparte, es la misma validación del resto del lenguaje.
+
+**Solo tiene sentido en servidor.** Un `.wsdb` importado desde un `.wsf` se rechaza explícitamente, con mensaje claro — el navegador no tiene forma segura de hablar con una base de datos directamente (mismo criterio que un paquete de npm en cliente).
+
+**Motor: SQLite real, compilado a WebAssembly (`node-sqlite3-wasm`), no un binario nativo.** La alternativa obvia, `better-sqlite3`, exige compilación nativa (rompe "todo vendorizado, cero instalación"). La alternativa WASM más conocida, `sql.js`, no sirve para esto: no tiene persistencia incremental en disco — cada escritura exige serializar y reescribir la base de datos **entera**, un coste que crece con el tamaño total de la base, no con el cambio. `node-sqlite3-wasm` resuelve las dos cosas a la vez: es WASM puro (nada que compilar, vendorizable tal cual, sin binarios por plataforma) y tiene una VFS real que traduce el acceso a fichero de SQLite a `fs` de Node — persistencia incremental de verdad, confirmada escribiendo desde un proceso y leyendo el mismo fichero desde OTRO proceso sin cerrar el primero.
+
+Cada campo del esquema es una columna SQLite real (no un blob JSON) — un tipo primitivo (`string`/`integer`/`number`/`boolean`) mapea a su columna nativa; cualquier otro tipo (`object`, `tipo(array)`) se guarda como `TEXT` con el valor en JSON. Una única conexión por fichero de base de datos, compartida entre todas las colecciones que la usen (varias tablas en un mismo fichero `.wsdb-data/webscript.db`, junto al proyecto — no configurable todavía, fijo y sencillo en esta primera versión).
 
 ## Seguridad: CSRF
 

@@ -94,7 +94,13 @@ function showToken(token) {
 	}
 }
 
-function parse(args, headers, secret) {
+// `secret` firma (o verifica la firma); `encrypt` es un flag APARTE — solo
+// si está activo el content es de verdad ciphertext y hay que descifrarlo.
+// Confundir "tiene secret" con "está cifrado" (como hacía una versión
+// anterior de esta función) rompe el caso normal, mucho más frecuente,
+// de firmar sin cifrar: showContent() intentaría descifrar texto plano y
+// devolvería null.
+function parse(args, headers, secret, encrypt) {
 	const from = headers["x-wson-from"] || null;
 	const id = headers["x-wson-correlation-id"] || null;
 	const signature = getSignature(headers);
@@ -102,7 +108,7 @@ function parse(args, headers, secret) {
 
 	const rawContent = typeof args === "string" ? args : JSON.stringify(args);
 	const signatureValid = secret ? verify(rawContent, signature, secret, timestamp) : null;
-	const content = secret ? showContent(rawContent, secret) : rawContent;
+	const content = encrypt ? showContent(rawContent, secret) : rawContent;
 
 	return { from, id, content, signatureValid };
 }
@@ -114,9 +120,27 @@ function sendOne(instancia) {
 		const id = instancia.id || crypto.randomUUID();
 		const createdAt = instancia.createdAt || new Date().toISOString();
 		const timestamp = Date.now();
+		const method = (instancia.via || "POST").toUpperCase();
+		// GET/HEAD no llevan body — es HTTP en sí, no una elección nuestra
+		// (muchos proxies/balanceadores reales lo descartan o lo rechazan).
+		// El `content` de un GET se manda como query string en su lugar,
+		// que es la forma estándar de mandar datos en una petición sin body.
+		const isBodyless = method === "GET" || method === "HEAD";
 
-		let bodyContent = typeof instancia.content === "string" ? instancia.content : JSON.stringify(instancia.content || {});
-		if (instancia.encrypt) {
+		const url = new URL(instancia.to);
+		if (isBodyless && instancia.content && typeof instancia.content === "object" && !Array.isArray(instancia.content)) {
+			for (const [k, v] of Object.entries(instancia.content)) url.searchParams.set(k, String(v));
+		}
+
+		// Sin body, se firma sobre un content vacío — coherente con lo que
+		// de verdad llega al otro lado (si se firmara sobre el content
+		// completo pero no se mandara, la firma nunca verificaría).
+		let bodyContent = isBodyless
+			? ""
+			: typeof instancia.content === "string"
+				? instancia.content
+				: JSON.stringify(instancia.content || {});
+		if (instancia.encrypt && !isBodyless) {
 			if (!instancia.secret) throw new Error("encrypt: true requiere secret");
 			bodyContent = encryptContent(bodyContent, instancia.secret);
 		}
@@ -131,21 +155,16 @@ function sendOne(instancia) {
 		if (instancia.authorization) headers["Authorization"] = instancia.authorization;
 		if (instancia.httpCode) headers["X-WSON-Http-Code-Hint"] = String(instancia.httpCode); // informativo, no cifrado
 
-		const url = new URL(instancia.to);
 		const client = url.protocol === "https:" ? https : http;
-		const method = instancia.via || "POST";
+		const reqHeaders = isBodyless ? headers : { ...headers, "Content-Length": Buffer.byteLength(bodyContent) };
 
-		const req = client.request(
-			url,
-			{ method, headers: { ...headers, "Content-Length": Buffer.byteLength(bodyContent) } },
-			(res) => {
-				let data = "";
-				res.on("data", (chunk) => (data += chunk));
-				res.on("end", () => resolve({ status: res.statusCode, body: data, id, createdAt }));
-			}
-		);
+		const req = client.request(url, { method, headers: reqHeaders }, (res) => {
+			let data = "";
+			res.on("data", (chunk) => (data += chunk));
+			res.on("end", () => resolve({ status: res.statusCode, body: data, id, createdAt }));
+		});
 		req.on("error", reject);
-		req.write(bodyContent);
+		if (!isBodyless) req.write(bodyContent);
 		req.end();
 	});
 }

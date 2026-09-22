@@ -95,3 +95,18 @@ test("sin Visual.render(), devuelve string vacío (no es una página)", () => {
 	const html = ssr(["visual comp =", "<div></div>"]);
 	assert.equal(html, "");
 });
+
+test("REGRESIÓN bug real: una function declarada directamente en el propio .wsf se resuelve en SSR (antes solo las importadas de un .ws)", () => {
+	const html = ssr([
+		"function saludo(nombre)",
+		'\treturn "Hola, " + nombre',
+		"",
+		'const mensaje = saludo("Ana")',
+		"",
+		"visual app =",
+		"<p>{mensaje}</p>",
+		"",
+		"Visual.render(app)",
+	]);
+	assert.equal(html, "<p>Hola, Ana</p>");
+});

@@ -11,22 +11,7 @@
 // WSON.send()/etc. Conectar esto con el runtime y con la resolución de
 // `import` en el servidor es la siguiente pieza pendiente.
 
-function primitiveCheck(fieldType) {
-	switch (fieldType) {
-		case "string":
-			return (v) => typeof v === "string";
-		case "integer":
-			return (v) => Number.isInteger(v);
-		case "decimal":
-			return (v) => typeof v === "number";
-		case "boolean":
-			return (v) => typeof v === "boolean";
-		case "any":
-			return () => true;
-		default:
-			return null; // object / clase de usuario: no validado aquí
-	}
-}
+const { primitiveCheck } = require("./type-check");
 
 function validateField(field, value, path) {
 	if (value === undefined || value === null) {
@@ -112,4 +97,63 @@ function fieldValue(wsonAst, key) {
 	return f ? f.value.replace(/^["']|["']$/g, "") : null;
 }
 
-module.exports = { buildDtoClass, validateField };
+// Igual que buildDtoClass, pero como TEXTO JS en vez de una clase de Node
+// real — para incrustar en el bundle de cliente (que no tiene require(),
+// así que no puede recibir la clase ya construida, necesita su código
+// fuente). Reutiliza `typeMismatch` del propio runtime del navegador
+// (misma función que valida `reactive` con tipo) en vez de duplicar la
+// lógica de validación — por eso, a diferencia de `validateField` (usado
+// en servidor), un campo de tipo "object" anidado no se valida en
+// profundidad aquí: mismo límite ya documentado para cualquier `reactive`
+// de tipo objeto en cliente.
+function genDtoClassSource(wsonAst, className) {
+	const to = fieldValue(wsonAst, "to");
+	const via = fieldValue(wsonAst, "via");
+	const from = fieldValue(wsonAst, "from");
+	const contentSchema = wsonAst.fields.find((f) => f.type === "ContentSchema");
+	const schemaFields = contentSchema ? contentSchema.fields : [];
+	const jsStr = (s) => (s === null ? "null" : JSON.stringify(s));
+
+	const fieldsLiteral = JSON.stringify(
+		schemaFields.map((f) => ({ name: f.name, fieldType: f.fieldType, optional: !!f.optional }))
+	);
+
+	const accessors = schemaFields
+		.map(
+			(f) => `  get ${f.name}() { return this._${f.name}; }
+  set ${f.name}(value) {
+    const __msg = ${className}._checkField(${jsStr(f.name)}, value);
+    if (__msg) throw new TypeError(__msg);
+    this._${f.name} = value;
+  }`
+		)
+		.join("\n");
+
+	return `class ${className} {
+  static _fields = ${fieldsLiteral};
+  static _checkField(name, value) {
+    const field = ${className}._fields.find((f) => f.name === name);
+    if (!field) return null;
+    if (value === undefined || value === null) {
+      return field.optional ? null : \`Campo obligatorio "\${name}" no informado\`;
+    }
+    return typeMismatch(field.fieldType, value, \`"\${name}"\`);
+  }
+  constructor(...args) {
+    this.to = ${jsStr(to)};
+    this.via = ${jsStr(via)};
+    this.from = ${jsStr(from)};
+    this.httpCode = null;
+    this.id = null;
+    this.createdAt = null;
+    ${className}._fields.forEach((field, i) => {
+      const __msg = ${className}._checkField(field.name, args[i]);
+      if (__msg) throw new TypeError(__msg);
+      this["_" + field.name] = args[i];
+    });
+  }
+${accessors}
+}`;
+}
+
+module.exports = { buildDtoClass, validateField, genDtoClassSource };

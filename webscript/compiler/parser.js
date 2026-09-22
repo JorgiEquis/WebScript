@@ -136,6 +136,15 @@ const RULES = [
 		build: (m) => ({ names: m[1].split(",").map((s) => s.trim()), from: m[2] }),
 	},
 	{
+		// import por defecto (sin llaves) — pensado sobre todo para JSON,
+		// donde no tiene sentido desestructurar por nombre: `import posts
+		// from "./posts.json"` — el contenido entero del fichero queda
+		// ligado a `posts`.
+		type: "Import",
+		re: /^import\s+(\w+)\s+from\s*["']([^"']+)["']$/,
+		build: (m) => ({ names: [m[1]], from: m[2], isDefault: true }),
+	},
+	{
 		// export delante de cualquier otra declaración: se re-parsea el resto
 		// y se marca como exportada.
 		type: "Export",
@@ -160,7 +169,7 @@ const RULES = [
 	},
 	{
 		type: "ReactiveDecl",
-		re: /^reactive\s+(?:(\w+)\s+)?(\w+)\s*=\s*(.*)$/,
+		re: /^reactive\s+(?:([\w/]+(?:\(array\))?)\s+)?(\w+)\s*=\s*(.*)$/,
 		build: (m) => ({
 			varType: m[1] || null,
 			name: m[2],
@@ -170,12 +179,12 @@ const RULES = [
 	},
 	{
 		type: "VarDecl",
-		re: /^var\s+(?:([\w/]+)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
+		re: /^var\s+(?:([\w/]+(?:\(array\))?)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
 		build: (m) => ({ varType: m[1] || null, name: m[2], expr: m[3] }),
 	},
 	{
 		type: "ConstDecl",
-		re: /^const\s+(?:(\w+)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
+		re: /^const\s+(?:([\w/]+(?:\(array\))?)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
 		build: (m) => ({ varType: m[1] || null, name: m[2], expr: m[3] }),
 	},
 	{
@@ -237,14 +246,15 @@ function parsePropertyLine(node) {
 	return { type: "Property", key: m[1], value: m[2], line: node.line };
 }
 
-// Líneas hijas de un WSON ad-hoc o de un fichero .wson: "-> clave: valor",
-// con soporte especial para "-> content:" cuyo cuerpo es el esquema del DTO
-// (anidado por indentación, sin flecha).
+// Líneas hijas de un WSON ad-hoc, de un fichero .wson, o de un fichero
+// .wsdb: "-> clave: valor", con soporte especial para "-> content:" (WSON)
+// o "-> schema:" (WSDB) cuyo cuerpo es el esquema de campos (anidado por
+// indentación, sin flecha) — mismo formato de campo en los dos casos.
 function parseWsonMetaLine(node) {
 	const m = /^->\s*(\w+)\s*:\s*(.*)$/.exec(node.text);
 	if (!m) return { type: "Raw", text: node.text, line: node.line };
 
-	if (m[1] === "content" && m[2] === "") {
+	if ((m[1] === "content" || m[1] === "schema") && m[2] === "") {
 		return {
 			type: "ContentSchema",
 			fields: node.children.map(parseSchemaField),
@@ -285,6 +295,14 @@ function parseWsonFile(topLevelNodes) {
 	return { type: "WsonSchema", fields: topLevelNodes.map(parseWsonMetaLine) };
 }
 
+// Fichero .wsdb: mismo formato de líneas "-> clave: valor" que un .wson,
+// pero con "-> schema:" en vez de "-> content:", y su propio tipo de nodo
+// raíz (WsdbSchema) — para que codegen-wsdb.js lo reconozca sin
+// confundirlo con un DTO de mensajería puntual.
+function parseWsdbFile(topLevelNodes) {
+	return { type: "WsdbSchema", fields: topLevelNodes.map(parseWsonMetaLine) };
+}
+
 function parseNode(node) {
 	for (const rule of RULES) {
 		const m = rule.re.exec(node.text);
@@ -309,12 +327,16 @@ function parseNode(node) {
 	};
 }
 
-function parse(source, { isWsonFile = false } = {}) {
+function parse(source, { isWsonFile = false, isWsdbFile = false } = {}) {
 	const { tokenize, buildTree } = require("./lexer");
 
 	if (isWsonFile) {
 		const tree = buildTree(tokenize(source));
 		return parseWsonFile(tree);
+	}
+	if (isWsdbFile) {
+		const tree = buildTree(tokenize(source));
+		return parseWsdbFile(tree);
 	}
 
 	const lines = tokenize(source);

@@ -19,7 +19,7 @@ function post(port, body, headers = {}) {
 			(res) => {
 				let out = "";
 				res.on("data", (c) => (out += c));
-				res.on("end", () => resolve({ status: res.statusCode, body: out }));
+				res.on("end", () => resolve({ status: res.statusCode, body: out, headers: res.headers }));
 			}
 		);
 		req.on("error", reject);
@@ -106,31 +106,63 @@ test("servidor real: CSRF no aplica sin cookie de sesión (sistema externo)", as
 	});
 });
 
-test("servidor real: CSRF bloquea con sesión y sin token", async () => {
+function extractCookie(setCookieHeaders, name) {
+	const line = (setCookieHeaders || []).find((c) => c.startsWith(`${name}=`));
+	return line ? line.split(";")[0].split("=")[1] : null;
+}
+
+test("servidor real: la primera petición (sesión nueva) no exige CSRF, y deja cookies wsession/wcsrf reales", async () => {
 	await withServer(DEMO_SOURCE, {}, async (port) => {
-		const res = await post(port, { texto: "x" }, { Cookie: "wsession=abc" });
-		assert.equal(res.status, 403);
+		const res = await post(port, { texto: "x" });
+		assert.equal(res.status, 201);
+		const setCookie = res.headers["set-cookie"];
+		assert.ok(extractCookie(setCookie, "wsession"));
+		assert.ok(extractCookie(setCookie, "wcsrf"));
 	});
 });
 
-test("servidor real: CSRF bloquea con token que no coincide", async () => {
+test("servidor real: CSRF bloquea una sesión YA establecida sin el token correcto", async () => {
 	await withServer(DEMO_SOURCE, {}, async (port) => {
-		const res = await post(
-			port,
-			{ texto: "x" },
-			{ Cookie: "wsession=abc; wcsrf=correcto", "X-WebScript-CSRF": "incorrecto" }
-		);
-		assert.equal(res.status, 403);
+		const first = await post(port, { texto: "x" });
+		const wsession = extractCookie(first.headers["set-cookie"], "wsession");
+
+		const second = await post(port, { texto: "x" }, { Cookie: `wsession=${wsession}` }); // sin X-WebScript-CSRF
+		assert.equal(second.status, 403);
 	});
 });
 
-test("servidor real: CSRF deja pasar con token que sí coincide", async () => {
+test("servidor real: CSRF bloquea con token que no coincide con el real de la sesión", async () => {
 	await withServer(DEMO_SOURCE, {}, async (port) => {
-		const res = await post(
+		const first = await post(port, { texto: "x" });
+		const wsession = extractCookie(first.headers["set-cookie"], "wsession");
+
+		const second = await post(
 			port,
 			{ texto: "x" },
-			{ Cookie: "wsession=abc; wcsrf=correcto", "X-WebScript-CSRF": "correcto" }
+			{ Cookie: `wsession=${wsession}`, "X-WebScript-CSRF": "un-token-inventado" }
 		);
+		assert.equal(second.status, 403);
+	});
+});
+
+test("servidor real: CSRF deja pasar con el token real de la sesión", async () => {
+	await withServer(DEMO_SOURCE, {}, async (port) => {
+		const first = await post(port, { texto: "x" });
+		const wsession = extractCookie(first.headers["set-cookie"], "wsession");
+		const wcsrf = extractCookie(first.headers["set-cookie"], "wcsrf");
+
+		const second = await post(
+			port,
+			{ texto: "x" },
+			{ Cookie: `wsession=${wsession}`, "X-WebScript-CSRF": wcsrf }
+		);
+		assert.equal(second.status, 201);
+	});
+});
+
+test("servidor real: una sesión inventada (nunca emitida por el servidor) se trata como nueva, sin exigir CSRF", async () => {
+	await withServer(DEMO_SOURCE, {}, async (port) => {
+		const res = await post(port, { texto: "x" }, { Cookie: "wsession=id-que-nunca-existio" });
 		assert.equal(res.status, 201);
 	});
 });
@@ -151,7 +183,7 @@ function postJson(port, pathname, body, headers = {}) {
 			(res) => {
 				let out = "";
 				res.on("data", (c) => (out += c));
-				res.on("end", () => resolve({ status: res.statusCode, body: out }));
+				res.on("end", () => resolve({ status: res.statusCode, body: out, headers: res.headers }));
 			}
 		);
 		req.on("error", reject);

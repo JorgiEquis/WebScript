@@ -26,6 +26,7 @@ const {
 } = require("./codegen-client");
 
 const { compileRoutePatternClient } = require("./runtime");
+const { typeMismatch } = require("./type-check");
 
 function unquote(raw) {
 	return raw.replace(/^["']|["']$/g, "");
@@ -212,20 +213,31 @@ function renderPageToHTML(ast, { baseDir, requestUrl = "/" } = {}) {
 		: { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [] };
 
 	const reactiveMap = new Map(imported.reactiveInits.map((r) => [r.name, r.expr]));
-	for (const n of ast.body.filter((n) => n.type === "ReactiveDecl")) reactiveMap.set(n.name, n.expr);
+	const reactiveTypeMap = new Map(imported.reactiveInits.map((r) => [r.name, r.varType || null]));
+	for (const n of ast.body.filter((n) => n.type === "ReactiveDecl")) {
+		reactiveMap.set(n.name, n.expr);
+		reactiveTypeMap.set(n.name, n.varType || null);
+	}
 
 	// Snapshot: valores iniciales evaluados una vez, sin reactividad — es
 	// texto, no puede actualizarse solo.
 	const state = {};
 	for (const [name, expr] of reactiveMap) {
 		// eslint-disable-next-line no-new-func
-		state[name] = new Function(`return (${expr});`)();
+		const value = new Function(`return (${expr});`)();
+		const varType = reactiveTypeMap.get(name);
+		if (varType) {
+			const msg = typeMismatch(varType, value, `"${name}"`);
+			if (msg) throw new TypeError(msg);
+		}
+		state[name] = value;
 	}
 
 	const reactiveNames = [...reactiveMap.keys()];
 	const functions = {};
-	for (const f of imported.functionSources) {
-		functions[f.node.name] = compileFunctionForSSR(f.node, reactiveNames, state);
+	const ownFunctionDecls = ast.body.filter((n) => n.type === "FunctionDecl");
+	for (const node of [...imported.functionSources.map((f) => f.node), ...ownFunctionDecls]) {
+		functions[node.name] = compileFunctionForSSR(node, reactiveNames, state);
 	}
 
 	// const/var de nivel superior (Visual.route(), destructuring de

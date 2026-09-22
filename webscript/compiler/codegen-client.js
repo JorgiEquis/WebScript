@@ -13,8 +13,9 @@
 //   un `.wsb` es lógica de servidor, no algo que se ejecute en navegador).
 
 const fs = require("fs");
+const { genDtoClassSource } = require("./codegen-dto");
 const path = require("path");
-const { resolveImportPath } = require("./resolve-imports");
+const { resolveImportPath, isPackageSpecifier } = require("./resolve-imports");
 
 const RUNTIME_SOURCE = fs.readFileSync(path.join(__dirname, "runtime.js"), "utf8");
 
@@ -39,7 +40,10 @@ function unquote(raw) {
 function substituteReactive(expr, reactiveNames) {
 	let out = expr;
 	for (const name of reactiveNames) {
-		const re = new RegExp(`(?<!\\.)\\b${name}\\b`, "g");
+		// No sustituir si es una CLAVE de objeto literal ({ nombre: ... } o
+		// , nombre: ...) — solo el valor debe convertirse en state.nombre,
+		// la clave se queda tal cual.
+		const re = new RegExp(`(?<![.\\w])(?<![{,]\\s{0,20})\\b${name}\\b(?!\\s{0,20}:)`, "g");
 		out = out.replace(re, `state.${name}`);
 	}
 	return out;
@@ -147,10 +151,21 @@ function genFunctionSource(fnNode, reactiveNames) {
 // reprocesar el mismo fichero dos veces (imports compartidos/circulares).
 function collectImportedPieces(ast, baseDir, visited = new Set()) {
 	const { parse } = require("./parser");
-	const result = { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [] };
+	const result = { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [], topLevelInits: [], classSources: [], jsModuleSources: [] };
 
 	for (const node of ast.body) {
 		if (node.type !== "Import") continue;
+
+		if (isPackageSpecifier(node.from)) {
+			// A diferencia del servidor (donde esto es un require() real,
+			// sin riesgo), aquí no hay ningún bundler que resuelva las
+			// propias dependencias del paquete — incrustar su código a
+			// ciegas podría producir un bundle roto de formas difíciles de
+			// prever. Se rechaza con un mensaje claro, no en silencio.
+			throw new Error(
+				`No se puede importar el paquete "${node.from}" desde el cliente: no hay un bundler que resuelva sus propias dependencias (sí funciona en servidor, desde un .wsb). Si es código propio sin dependencias externas, usa una ruta relativa a un .js en su lugar.`
+			);
+		}
 
 		const targetPath = resolveImportPath(baseDir, node.from);
 		if (!targetPath) {
@@ -158,6 +173,62 @@ function collectImportedPieces(ast, baseDir, visited = new Set()) {
 		}
 		if (visited.has(targetPath)) continue;
 		visited.add(targetPath);
+
+		if (targetPath.endsWith(".js")) {
+			// JS normal ya existente, sin sus propias dependencias externas
+			// — vía de adopción incremental: meter WebScript fichero a
+			// fichero en un proyecto Node ya existente. Se incrusta su
+			// código fuente tal cual, envuelto en un módulo CommonJS
+			// aislado (module.exports/exports) — si ese .js a su vez
+			// importara/requiriera otra cosa, eso NO se resuelve aquí (sin
+			// bundler, solo se admite un fichero suelto).
+			const moduleId = `__jsmod_${result.jsModuleSources.length}`;
+			const jsSource = fs.readFileSync(targetPath, "utf8");
+			result.jsModuleSources.push(
+				`const ${moduleId} = (function () {\n  const module = { exports: {} };\n  const exports = module.exports;\n${jsSource}\n  return module.exports;\n})();`
+			);
+			if (node.isDefault) {
+				result.topLevelInits.push({ type: "ConstDecl", varType: null, name: node.names[0], expr: moduleId });
+			} else {
+				for (const name of node.names) {
+					result.topLevelInits.push({ type: "ConstDecl", varType: null, name, expr: `${moduleId}.${name}` });
+				}
+			}
+			continue;
+		}
+
+		if (targetPath.endsWith(".wsdb")) {
+			// Una base de datos es, por definición, algo del servidor — no
+			// hay forma segura ni con sentido de que el navegador hable con
+			// SQLite directamente. Mismo criterio que un paquete de npm:
+			// rechazo explícito, con mensaje claro, no un error genérico.
+			throw new Error(
+				`No se puede importar "${node.from}" desde el cliente: un .wsdb es una base de datos, solo tiene sentido en el servidor (desde un .wsb).`
+			);
+		}
+
+		if (targetPath.endsWith(".json")) {
+			// El contenido de un .json es dato puro, conocido en tiempo de
+			// compilación — se embebe como const literal (JSON válido es
+			// JS válido), no como un import en tiempo de ejecución (el
+			// bundle de cliente no tiene require()). `import posts from
+			// "./posts.json"` liga el contenido entero a `posts`; `import
+			// { campo } from "./datos.json"` liga solo esa propiedad.
+			const jsonContent = JSON.parse(fs.readFileSync(targetPath, "utf8"));
+			if (node.isDefault) {
+				result.topLevelInits.push({ type: "ConstDecl", varType: null, name: node.names[0], expr: JSON.stringify(jsonContent) });
+			} else {
+				for (const name of node.names) {
+					result.topLevelInits.push({
+						type: "ConstDecl",
+						varType: null,
+						name,
+						expr: JSON.stringify(jsonContent[name]),
+					});
+				}
+			}
+			continue;
+		}
 
 		if (targetPath.endsWith(".wsf")) {
 			const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
@@ -168,12 +239,34 @@ function collectImportedPieces(ast, baseDir, visited = new Set()) {
 			result.reactiveInits.push(...nested.reactiveInits);
 			result.functionSources.push(...nested.functionSources);
 			result.visualDecls.push(...nested.visualDecls);
+			result.topLevelInits.push(...nested.topLevelInits);
+			result.classSources.push(...nested.classSources);
+			result.jsModuleSources.push(...nested.jsModuleSources);
 
 			result.reactiveInits.push(
-				...targetAst.body.filter((n) => n.type === "ReactiveDecl").map((n) => ({ name: n.name, expr: n.expr }))
+				...targetAst.body.filter((n) => n.type === "ReactiveDecl").map((n) => ({ name: n.name, expr: n.expr, varType: n.varType }))
 			);
+			// Las function declaradas directamente en el .wsf importado
+			// (no solo las que a su vez importa de un .ws) también viajan
+			// — antes se quedaban fuera, y una función de un componente
+			// importado que la usara en su propio onclick/interpolación se
+			// quedaba sin definir en el bundle.
+			result.functionSources.push(...targetAst.body.filter((n) => n.type === "FunctionDecl").map((n) => ({ node: n })));
+			// const/var de nivel superior del .wsf importado — mismo
+			// criterio que reactive/function: se traen TODOS sin
+			// condición, la pida o no el import por nombre (antes no se
+			// traían en absoluto: ReferenceError real al usarlos).
+			result.topLevelInits.push(...targetAst.body.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl"));
 			result.visualDecls.push(...targetAst.body.filter((n) => n.type === "VisualDecl"));
 			result.styleNames.push(...targetAst.body.filter((n) => n.type === "StyleDecl").map((n) => n.name));
+			continue;
+		}
+
+		if (targetPath.endsWith(".wson")) {
+			const wsonAst = parse(fs.readFileSync(targetPath, "utf8"), { isWsonFile: true });
+			for (const name of node.names) {
+				result.classSources.push(genDtoClassSource(wsonAst, name));
+			}
 			continue;
 		}
 
@@ -181,26 +274,38 @@ function collectImportedPieces(ast, baseDir, visited = new Set()) {
 			const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
 			const declared = targetAst.body.map((n) => (n.type === "Export" ? n.declaration : n));
 
+			// TODAS las reactive del .ws se traen sin condición — igual
+			// que ya se hace al importar de otro .wsf (línea ~176). Una
+			// función importada puede depender de una reactive "hermana"
+			// que nadie pidió en el import; sin esto, se quedaba sin
+			// definir de verdad (ReferenceError real, no solo un valor
+			// perdido — confirmado antes de este arreglo).
+			result.reactiveInits.push(
+				...targetAst.body
+					.filter((n) => n.type === "ReactiveDecl")
+					.map((n) => ({ name: n.name, expr: n.expr, varType: n.varType }))
+			);
+			// const/var de nivel superior del .ws — mismo criterio: se
+			// traen todos sin condición (antes no se traían en absoluto).
+			result.topLevelInits.push(...targetAst.body.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl"));
+
 			for (const name of node.names) {
 				const decl = declared.find((d) => d && d.name === name);
 				if (!decl) throw new Error(`"${name}" no está exportado en ${targetPath}`);
 
 				if (decl.type === "FunctionDecl") {
 					// Las reactive globales que la función pueda usar son las
-					// del propio fichero de origen — se resuelven cuando se
-					// genera el bundle completo, no aquí; de momento se marca
-					// el nombre para sustituir más adelante.
+					// del propio fichero de origen — ya se trajeron arriba,
+					// se resuelven cuando se genera el bundle completo.
 					result.functionSources.push({ node: decl });
-				} else if (decl.type === "ReactiveDecl") {
-					result.reactiveInits.push({ name: decl.name, expr: decl.expr });
 				}
-				// ConstDecl/VarDecl exportado de un .ws: fuera de alcance por
-				// ahora (poco común, y no es reactive ni función).
+				// ReactiveDecl y ConstDecl/VarDecl: ya se trajeron arriba
+				// (todos, no solo los pedidos por nombre).
 			}
 			continue;
 		}
 
-		throw new Error(`Import no soportado en el cliente: "${node.from}" (solo .wsf y .ws)`);
+		throw new Error(`Import no soportado en el cliente: "${node.from}" (solo .wsf, .ws, .wson y .js)`);
 	}
 
 	return result;
@@ -352,25 +457,34 @@ function genElement(parentVar, node, ctx, lines) {
 	lines.push(`${parentVar}.appendChild(${elVar});`);
 }
 
+// Diffing de if/else: no hay "identidad de elemento" como en un for (una
+// rama no es un dato con el que comparar por referencia), así que lo que
+// sí se puede — y se hace — es no tocar nada si la rama activa sigue
+// siendo la misma tras reevaluar las condiciones. Antes, cualquier cambio
+// que disparara el effect (aunque la rama ganadora fuera la misma)
+// destruía y reconstruía el contenido igualmente.
 function genIfChain(parentVar, group, ctx, lines) {
 	const anchor = uniq("anchorStart");
 	const anchorEnd = uniq("anchorEnd");
+	const activeVar = uniq("activeBranch");
 	lines.push(`const ${anchor} = document.createComment("if");`);
 	lines.push(`const ${anchorEnd} = document.createComment("/if");`);
 	lines.push(`${parentVar}.appendChild(${anchor});`);
 	lines.push(`${parentVar}.appendChild(${anchorEnd});`);
+	lines.push(`let ${activeVar} = -1;`);
 
+	const hasExplicitElse = group.chain[group.chain.length - 1].type === "Else";
 	const branches = group.chain.map((branch) => ({
 		cond: branch.type === "Else" ? "true" : substituteReactive(branch.cond, ctx.reactiveNames),
 		body: branch.body || [],
 	}));
 
 	lines.push(`effect(() => {`);
-	// Solo lo que hay ENTRE los dos marcadores es de este bloque — no todo
-	// lo que venga después en el padre (puede incluir hermanos ajenos).
-	lines.push(`  while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
 	branches.forEach((b, idx) => {
 		lines.push(`  ${idx === 0 ? "if" : "else if"} (${b.cond}) {`);
+		lines.push(`    if (${activeVar} === ${idx}) return;`); // misma rama que antes: nada que hacer
+		lines.push(`    ${activeVar} = ${idx};`);
+		lines.push(`    while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
 		lines.push(`    const frag = document.createDocumentFragment();`);
 		const inner = [];
 		genChildren("frag", b.body, ctx, inner);
@@ -378,29 +492,63 @@ function genIfChain(parentVar, group, ctx, lines) {
 		lines.push(`    ${anchorEnd}.before(frag);`);
 		lines.push(`  }`);
 	});
+	if (!hasExplicitElse) {
+		// Sin `else` explícito: puede que ninguna condición se cumpla — hay
+		// que poder "desactivar" también ese caso (rama -1).
+		lines.push(`  else {`);
+		lines.push(`    if (${activeVar} === -1) return;`);
+		lines.push(`    ${activeVar} = -1;`);
+		lines.push(`    while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
+		lines.push(`  }`);
+	}
 	lines.push(`});`);
 }
 
+// Diffing por clave: la clave de cada elemento es el propio valor/objeto
+// (un Map ya distingue por referencia si es objeto, y por valor si es
+// primitivo — no hace falta sintaxis nueva para declarar una clave). Como
+// mutar una propiedad de un elemento no cambia su referencia, esto ya
+// reutiliza el nodo correcto en el caso común (reactive de objetos), sin
+// que el desarrollador tenga que hacer nada especial.
 function genFor(parentVar, node, ctx, lines) {
 	const anchor = uniq("anchorStart");
 	const anchorEnd = uniq("anchorEnd");
+	const keyMapVar = uniq("keyMap");
 	lines.push(`const ${anchor} = document.createComment("for");`);
 	lines.push(`const ${anchorEnd} = document.createComment("/for");`);
 	lines.push(`${parentVar}.appendChild(${anchor});`);
 	lines.push(`${parentVar}.appendChild(${anchorEnd});`);
+	lines.push(`const ${keyMapVar} = new Map();`);
 
 	const listExpr = substituteReactive(node.list, ctx.reactiveNames);
 	const innerCtx = { ...ctx, reactiveNames: ctx.reactiveNames.filter((n) => n !== node.item) };
 
 	lines.push(`effect(() => {`);
-	lines.push(`  while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
+	lines.push(`  const list = ${listExpr};`);
+	lines.push(`  const nextKeyMap = new Map();`);
 	lines.push(`  const frag = document.createDocumentFragment();`);
-	lines.push(`  for (const ${node.item} of ${listExpr}) {`);
+	lines.push(`  for (const ${node.item} of list) {`);
+	lines.push(`    let nodes = ${keyMapVar}.get(${node.item});`);
+	lines.push(`    if (nodes) {`);
+	lines.push(`      ${keyMapVar}.delete(${node.item});`); // consumido: lo que quede al final son los eliminados
+	lines.push(`    } else {`);
+	lines.push(`      const itemFrag = document.createDocumentFragment();`);
 	const inner = [];
-	genChildren("frag", node.body || [], innerCtx, inner);
-	inner.forEach((l) => lines.push("    " + l));
+	genChildren("itemFrag", node.body || [], innerCtx, inner);
+	inner.forEach((l) => lines.push("      " + l));
+	lines.push(`      nodes = Array.from(itemFrag.childNodes);`);
+	lines.push(`    }`);
+	// appendChild MUEVE un nodo si ya está en el documento — así los
+	// elementos reutilizados se reordenan sin recrearse.
+	lines.push(`    nodes.forEach((n) => frag.appendChild(n));`);
+	lines.push(`    nextKeyMap.set(${node.item}, nodes);`);
 	lines.push(`  }`);
+	// Lo que sigue entre los marcadores en este punto son solo los
+	// elementos NO reutilizados (los reutilizados ya se movieron a frag).
+	lines.push(`  while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
 	lines.push(`  ${anchorEnd}.before(frag);`);
+	lines.push(`  ${keyMapVar}.clear();`);
+	lines.push(`  for (const [k, v] of nextKeyMap) ${keyMapVar}.set(k, v);`);
 	lines.push(`});`);
 }
 
@@ -518,19 +666,44 @@ function genHydrateElement(cursorVar, node, ctx, lines) {
 function genHydrateIfChain(cursorVar, group, ctx, lines) {
 	const anchor = uniq("anchorStart");
 	const anchorEnd = uniq("anchorEnd");
+	const activeVar = uniq("activeBranch");
+	const mountedVar = uniq("mounted");
 	lines.push(`const ${anchor} = ${cursorVar};`);
 	lines.push(`const ${anchorEnd} = findBlockEnd(${anchor});`);
 	lines.push(`${cursorVar} = ${anchorEnd} ? ${anchorEnd}.nextSibling : ${anchor}.nextSibling;`);
+	lines.push(`let ${activeVar} = -1;`);
+	lines.push(`let ${mountedVar} = false;`);
 
+	const hasExplicitElse = group.chain[group.chain.length - 1].type === "Else";
 	const branches = group.chain.map((branch) => ({
 		cond: branch.type === "Else" ? "true" : substituteReactive(branch.cond, ctx.reactiveNames),
 		body: branch.body || [],
 	}));
 
 	lines.push(`effect(() => {`);
-	lines.push(`  while (${anchor}.nextSibling && ${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
+	// Primer paso: se hidrata de verdad la rama que ya coincide en el SSR
+	// (sus nodos ya existen entre los marcadores) — no se reconstruye nada.
+	lines.push(`  if (!${mountedVar}) {`);
+	lines.push(`    ${mountedVar} = true;`);
+	branches.forEach((b, idx) => {
+		const hcursor = uniq("hc");
+		lines.push(`    ${idx === 0 ? "if" : "else if"} (${b.cond}) {`);
+		lines.push(`      ${activeVar} = ${idx};`);
+		lines.push(`      let ${hcursor} = ${anchor}.nextSibling;`);
+		const hinner = [];
+		genHydrateChildren(hcursor, b.body, ctx, hinner);
+		hinner.forEach((l) => lines.push("      " + l));
+		lines.push(`    }`);
+	});
+	lines.push(`    return;`);
+	lines.push(`  }`);
+	// Cambios posteriores: mismo diffing de rama activa que en creación —
+	// si sigue siendo la misma rama, no se toca nada.
 	branches.forEach((b, idx) => {
 		lines.push(`  ${idx === 0 ? "if" : "else if"} (${b.cond}) {`);
+		lines.push(`    if (${activeVar} === ${idx}) return;`);
+		lines.push(`    ${activeVar} = ${idx};`);
+		lines.push(`    while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
 		lines.push(`    const frag = document.createDocumentFragment();`);
 		const inner = [];
 		genChildren("frag", b.body, ctx, inner);
@@ -538,28 +711,71 @@ function genHydrateIfChain(cursorVar, group, ctx, lines) {
 		lines.push(`    ${anchorEnd}.before(frag);`);
 		lines.push(`  }`);
 	});
+	if (!hasExplicitElse) {
+		lines.push(`  else {`);
+		lines.push(`    if (${activeVar} === -1) return;`);
+		lines.push(`    ${activeVar} = -1;`);
+		lines.push(`    while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
+		lines.push(`  }`);
+	}
 	lines.push(`});`);
 }
 
 function genHydrateFor(cursorVar, node, ctx, lines) {
 	const anchor = uniq("anchorStart");
 	const anchorEnd = uniq("anchorEnd");
+	const keyMapVar = uniq("keyMap");
+	const mountedVar = uniq("mounted");
+	const hcursor = uniq("hc");
+
 	lines.push(`const ${anchor} = ${cursorVar};`);
 	lines.push(`const ${anchorEnd} = findBlockEnd(${anchor});`);
 	lines.push(`${cursorVar} = ${anchorEnd} ? ${anchorEnd}.nextSibling : ${anchor}.nextSibling;`);
+	lines.push(`const ${keyMapVar} = new Map();`);
+	lines.push(`let ${mountedVar} = false;`);
 
 	const listExpr = substituteReactive(node.list, ctx.reactiveNames);
 	const innerCtx = { ...ctx, reactiveNames: ctx.reactiveNames.filter((n) => n !== node.item) };
 
 	lines.push(`effect(() => {`);
-	lines.push(`  while (${anchor}.nextSibling && ${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
-	lines.push(`  const frag = document.createDocumentFragment();`);
-	lines.push(`  for (const ${node.item} of ${listExpr}) {`);
-	const inner = [];
-	genChildren("frag", node.body || [], innerCtx, inner);
-	inner.forEach((l) => lines.push("    " + l));
+	lines.push(`  const list = ${listExpr};`);
+	lines.push(`  if (!${mountedVar}) {`);
+	lines.push(`    ${mountedVar} = true;`);
+	// Primer paso: se hidratan de verdad los nodos que ya puso el SSR, uno
+	// por elemento, guardándolos en el mapa de claves — nada se tira aquí.
+	lines.push(`    let ${hcursor} = ${anchor}.nextSibling;`);
+	lines.push(`    for (const ${node.item} of list) {`);
+	lines.push(`      const start = ${hcursor};`);
+	const hinner = [];
+	genHydrateChildren(hcursor, node.body || [], innerCtx, hinner);
+	hinner.forEach((l) => lines.push("      " + l));
+	lines.push(`      const nodes = [];`);
+	lines.push(`      for (let n = start; n && n !== ${hcursor}; n = n.nextSibling) nodes.push(n);`);
+	lines.push(`      ${keyMapVar}.set(${node.item}, nodes);`);
+	lines.push(`    }`);
+	lines.push(`    return;`);
 	lines.push(`  }`);
+	// Cambios posteriores: mismo diffing por clave que en modo creación.
+	lines.push(`  const nextKeyMap = new Map();`);
+	lines.push(`  const frag = document.createDocumentFragment();`);
+	lines.push(`  for (const ${node.item} of list) {`);
+	lines.push(`    let nodes = ${keyMapVar}.get(${node.item});`);
+	lines.push(`    if (nodes) {`);
+	lines.push(`      ${keyMapVar}.delete(${node.item});`);
+	lines.push(`    } else {`);
+	lines.push(`      const itemFrag = document.createDocumentFragment();`);
+	const inner = [];
+	genChildren("itemFrag", node.body || [], innerCtx, inner);
+	inner.forEach((l) => lines.push("      " + l));
+	lines.push(`      nodes = Array.from(itemFrag.childNodes);`);
+	lines.push(`    }`);
+	lines.push(`    nodes.forEach((n) => frag.appendChild(n));`);
+	lines.push(`    nextKeyMap.set(${node.item}, nodes);`);
+	lines.push(`  }`);
+	lines.push(`  while (${anchor}.nextSibling !== ${anchorEnd}) ${anchor}.nextSibling.remove();`);
 	lines.push(`  ${anchorEnd}.before(frag);`);
+	lines.push(`  ${keyMapVar}.clear();`);
+	lines.push(`  for (const [k, v] of nextKeyMap) ${keyMapVar}.set(k, v);`);
 	lines.push(`});`);
 }
 
@@ -594,16 +810,66 @@ function generateCreateFunction(visualDecl, ctx) {
 	return lines.join("\n");
 }
 
+// "screen" -> ["screen"]; "{id, tab}" -> ["id", "tab"]
+function extractBoundNames(name) {
+	if (name.startsWith("{")) {
+		return name
+			.slice(1, -1)
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+	}
+	return [name];
+}
+
 function generateClientBundle(ast, { baseDir } = {}) {
 	const imported = baseDir
 		? collectImportedPieces(ast, baseDir)
-		: { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [] };
+		: { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [], topLevelInits: [], classSources: [], jsModuleSources: [] };
 
 	// Las reactive propias del fichero ganan si hay colisión de nombre con
 	// una importada (poco probable, pero más predecible así).
 	const reactiveMap = new Map(imported.reactiveInits.map((r) => [r.name, r.expr]));
-	for (const n of ast.body.filter((n) => n.type === "ReactiveDecl")) reactiveMap.set(n.name, n.expr);
+	const reactiveTypeMap = new Map(imported.reactiveInits.map((r) => [r.name, r.varType || null]));
+	for (const n of ast.body.filter((n) => n.type === "ReactiveDecl")) {
+		reactiveMap.set(n.name, n.expr);
+		reactiveTypeMap.set(n.name, n.varType || null);
+	}
 	const reactiveNames = [...reactiveMap.keys()];
+
+	// const/var de nivel superior que dependen de Visual.route()/params()/
+	// query() (directa o transitivamente, p. ej. `const {id} =
+	// Visual.params(screen)` depende de `screen`) se tratan como
+	// REACTIVOS de verdad: sus nombres pasan a ser propiedades de `state`,
+	// recalculadas dentro de un único `effect()` — así cualquier
+	// interpolación que use `id`/`tab` se reevalúa sola cuando cambia la
+	// URL (`Visual.route()` ahora lee un estado reactivo interno, ver
+	// runtime.js). El resto de const/var de nivel superior (sin relación
+	// con la ruta) se compilan igual que antes, una sola vez.
+	const topLevelDeclsAll = [...imported.topLevelInits, ...ast.body.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl")];
+	const routeDerivedNames = new Set();
+	function dependsOnRoute(expr) {
+		if (/\bVisual\.(route|params|query)\(/.test(expr)) return true;
+		for (const n of routeDerivedNames) {
+			if (new RegExp(`\\b${n}\\b`).test(expr)) return true;
+		}
+		return false;
+	}
+	const routeDerivedDecls = [];
+	const plainTopLevelDecls = [];
+	for (const decl of topLevelDeclsAll) {
+		if (dependsOnRoute(decl.expr)) {
+			routeDerivedDecls.push(decl);
+			extractBoundNames(decl.name).forEach((n) => routeDerivedNames.add(n));
+		} else {
+			plainTopLevelDecls.push(decl);
+		}
+	}
+
+	// A partir de aquí, todo lo demás (plantillas, otras funciones) debe
+	// tratar id/tab/screen... como reactive de verdad — se añaden a la
+	// lista general ANTES de construir el ctx que usan genChildren/etc.
+	routeDerivedNames.forEach((n) => reactiveNames.push(n));
 
 	const ownVisuals = ast.body.filter((n) => n.type === "VisualDecl");
 	const allVisuals = [...imported.visualDecls, ...ownVisuals];
@@ -615,14 +881,47 @@ function generateClientBundle(ast, { baseDir } = {}) {
 	const ctx = { reactiveNames, visualNames, styleNames };
 
 	const stateInit = reactiveNames.map((name) => `  ${name}: ${reactiveMap.get(name)},`).join("\n");
-	const functionSources = imported.functionSources.map((f) => genFunctionSource(f.node, reactiveNames));
+	const typedNames = reactiveNames.filter((name) => reactiveTypeMap.get(name));
+	const typeSchemaLiteral = typedNames.map((name) => `  ${jsString(name)}: ${jsString(reactiveTypeMap.get(name))},`).join("\n");
+	// Funciones importadas de un .ws + las declaradas DIRECTAMENTE en este
+	// propio .wsf (antes solo se traían las importadas — una function
+	// declarada aquí mismo se llamaba desde un onclick pero nunca viajaba
+	// al bundle: ReferenceError real en el navegador al hacer clic).
+	const ownFunctionDecls = ast.body.filter((n) => n.type === "FunctionDecl");
+	const functionSources = [...imported.functionSources.map((f) => f.node), ...ownFunctionDecls].map((node) =>
+		genFunctionSource(node, reactiveNames)
+	);
+	// Clases DTO importadas de un .wson — ya vienen como texto JS completo
+	// (genDtoClassSource), no como nodos de AST que compilar aquí.
+	const classSources = imported.classSources;
+	// Módulos .js embebidos — deben ir ANTES que cualquier const/var que
+	// los referencie (incluidos los de topLevelInits, más abajo).
+	const jsModuleSources = imported.jsModuleSources;
 
-	// const/var de nivel superior que no son reactive (p. ej.
-	// `const Visual screen = Visual.route('/personas/:id')`, o
-	// `const {id} = Visual.params(screen)`) — se emiten como JS real, con
-	// sustitución de reactive globales por si las usan en su expresión.
-	const topLevelDecls = ast.body.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl");
-	const topLevelSources = topLevelDecls.map((n) => genFunctionStatement(n, reactiveNames));
+	// const/var de nivel superior SIN relación con la ruta (p. ej. algo
+	// derivado de una reactive) — se emiten como JS real, una sola vez.
+	const topLevelSources = plainTopLevelDecls.map((n) => genFunctionStatement(n, reactiveNames));
+
+	// Los derivados de ruta se recalculan dentro de un único effect() — la
+	// primera ejecución (inmediata, como todo effect()) deja los valores
+	// iniciales en `state`, y las siguientes ocurren solas cuando cambia
+	// la URL. `reactiveNamesForRouteEffect` NO incluye los propios nombres
+	// route-derived (dentro del effect son locals `const` normales, no se
+	// prefijan con `state.`), pero SÍ las reactive de verdad del fichero.
+	const reactiveNamesForRouteEffect = [...reactiveMap.keys()];
+	let routeEffectSource = "";
+	if (routeDerivedDecls.length > 0) {
+		const body = routeDerivedDecls
+			.map((d) => {
+				const rhs = substituteReactive(d.expr, reactiveNamesForRouteEffect);
+				const assigns = extractBoundNames(d.name)
+					.map((n) => `  state.${n} = ${n};`)
+					.join("\n");
+				return `  const ${d.name} = (${rhs});\n${assigns}`;
+			})
+			.join("\n");
+		routeEffectSource = `effect(() => {\n${body}\n});`;
+	}
 
 	const wsonSources = ast.body.filter((n) => n.type === "WsonInlineDecl").map(genWsonInlineSource);
 
@@ -631,10 +930,15 @@ function generateClientBundle(ast, { baseDir } = {}) {
 	const parts = [
 		"// Generado por WebScript (codegen-client.js) — no editar a mano",
 		RUNTIME_SOURCE,
-		`const state = createStore({\n${stateInit}\n});`,
+		...jsModuleSources,
+		...classSources,
+		typedNames.length > 0
+			? `const state = createStore({\n${stateInit}\n}, {\n${typeSchemaLiteral}\n});`
+			: `const state = createStore({\n${stateInit}\n});`,
 		...functionSources,
 		...wsonSources,
 		...topLevelSources,
+		...(routeEffectSource ? [routeEffectSource] : []),
 		...allVisuals.map((v) => generateCreateFunction(v, ctx)),
 		...allVisuals.map((v) => generateHydrateFunction(v, ctx)),
 	];

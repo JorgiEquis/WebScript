@@ -77,7 +77,35 @@ test("hidratación: contenido de slot (sin if/for) reutiliza el mismo nodo", () 
 	assert.equal(doc.querySelector("h3").textContent, "Panel");
 });
 
-test("hidratación: if/else sigue siendo reactivo tras hidratar (se reconstruye localmente, límite conocido)", () => {
+test("hidratación: if/else hidrata de verdad la rama que ya coincide con el SSR, y sobrevive a cambios que no cambian de rama", () => {
+	const { dom, doc, mount } = ssrThenHydrate([
+		"reactive contador = 0",
+		"visual app =",
+		"<div>",
+		"\tif (contador < 3)",
+		"\t\t<p>pocos</p>",
+		"\telse",
+		"\t\t<p>muchos</p>",
+		"</div>",
+		"Visual.render(app)",
+	]);
+
+	const pDelSSR = doc.querySelector("p");
+	pDelSSR.__marcaSSR = "del-ssr";
+
+	mount();
+
+	assert.equal(doc.querySelector("p").__marcaSSR, "del-ssr"); // reutilizado, no recreado al montar
+	assert.equal(doc.querySelector("p").textContent, "pocos");
+
+	dom.window.eval("state.contador = 1;"); // no cambia de rama
+	assert.equal(doc.querySelector("p").__marcaSSR, "del-ssr");
+
+	dom.window.eval("state.contador = 5;"); // cambia de rama de verdad
+	assert.equal(doc.querySelector("p").textContent, "muchos");
+});
+
+test("hidratación: if/else sigue siendo reactivo tras hidratar, cambiando de rama con un evento real", () => {
 	const { doc, mount } = ssrThenHydrate([
 		"reactive contador = 0",
 		"visual app =",
@@ -95,6 +123,34 @@ test("hidratación: if/else sigue siendo reactivo tras hidratar (se reconstruye 
 	assert.equal(doc.querySelectorAll("p")[0].textContent, "cero");
 	doc.querySelector("button").dispatchEvent(new doc.defaultView.Event("click"));
 	assert.equal(doc.querySelectorAll("p")[0].textContent, "no-cero");
+});
+
+test("hidratación: for con diffing por clave reutiliza los nodos del SSR de verdad, incluso al reordenar después", () => {
+	const { dom, doc, mount } = ssrThenHydrate([
+		'reactive items = [{ id: 1, texto: "uno" }, { id: 2, texto: "dos" }, { id: 3, texto: "tres" }]',
+		"visual app =",
+		"<ul>",
+		"\tfor (item in items)",
+		"\t\t<li>{item.texto}</li>",
+		"</ul>",
+		"Visual.render(app)",
+	]);
+
+	const liDosAntes = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "dos");
+	liDosAntes.__marcaSSR = "del-ssr";
+
+	mount();
+
+	// Ni siquiera hace falta cambiar la lista: el propio montaje debe
+	// haber reutilizado el nodo, no reconstruido el <ul> entero.
+	const liDosTrasMontar = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "dos");
+	assert.equal(liDosTrasMontar.__marcaSSR, "del-ssr");
+
+	dom.window.eval("state.items.reverse();");
+
+	const liDosTrasReordenar = Array.from(doc.querySelectorAll("li")).find((li) => li.textContent === "dos");
+	assert.equal(liDosTrasReordenar.__marcaSSR, "del-ssr");
+	assert.deepEqual(Array.from(doc.querySelectorAll("li")).map((li) => li.textContent), ["tres", "dos", "uno"]);
 });
 
 test("hidratación: for sigue siendo reactivo tras hidratar, y no rompe hermanos posteriores", () => {

@@ -1,13 +1,58 @@
 {
-	"name": "webscript-compiler",
-	"private": true,
+	"name": "websc",
+	"version": "0.1.0",
+	"description": "Compilador y CLI de WebScript — lenguaje que unifica HTML/CSS/JS y un servidor Node en un único proyecto (reactive, visual, WSON, SSR con hidratación real).",
+	"keywords": [
+		"webscript",
+		"compiler",
+		"reactive",
+		"ssr",
+		"cli"
+	],
+	"license": "MIT",
 	"bin": {
 		"websc": "./bin/websc.js"
+	},
+	"main": "./index.js",
+	"files": [
+		"bin/",
+		"templates/",
+		"index.js",
+		"lexer.js",
+		"html-parser.js",
+		"parser.js",
+		"codegen.js",
+		"codegen-client.js",
+		"codegen-server.js",
+		"codegen-dto.js",
+		"codegen-wsdb.js",
+		"type-check.js",
+		"codegen-ssr.js",
+		"resolve-imports.js",
+		"runtime.js",
+		"wson-runtime.js",
+		"validate-js-body.js",
+		"check-lib.js",
+		"route-pattern.js",
+		"discover-files.js",
+		"cli.js",
+		"serve-demo.js"
+	],
+	"engines": {
+		"node": ">=18"
 	},
 	"scripts": {
 		"test": "node --test tests/*.test.js"
 	},
 	"devDependencies": {
 		"jsdom": "^30.1.0"
+	},
+	"optionalDependencies": {
+		"redis": "^6.2.1"
+	},
+	"dependencies": {
+		"acorn": "^8.18.0",
+		"acorn-walk": "^8.3.5",
+		"node-sqlite3-wasm": "^0.8.60"
 	}
 }
