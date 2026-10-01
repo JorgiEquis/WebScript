@@ -95,7 +95,7 @@ test(
 			"watch(peticion)",
 			"\tvisitas++",
 			"\tpeticion.content = { visitas: visitas }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n");
 
 		const server = createServer(parse(source), { "session-store": "redis" });

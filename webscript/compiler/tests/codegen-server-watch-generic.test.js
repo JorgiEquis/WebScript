@@ -51,7 +51,7 @@ test("watch() sobre una reactive boolean (sin WSON.listen) se dispara al reasign
 		"watch(peticion)",
 		"\tactivo = true",
 		"\tpeticion.content = { activo: activo, vecesActivado: vecesActivado }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, null, async (port) => {
@@ -90,7 +90,7 @@ test("watch() sobre reactive string, tipo(array) y un DTO real, todos en cascada
 		'\tultimoMensaje = "hola"',
 		'\tultimaPersona = new Persona("Ana", 30)',
 		"\tpeticion.content = { historial: historial }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, { baseDir: dir }, async (port) => {
@@ -121,7 +121,7 @@ test("import .wsb: una reactive normal (sin WSON.listen) declarada en un fichero
 			"watch(peticion)",
 			"\tactivo = true",
 			"\tpeticion.content = { activo: activo, vecesActivado: vecesActivado }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -150,7 +150,7 @@ test("import .wsb: WSON.listen()+reactive en un fichero, watch() de esa misma re
 			"",
 			"watch(peticion)",
 			"\tpeticion.content = { ok: true }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -178,7 +178,7 @@ test("dos watch() para la misma reactive (colisión) se detectan con un error cl
 		"reactive any peticion = WSON.listen(wsonAlgo)",
 		"",
 		"watch(peticion)",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	assert.throws(() => createServer(parse(source), {}), /[Cc]olisión de watch\(\).*"activo"/);
@@ -209,7 +209,7 @@ test("REGRESIÓN (async/await implícito): un watch() en cascada que hace algo a
 		"watch(peticion)",
 		"\tactivo = true",
 		"\tpeticion.content = { ok: true }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	try {
@@ -259,7 +259,7 @@ test("REGRESIÓN (async/await implícito): WSON.send() se espera aunque NO sea l
 		"watch(peticion)",
 		"\tactivo = true",
 		"\tpeticion.content = { ok: true }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	try {
@@ -286,7 +286,7 @@ test("WSON.enqueue() sigue sin bloquear la petición — fire-and-forget A PROP�
 		"watch(peticion)",
 		'\tWSON.enqueue({ to: "http://localhost:9999/no-existe", via: "POST", content: {} })',
 		"\tpeticion.content = { ok: true }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, null, async (port) => {
@@ -311,7 +311,7 @@ test("un typo real se sigue detectando en un watch() aunque su cuerpo contenga a
 		"watch(peticion)",
 		"\tcontadr = contadr + 1", // typo real
 		"\tpeticion.content = { ok: true }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	assert.throws(() => createServer(parse(source), {}), /"contadr"/);
@@ -334,7 +334,7 @@ test("un watch() en cascada que falla no tumba la petición original (se registr
 		"watch(peticion)",
 		"\tactivo = true",
 		"\tpeticion.content = { ok: true }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, null, async (port) => {

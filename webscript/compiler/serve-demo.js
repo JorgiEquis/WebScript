@@ -48,19 +48,30 @@ if (/^\d+$/.test(args[args.length - 1])) {
 }
 
 // Un argumento que sea un directorio se escanea con el mismo criterio que
-// `websc build` (no recursivo; un .wsb importado por otro del propio
-// directorio se excluye, para no duplicar sus rutas) — así no hace falta
-// listar cada fichero uno a uno, igual que ya no hace falta con
+// `websc build` (findWsfFiles SÍ recorre subcarpetas — su ruta sale
+// entonces de su propia ruta relativa a ese directorio, ver
+// route-pattern.js; findWsbFiles sigue plana — un .wsb importado por otro
+// del propio directorio se excluye, para no duplicar sus rutas) — así no
+// hace falta listar cada fichero uno a uno, igual que ya no hace falta con
 // `websc build src/`.
-const wsfPaths = [];
+const wsfEntries = [];
 const wsbPaths = [];
 const desconocidos = [];
 for (const arg of args) {
 	if (fs.existsSync(arg) && fs.statSync(arg).isDirectory()) {
-		wsfPaths.push(...findWsfFiles(arg));
+		// Ruta relativa AL DIRECTORIO ESCANEADO, sin ".wsf" — es lo que
+		// decide el patrón de ruta cuando el fichero no declara su propio
+		// Visual.route() (src/api/listaProductos.wsf, escaneado desde
+		// src/, da "api/listaProductos" → /api/listaProductos).
+		for (const fullPath of findWsfFiles(arg)) {
+			const relNoExt = path.relative(arg, fullPath).replace(/\.wsf$/, "").split(path.sep).join("/");
+			wsfEntries.push({ wsfPath: fullPath, relNoExt });
+		}
 		wsbPaths.push(...findWsbFiles(arg));
 	} else if (arg.endsWith(".wsf")) {
-		wsfPaths.push(arg);
+		// Fichero suelto, sin carpeta de referencia: su ruta sale de su
+		// propio nombre, como siempre (sin subcarpeta que aportar).
+		wsfEntries.push({ wsfPath: arg, relNoExt: path.basename(arg, ".wsf") });
 	} else if (arg.endsWith(".wsb")) {
 		wsbPaths.push(arg);
 	} else {
@@ -71,22 +82,26 @@ if (desconocidos.length > 0) {
 	console.error(`Argumento no reconocido (se esperaba .wsf, .wsb, un directorio, o un puerto al final): ${desconocidos.join(", ")}`);
 	process.exit(1);
 }
-if (wsfPaths.length === 0) {
+if (wsfEntries.length === 0) {
 	console.error("Hace falta al menos un fichero .wsf");
 	process.exit(1);
 }
 
 // Cada página: su AST (para SSR real por petición), su bundle (cacheado,
 // no depende de la petición), y su patrón de ruta real — mismo criterio
-// que `websc build` (Visual.route() si lo declara, si no "/" + su nombre
-// de fichero), reutilizado desde route-pattern.js.
-const pages = wsfPaths.map((wsfPath) => {
+// que `websc build` (Visual.route() si lo declara; si no, la ruta sale del
+// propio fichero — con subcarpetas y ":param" en el nombre, ver
+// route-pattern.js), reutilizado desde route-pattern.js. `params`/`query`
+// (sistema nuevo, sin Visual.ws) solo se activan cuando el fichero NO
+// declara ya su propio Visual.route() — igual criterio que websc build.
+const pages = wsfEntries.map(({ wsfPath, relNoExt }) => {
 	const baseDir = path.dirname(path.resolve(wsfPath));
 	const ast = parse(fs.readFileSync(wsfPath, "utf8"), {});
-	const bundle = generateClientBundle(ast, { baseDir });
-	const baseName = path.basename(wsfPath, ".wsf");
-	const pattern = routePatternFor(ast, baseName);
-	return { wsfPath, baseDir, ast, bundle, pattern, matcher: compileRoutePatternClient(pattern) };
+	const pattern = routePatternFor(ast, relNoExt);
+	const hasExplicitRoute = ast.body.some((n) => (n.type === "ConstDecl" || n.type === "VarDecl") && /^Visual\.route\(/.test(n.expr));
+	const newSystemRoute = hasExplicitRoute ? null : pattern;
+	const bundle = generateClientBundle(ast, { baseDir, routePattern: newSystemRoute });
+	return { wsfPath, baseDir, ast, bundle, pattern, newSystemRoute, matcher: compileRoutePatternClient(pattern) };
 });
 
 // Con una sola página, se sirve también en "/" (de regalo, para poder
@@ -124,7 +139,7 @@ const server = http.createServer((req, res) => {
 			// SSR real, en cada petición — si la página usa Visual.route()
 			// con :params, esto es lo que hace que salga el valor correcto
 			// según la URL exacta pedida, no uno precalculado de antes.
-			const ssrHtml = renderPageToHTML(page.ast, { baseDir: page.baseDir, requestUrl: req.url });
+			const ssrHtml = renderPageToHTML(page.ast, { baseDir: page.baseDir, requestUrl: req.url, routePattern: page.newSystemRoute });
 			const html = `<!DOCTYPE html>\n<html lang="es">\n<head><meta charset="UTF-8"><title>WebScript</title></head>\n<body>${ssrHtml}<script>${page.bundle}</script></body>\n</html>\n`;
 			res.writeHead(200, { "Content-Type": "text/html" });
 			res.end(html);
@@ -140,7 +155,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, () => {
-	console.log(`${wsfPaths.length > 1 ? "Páginas" : "Página"}${apiHandler ? " + API" : ""} en http://localhost:${port}/`);
+	console.log(`${wsfEntries.length > 1 ? "Páginas" : "Página"}${apiHandler ? " + API" : ""} en http://localhost:${port}/`);
 	for (const p of pages) console.log(`  GET  ${p.pattern}  ->  ${path.basename(p.wsfPath)}`);
 	if (apiHandler) console.log(`  resto de rutas    -> la API combinada de ${wsbPaths.map((p) => path.basename(p)).join(", ")}`);
 });

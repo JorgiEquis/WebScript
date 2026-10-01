@@ -1,0 +1,50 @@
+{
+	"name": "websc-language",
+	"displayName": "WebScript",
+	"description": "Resaltado de sintaxis, información al pasar el ratón (hover) e ir a definición (Ctrl+Click) para WebScript (.wsf, .wsb, .ws, .wson, .wsdb).",
+	"version": "0.1.0",
+	"publisher": "webscript-local",
+	"engines": {
+		"vscode": "^1.75.0"
+	},
+	"categories": [
+		"Programming Languages"
+	],
+	"main": "./src/extension.js",
+	"activationEvents": [
+		"onLanguage:webscript"
+	],
+	"contributes": {
+		"languages": [
+			{
+				"id": "webscript",
+				"aliases": [
+					"WebScript",
+					"websc"
+				],
+				"extensions": [
+					".wsf",
+					".wsb",
+					".ws",
+					".wson",
+					".wsdb"
+				],
+				"configuration": "./language-configuration.json",
+				"icon": {
+					"light": "./images/websc-icon.svg",
+					"dark": "./images/websc-icon.svg"
+				}
+			}
+		],
+		"grammars": [
+			{
+				"language": "webscript",
+				"scopeName": "source.webscript",
+				"path": "./syntaxes/webscript.tmLanguage.json",
+				"embeddedLanguages": {
+					"meta.embedded.expr.webscript": "javascript"
+				}
+			}
+		]
+	}
+}

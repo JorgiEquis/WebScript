@@ -19,7 +19,7 @@ const SOURCE_CON_ERROR = [
 	"",
 	"watch(peticion)",
 	"\testo no es JS valido en absoluto ///// $$$",
-	"\tWSON.send(peticion)",
+	"\tWSON.httpSend(peticion)",
 ].join("\n");
 
 test("REGRESIÓN bug real: un error de sintaxis en watch() se detecta al CREAR el servidor, no en la primera petición", () => {
@@ -36,7 +36,7 @@ test("una ruta sin errores sigue funcionando con normalidad tras compilar una ve
 		"",
 		"watch(peticion)",
 		"\tpeticion.content = { ok: true }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	const server = createServer(parse(source), {});
@@ -97,7 +97,7 @@ test("integración real: websc build detecta un typo de variable de servidor con
 			"watch(peticion)",
 			"\tcontadr = contadr + 1",
 			"\tpeticion.content = { contador: contador }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 

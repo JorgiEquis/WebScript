@@ -1,20 +1,35 @@
 // discover-files.js — WebScript, v0
 //
-// Encuentra los .wsf/.wsb "servibles" de un directorio (no recursivo,
-// igual que websc build) — compartido entre bin/websc.js y serve-demo.js,
-// para que escanear una carpeta entera se comporte igual en los dos
-// sitios.
+// Encuentra los .wsf/.wsb "servibles" de un directorio, compartido entre
+// bin/websc.js y serve-demo.js para que escanear una carpeta entera se
+// comporte igual en los dos sitios. findWsfFiles SÍ recorre subcarpetas
+// (una página nueva sin Visual.route() saca su ruta de la ruta del propio
+// fichero); findWsbFiles sigue plana, sin cambios — no se ha tocado el
+// descubrimiento de .wsb.
 
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("./parser");
 const { resolveImportPath } = require("./resolve-imports");
 
+// findWsfFiles SÍ recorre subcarpetas (a diferencia de findWsbFiles, que
+// sigue plana a propósito — no se ha pedido tocar el descubrimiento de
+// .wsb): la ruta de una página nueva (sin Visual.route()) sale de la ruta
+// del propio fichero — src/api/listaProductos.wsf → /api/listaProductos —
+// así que hace falta encontrarlo primero. Devuelve rutas COMPLETAS, como
+// antes; quien llama calcula la ruta relativa a `srcDir` para el patrón de
+// ruta y el nombre de los ficheros de salida.
 function findWsfFiles(srcDir) {
-	return fs
-		.readdirSync(srcDir)
-		.filter((f) => f.endsWith(".wsf"))
-		.map((f) => path.join(srcDir, f));
+	const result = [];
+	for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+		const fullPath = path.join(srcDir, entry.name);
+		if (entry.isDirectory()) {
+			result.push(...findWsfFiles(fullPath));
+		} else if (entry.name.endsWith(".wsf")) {
+			result.push(fullPath);
+		}
+	}
+	return result;
 }
 
 // Un .wsb importado explícitamente por otro .wsb del propio directorio es

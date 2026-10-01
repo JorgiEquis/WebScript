@@ -153,7 +153,6 @@ function sendOne(instancia) {
 		if (instancia.from) headers["X-WSON-From"] = instancia.from;
 		headers["X-WSON-Correlation-Id"] = id;
 		if (instancia.authorization) headers["Authorization"] = instancia.authorization;
-		if (instancia.httpCode) headers["X-WSON-Http-Code-Hint"] = String(instancia.httpCode); // informativo, no cifrado
 
 		const client = url.protocol === "https:" ? https : http;
 		const reqHeaders = isBodyless ? headers : { ...headers, "Content-Length": Buffer.byteLength(bodyContent) };
@@ -195,9 +194,30 @@ async function enqueue(instancia, { retries = 3, baseDelayMs = 200 } = {}) {
 	})();
 }
 
+// `httpParams(instancia)`/`httpQuery(instancia)` leen `_params`/`_query` —
+// campos que solo existen en la instancia real que crea createRequestHandler
+// para una petición HTTP entrante (ver codegen-server.js). Cualquier otro
+// caso — un WSON construido a mano para enviarlo con `send()`, un valor
+// recibido por una `online function` (sin HTTP detrás), o una petición sin
+// :params/query string — no tiene nada que devolver: `null`, nunca `{}`
+// silencioso ni un `undefined` que reviente al desestructurar. Genéricas
+// aquí (no solo dentro de un `watch()` de ruta) para que decir "esto no es
+// una petición HTTP" sea gratis en cualquier sitio, sin duplicar la función.
+function httpParams(instancia) {
+	const p = instancia && instancia._params;
+	return p && Object.keys(p).length > 0 ? p : null;
+}
+
+function httpQuery(instancia) {
+	const q = instancia && instancia._query;
+	return q && Object.keys(q).length > 0 ? q : null;
+}
+
 module.exports = {
 	send,
 	enqueue,
+	httpParams,
+	httpQuery,
 	verify,
 	showContent,
 	encryptContent,

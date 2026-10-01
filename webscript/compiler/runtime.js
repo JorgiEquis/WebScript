@@ -235,6 +235,12 @@ function navigate(url, opts) {
 	routerState.href = target;
 }
 
+// `goto()` es el mismo `navigate()`, con el nombre reservado suelto del
+// sistema nuevo (HTML suelto, sin Visual.ws) — coherente con `params`/
+// `query`, ninguno de los tres lleva el prefijo `Visual.`. `Visual.navigate`
+// sigue existiendo, sin cambios, para el sistema antiguo.
+const goto = navigate;
+
 if (typeof window !== "undefined") {
 	window.addEventListener("popstate", () => {
 		routerState.href = location.href;

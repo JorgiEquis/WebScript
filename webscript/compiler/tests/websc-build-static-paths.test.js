@@ -93,9 +93,9 @@ test("Visual.staticPaths(screen, posts): genera un .html real por cada combinaci
 	assert.equal(fallback.static, false);
 
 	const html1 = fs.readFileSync(path.join(dir, "dist", "blog-mi-primer-post.html"), "utf8");
-	assert.match(html1, /<h1>Post: mi-primer-post<\/h1>/);
+	assert.match(html1, /<h1>(?:<!--t-->)?Post: mi-primer-post(?:<!--\/t-->)?<\/h1>/);
 	const html2 = fs.readFileSync(path.join(dir, "dist", "blog-otro-post.html"), "utf8");
-	assert.match(html2, /<h1>Post: otro-post<\/h1>/);
+	assert.match(html2, /<h1>(?:<!--t-->)?Post: otro-post(?:<!--\/t-->)?<\/h1>/);
 });
 
 test("import { campo } from ...json (con llaves): solo esa propiedad, no el fichero entero", () => {
@@ -125,7 +125,7 @@ test("import { campo } from ...json (con llaves): solo esa propiedad, no el fich
 	runWebsc(["build", dir]);
 
 	const html = fs.readFileSync(path.join(dir, "dist", "blog-post-a.html"), "utf8");
-	assert.match(html, /<h1>Post: post-a<\/h1>/);
+	assert.match(html, /<h1>(?:<!--t-->)?Post: post-a(?:<!--\/t-->)?<\/h1>/);
 });
 
 test("Visual.staticPaths() acepta cualquier const de nivel superior ya resuelto, no solo un import de .json", () => {
@@ -151,9 +151,9 @@ test("Visual.staticPaths() acepta cualquier const de nivel superior ya resuelto,
 	runWebsc(["build", dir]);
 
 	const html1 = fs.readFileSync(path.join(dir, "dist", "blog-post-x.html"), "utf8");
-	assert.match(html1, /<h1>Post: post-x<\/h1>/);
+	assert.match(html1, /<h1>(?:<!--t-->)?Post: post-x(?:<!--\/t-->)?<\/h1>/);
 	const html2 = fs.readFileSync(path.join(dir, "dist", "blog-post-y.html"), "utf8");
-	assert.match(html2, /<h1>Post: post-y<\/h1>/);
+	assert.match(html2, /<h1>(?:<!--t-->)?Post: post-y(?:<!--\/t-->)?<\/h1>/);
 });
 
 test("integración real: dist/server.js sirve las rutas pre-generadas incluso sin el .wsf ni el .json fuente, y da un 500 claro (aislado) para el fallback", async () => {
@@ -187,11 +187,11 @@ test("integración real: dist/server.js sirve las rutas pre-generadas incluso si
 	await withRunningServer(dir, async (port) => {
 		const r1 = await get(port, "/blog/mi-primer-post");
 		assert.equal(r1.status, 200);
-		assert.match(r1.body, /<h1>Post: mi-primer-post<\/h1>/);
+		assert.match(r1.body, /<h1>(?:<!--t-->)?Post: mi-primer-post(?:<!--\/t-->)?<\/h1>/);
 
 		const r2 = await get(port, "/blog/otro-post");
 		assert.equal(r2.status, 200);
-		assert.match(r2.body, /<h1>Post: otro-post<\/h1>/);
+		assert.match(r2.body, /<h1>(?:<!--t-->)?Post: otro-post(?:<!--\/t-->)?<\/h1>/);
 
 		const r3 = await get(port, "/blog/no-listado");
 		assert.equal(r3.status, 500);
@@ -227,6 +227,6 @@ test("integración real: el fallback dinámico renderiza un slug nuevo (no lista
 	await withRunningServer(dir, async (port) => {
 		const res = await get(port, "/blog/un-post-nuevo");
 		assert.equal(res.status, 200);
-		assert.match(res.body, /<h1>Post: un-post-nuevo<\/h1>/);
+		assert.match(res.body, /<h1>(?:<!--t-->)?Post: un-post-nuevo(?:<!--\/t-->)?<\/h1>/);
 	});
 });

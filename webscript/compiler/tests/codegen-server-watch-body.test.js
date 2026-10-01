@@ -41,7 +41,7 @@ test("REGRESIÓN bug real: un for dentro de watch() ejecuta de verdad su cuerpo 
 		"\tfor (n of numeros)",
 		"\t\ttotal = total + n",
 		"\tpeticion.content = { total: total }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -65,7 +65,7 @@ test("REGRESIÓN bug real: el estado de servidor SÍ se sustituye dentro del cue
 		"\tfor (n of numeros)",
 		"\t\tacumulado = acumulado + n",
 		"\tpeticion.content = { acumulado: acumulado }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -89,7 +89,7 @@ test("un if real anidado dentro de un for real dentro de watch() funciona correc
 		"\t\tif (n % 2 == 0)",
 		"\t\t\tpares.push(n)",
 		"\tpeticion.content = { pares: pares }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -113,7 +113,7 @@ test("un while real dentro de watch() ejecuta de verdad su cuerpo", async () => 
 		"\t\tresultado = resultado + i",
 		"\t\ti = i + 1",
 		"\tpeticion.content = { resultado: resultado }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -135,7 +135,7 @@ test("tipado de servidor: una reasignación con tipo incorrecto se rechaza con 4
 		"watch(peticion)",
 		'\tvisitas = "no soy un entero"',
 		"\tpeticion.content = { visitas: visitas }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -160,7 +160,7 @@ test("tipado de servidor: se rechaza igual dentro de un for — no hace falta qu
 		"\tfor (v of valores)",
 		"\t\tcontador = v",
 		"\tpeticion.content = { contador: contador }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -183,7 +183,7 @@ test("tipado de servidor: una reasignación con tipo correcto (incluido ++) sigu
 		"watch(peticion)",
 		"\tvisitas++",
 		"\tpeticion.content = { visitas: visitas }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -206,7 +206,7 @@ test("tipado de servidor: sin tipo declarado, cualquier reasignación sigue coli
 		"watch(peticion)",
 		'\tcontador = "cualquier cosa"',
 		"\tpeticion.content = { contador: contador }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {
@@ -235,7 +235,7 @@ test("substituteServerState no sustituye claves de objeto aunque estén justo de
 		"\tfor (x of lista)",
 		"\t\tconst obj = { edad: 99 }",
 		"\tpeticion.content = { edad: edad }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	await withServer(source, async (port) => {

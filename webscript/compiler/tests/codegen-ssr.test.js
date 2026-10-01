@@ -9,7 +9,7 @@ function ssr(sourceLines, opts) {
 
 test("interpolación de texto simple", () => {
 	const html = ssr(["reactive nombre = \"Ana\"", "visual app =", "<p>Hola {nombre}</p>", "Visual.render(app)"]);
-	assert.equal(html, "<p>Hola Ana</p>");
+	assert.equal(html, "<p><!--t-->Hola Ana<!--/t--></p>");
 });
 
 test("escapa HTML en el contenido interpolado (sin inyección)", () => {
@@ -45,7 +45,7 @@ test("for: renderiza todos los elementos de la lista", () => {
 		"</ul>",
 		"Visual.render(app)",
 	]);
-	assert.equal(html, "<ul><!--for--><li>a</li><li>b</li><li>c</li><!--/for--></ul>");
+	assert.equal(html, "<ul><!--for--><li><!--t-->a<!--/t--></li><li><!--t-->b<!--/t--></li><li><!--t-->c<!--/t--></li><!--/for--></ul>");
 });
 
 test("style: el nombre se compila a clase literal, no se evalúa como variable", () => {
@@ -73,7 +73,7 @@ test("composición: props se pasan al componente y slot recibe contenido del pad
 		"<tarjeta t={titulo}><p>contenido</p></tarjeta>",
 		"Visual.render(app)",
 	]);
-	assert.equal(html, "<div><h3>Panel</h3><p>contenido</p></div>");
+	assert.equal(html, "<div><h3><!--t-->Panel<!--/t--></h3><p>contenido</p></div>");
 });
 
 test("Visual.route()/params()/query() se resuelven contra requestUrl, no window.location", () => {
@@ -88,7 +88,7 @@ test("Visual.route()/params()/query() se resuelven contra requestUrl, no window.
 		],
 		{ requestUrl: "/personas/42?tab=datos" }
 	);
-	assert.equal(html, "<p>42-datos</p>");
+	assert.equal(html, "<p><!--t-->42-datos<!--/t--></p>");
 });
 
 test("sin Visual.render(), devuelve string vacío (no es una página)", () => {
@@ -108,5 +108,5 @@ test("REGRESIÓN bug real: una function declarada directamente en el propio .wsf
 		"",
 		"Visual.render(app)",
 	]);
-	assert.equal(html, "<p>Hola, Ana</p>");
+	assert.equal(html, "<p><!--t-->Hola, Ana<!--/t--></p>");
 });

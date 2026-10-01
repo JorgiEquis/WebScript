@@ -23,12 +23,12 @@ watch(peticionPersona)
 		contenido.listaPropiedades
 	)
 
-	// httpCode y WSON.send() no son obligatorios aquí — sin ellos, se
-	// responde 200 por defecto. Llamar a WSON.send(peticionPersona) en
-	// este contexto (dentro del watch de un listen) responde la propia
-	// petición entrante, no manda una llamada saliente nueva.
-	peticionPersona.httpCode = 201
-	WSON.send(peticionPersona)
+	// httpSend() no es obligatorio aquí — sin él, se responde 200 por
+	// defecto. WSON.httpSend(peticionPersona, 201) responde la propia
+	// petición entrante con el código indicado (por eso "http" en el
+	// nombre) — distinto de WSON.send(), que manda una llamada saliente
+	// nueva hacia cualquier otro destino.
+	WSON.httpSend(peticionPersona, 201)
 
 // GET /personas/:id — mismo mecanismo que POST, vía WSON.listen()/watch()
 // (el renderizado del visual en el cliente es cosa de Visual.route(), en
@@ -40,6 +40,6 @@ const WSON wsonObtenerPersona =
 reactive any peticionObtenerPersona = WSON.listen(wsonObtenerPersona)
 
 watch(peticionObtenerPersona)
-	var id = WSON.params(peticionObtenerPersona).id
+	var id = WSON.httpParams(peticionObtenerPersona).id
 	peticionObtenerPersona.content = { id: id, nombre: "Ana", edad: 30 }
-	WSON.send(peticionObtenerPersona)
+	WSON.httpSend(peticionObtenerPersona)

@@ -28,11 +28,14 @@ const COMPILER_FILES = [
 	"codegen-server.js",
 	"codegen-dto.js",
 	"codegen-wsdb.js",
+	"wsdb-query.js",
 	"type-check.js",
 	"codegen-ssr.js",
 	"resolve-imports.js",
 	"runtime.js",
 	"wson-runtime.js",
+	"websocket-runtime.js",
+	"wsclient-runtime.js",
 	"validate-js-body.js",
 	"check-lib.js",
 	"route-pattern.js",
@@ -40,7 +43,7 @@ const COMPILER_FILES = [
 	"cli.js",
 ];
 
-const LIB_FILES = ["Visual.ws", "WSON.ws"];
+const LIB_FILES = ["Visual.ws", "WSON.ws", "WSSchema.ws", "WSDB.ws"];
 
 const WCONFIG_TEMPLATE =
 	JSON.stringify(
@@ -179,6 +182,20 @@ function usesVisualQuery(ast) {
 	return ast.body.some((n) => (n.type === "ConstDecl" || n.type === "VarDecl") && /Visual\.query\(/.test(n.expr));
 }
 
+// Mismo motivo que usesVisualQuery, para el sistema NUEVO (sin
+// Visual.ws): una página sin `:param` en la ruta que use el `query`
+// reservado en su HTML tampoco puede precalcularse una sola vez en el
+// build — su contenido varía con la query string de cada petición. Se
+// comprueba de forma deliberadamente conservadora (por texto, sin
+// analizar árbol): un falso positivo solo hace que la página se sirva con
+// SSR dinámico en vez de precalculada (siempre correcto, solo menos
+// óptimo); un falso negativo serviría una query string SIEMPRE VACÍA —
+// eso sí sería un bug real, y es lo que esto evita.
+function usesReservedQuery(ast, target) {
+	if (!target) return false;
+	return /\bquery\b/.test(JSON.stringify(target.html));
+}
+
 // Visual.staticPaths(screen, posts) — para una página CON :params cuyos
 // valores posibles se conocen de antemano (un blog con tres posts, p.
 // ej.): en vez de renderizar por SSR en cada petición, se pre-generan sus
@@ -199,21 +216,60 @@ function findStaticPathsCall(ast) {
 // llegar a ella. Se excluyen las que dependen de Visual.route()/params()/
 // query() — irrelevantes aquí, y el `Visual` real ni siquiera está
 // disponible en este contexto de build.
+//
+// Cada declaración se evalúa POR SEPARADO, contra un ámbito que acumula las
+// anteriores, y solo se exige que salga bien la que liga `varName` (o las
+// que ella necesite). Antes era un único script con todas: cualquier
+// declaración importada que no se pudiera evaluar aquí tumbaba el build
+// entero aunque no tuviera nada que ver con `varName`. Con imports dentro de
+// un .ws ese caso es mucho más fácil de alcanzar (un .ws puede arrastrar una
+// const ligada a un módulo .js, o a algo que solo funciona en el navegador,
+// que este script no necesita para nada). Los módulos .js embebidos se
+// evalúan primero, también de forma tolerante.
 function resolveTopLevelValue(ast, varName, wsfFullPath, srcDir) {
-	const { collectImportedPieces } = loadCompilerModule("codegen-client");
+	const { collectImportedPieces, extractBoundNames } = loadCompilerModule("codegen-client");
 	const Module = require("module");
 	const imported = collectImportedPieces(ast, srcDir);
 	const localDecls = ast.body.filter(
 		(n) => (n.type === "ConstDecl" || n.type === "VarDecl") && !/\bVisual\.(route|params|query)\(/.test(n.expr)
 	);
 	const allDecls = [...imported.topLevelInits, ...localDecls];
-	const lines = allDecls.map((n) => `${n.type === "ConstDecl" ? "const" : "let"} ${n.name} = ${n.expr};`);
-	const script = [...lines, `return ${varName};`].join("\n");
-	// eslint-disable-next-line no-new-func
-	const fn = new Function("require", "__dirname", "__filename", script);
 	// require()/__dirname resueltos relativos al propio .wsf, no a
 	// bin/websc.js — por si alguna declaración usa require() ella misma.
-	return fn(Module.createRequire(wsfFullPath), path.dirname(wsfFullPath), wsfFullPath);
+	const req = Module.createRequire(wsfFullPath);
+	const dirName = path.dirname(wsfFullPath);
+	const scope = Object.create(null);
+
+	for (const src of imported.jsModuleSources || []) {
+		const m = /^\s*const\s+(__jsmod_\d+)/.exec(src);
+		if (!m) continue;
+		try {
+			// eslint-disable-next-line no-new-func
+			scope[m[1]] = new Function("require", "__dirname", "__filename", `${src}\nreturn ${m[1]};`)(req, dirName, wsfFullPath);
+		} catch {
+			// un módulo que solo funciona en el navegador: si nada lo necesita aquí, da igual
+		}
+	}
+
+	let causa = null;
+	for (const decl of allDecls) {
+		const bound = extractBoundNames(decl.name);
+		try {
+			// eslint-disable-next-line no-new-func
+			const fn = new Function(
+				"require",
+				"__dirname",
+				"__filename",
+				"__scope",
+				`with (__scope) { ${decl.type === "ConstDecl" ? "const" : "let"} ${decl.name} = ${decl.expr}; return { ${bound.join(", ")} }; }`
+			);
+			Object.assign(scope, fn(req, dirName, wsfFullPath, scope));
+		} catch (e) {
+			if (bound.includes(varName)) causa = e;
+		}
+	}
+	if (!(varName in scope)) throw causa || new Error(`"${varName}" no está definida en ${path.relative(process.cwd(), wsfFullPath)}`);
+	return scope[varName];
 }
 
 // Sustituye cada :nombre del patrón por el valor real de esa combinación
@@ -237,7 +293,40 @@ function fileNameForCombo(baseName, params) {
 	return `${baseName}-${sufijo}.html`;
 }
 
-async function cmdBuild(targetDir) {
+// Un .wsdb v2 ("-> name:") no genera ningún fichero propio en lib/ — su
+// API es la de las interfaces fijas Schema/WSDB (ver templates/lib/), las
+// mismas para cualquier colección. Lo que sí hace el build es validar
+// TODOS los .wsdb del proyecto (v1 y v2), aunque ningún .wsb los importe
+// todavía — incluida la resolución de "-> depends" (que el fichero
+// nombrado exista y sea v2) — para que un error de declaración salga
+// aquí, no en la primera petición real que use la colección.
+function validateWsdbFiles(srcDir) {
+	const { parse } = loadCompilerModule("parser");
+	const { readWsdbV2, resolveDependsTargets } = loadCompilerModule("codegen-wsdb");
+
+	(function walk(dir) {
+		for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+			if (e.name === "node_modules" || e.name === "dist" || e.name.startsWith(".")) continue;
+			const full = path.join(dir, e.name);
+			if (e.isDirectory()) {
+				walk(full);
+				continue;
+			}
+			if (!e.name.endsWith(".wsdb")) continue;
+			const rel = path.relative(process.cwd(), full);
+			let ast;
+			try {
+				ast = parse(fs.readFileSync(full, "utf8"), { isWsdbFile: true });
+			} catch (e) {
+				throw new Error(`${rel}: ${e.message}`);
+			}
+			const meta = readWsdbV2(ast, rel);
+			if (meta.depends.length > 0) resolveDependsTargets(meta, path.dirname(full), rel);
+		}
+	})(srcDir);
+}
+
+async function cmdBuild(targetDir, { createClients = false } = {}) {
 	const srcDir = path.join(targetDir, "src");
 	if (!fs.existsSync(srcDir)) {
 		console.error(`"${targetDir}" no tiene una carpeta src/.`);
@@ -245,8 +334,84 @@ async function cmdBuild(targetDir) {
 		return;
 	}
 
+	// `staticPaths` en wconfig.json: el equivalente, para el sistema nuevo
+	// (HTML suelto, sin Visual.ws), de `Visual.staticPaths(screen, valores)`
+	// del sistema antiguo. Como una página nueva no declara ningún `screen`
+	// (su ruta sale del propio nombre de fichero), la clave es el PATRÓN DE
+	// RUTA tal cual — el mismo string que ya calcula `routePatternFor` — y
+	// el valor son los combos posibles: un array inline, o la ruta (relativa
+	// a la raíz del proyecto, junto a wconfig.json) de un .json con ese
+	// array, para no tener que duplicar los datos dentro de wconfig.json.
+	//
+	//   { "staticPaths": { "/blog/:slug": [{ "slug": "a" }, { "slug": "b" }] } }
+	//   { "staticPaths": { "/blog/:slug": "src/posts.json" } }
+	//
+	// `clients`: qué .ws generar a partir de las `online function` de otro
+	// servidor WebScript — mismo trabajo que `websc client-generate <url>
+	// --out <fichero>`, pero declarado de una vez para todos los remotos
+	// del proyecto en vez de acordarse de cada URL/--out a mano. La clave
+	// es la ruta de salida (relativa a la raíz del proyecto); el valor, la
+	// URL wss://.
+	//
+	//   { "clients": { "src/OtroServidor.ws": "wss://otroservidor.com/" } }
+	//
+	// Ambas se leen aquí (no en dist/server.js, que lee wconfig.json en
+	// tiempo de EJECUCIÓN para el resto de opciones) porque generar los
+	// .html precalculados y sincronizar los clientes son cosa del BUILD.
+	let wconfigStaticPaths = {};
+	let wconfigClients = {};
+	const wconfigPath = path.join(targetDir, "wconfig.json");
+	if (fs.existsSync(wconfigPath)) {
+		const wconfig = JSON.parse(fs.readFileSync(wconfigPath, "utf8"));
+		wconfigStaticPaths = wconfig.staticPaths || {};
+		wconfigClients = wconfig.clients || {};
+	}
+
+	// `clients` SOLO se sincroniza con `--create-clients` — a diferencia de
+	// todo lo demás que hace `websc build`, esto necesita hablar por red con
+	// un servidor remoto que tiene que estar arrancado en ese momento; sin
+	// el flag, un `websc build` normal sigue siendo puro y sin red, como
+	// siempre. Un fallo de un remoto concreto (no arranca, no responde, no
+	// expone nada) NO tumba el build entero: se escribe una clase VACÍA (sin
+	// funciones) para ese remoto y se sigue con el siguiente — mismo
+	// espíritu que ya tiene el resto del build (un `.wsf` roto no debería
+	// impedir compilar los demás). Quien importe una función de esa clase
+	// vacía se entera con el error de siempre ("X no está exportado"), más
+	// específico y útil que un fallo de red genérico en mitad del build.
+	if (createClients) {
+		for (const [outPathRel, url] of Object.entries(wconfigClients)) {
+			const outPath = path.join(targetDir, outPathRel);
+			try {
+				const { cuerpo, nombresFunciones } = await generateClientContent(url);
+				const contenido = [
+					`// ${path.basename(outPath)} — generado por wconfig.json (clients) durante \`websc build --create-clients\` el ${new Date().toISOString()}`,
+					"// Este fichero se reescribe ENTERO en cada build con --create-clients — un cambio",
+					"// hecho a mano aquí se pierde en la siguiente regeneración.",
+					`// Fuente: ${url}`,
+					"",
+					cuerpo,
+					"",
+				].join("\n");
+				fs.mkdirSync(path.dirname(outPath), { recursive: true });
+				fs.writeFileSync(outPath, contenido);
+				console.log(`  clients: ${outPathRel}  <- ${url} (${nombresFunciones.length} online function: ${nombresFunciones.join(", ")})`);
+			} catch (err) {
+				const contenido = [
+					`// ${path.basename(outPath)} — generado por wconfig.json (clients) durante \`websc build --create-clients\` el ${new Date().toISOString()}`,
+					`// VACÍO: no se pudo generar contra ${url} en este build — ${err.message}`,
+					"// El resto del build siguió con normalidad; vuelve a construir con el remoto",
+					"// disponible para rellenar esta clase con sus online function reales.",
+					"",
+				].join("\n");
+				fs.mkdirSync(path.dirname(outPath), { recursive: true });
+				fs.writeFileSync(outPath, contenido);
+				console.log(`  clients: ${outPathRel}  <- ${url}: FALLÓ (${err.message}) — se dejó una clase vacía y se sigue con el resto del build`);
+			}
+		}
+	}
+
 	const { parse } = loadCompilerModule("parser");
-	const { classifyWsf } = loadCompilerModule("codegen");
+	const { classifyWsf, findImplicitPageTarget } = loadCompilerModule("codegen");
 	const { generateClientBundle } = loadCompilerModule("codegen-client");
 	const { createRequestHandler } = loadCompilerModule("codegen-server");
 	const { renderPageToHTML } = loadCompilerModule("codegen-ssr");
@@ -255,8 +420,10 @@ async function cmdBuild(targetDir) {
 	fs.rmSync(distDir, { recursive: true, force: true });
 	fs.mkdirSync(distDir, { recursive: true });
 
-	const wsfFiles = findWsfFiles(srcDir).map((f) => path.basename(f));
+	const wsfFiles = findWsfFiles(srcDir).map((f) => path.relative(srcDir, f).split(path.sep).join("/"));
 	const wsbFiles = findWsbFiles(srcDir).map((f) => path.basename(f));
+
+	validateWsdbFiles(srcDir);
 
 	// --- Cliente: un bundle por cada .wsf "page". El HTML de una página
 	// SIN :params en su ruta ni uso de Visual.query() no puede variar entre
@@ -271,13 +438,32 @@ async function cmdBuild(targetDir) {
 		const ast = parse(fs.readFileSync(fullPath, "utf8"));
 		if (classifyWsf(ast) !== "page") continue; // library: no genera página propia
 
-		const bundle = generateClientBundle(ast, { baseDir: srcDir });
+		const relNoExt = file.slice(0, -".wsf".length);
 		const baseName = path.basename(file, ".wsf");
-		const bundleFile = `${baseName}.bundle.js`;
-		fs.writeFileSync(path.join(distDir, bundleFile), bundle);
-
-		const pattern = routePatternFor(ast, baseName);
+		const pattern = routePatternFor(ast, relNoExt);
 		if (pattern === "/") sawRoot = true;
+
+		// El sistema NUEVO (HTML suelto, sin Visual.ws) da acceso a
+		// `params`/`query` calculados contra el patrón de ruta que sale
+		// del propio nombre de fichero. Un .wsf del sistema ANTIGUO, con
+		// su propio `Visual.route()`, no los recibe (sigue con
+		// `Visual.params(screen)`/`Visual.query(screen)`, sin tocar) — así
+		// que solo se pasa cuando el fichero NO declara ya su propia ruta.
+		const hasExplicitRoute = ast.body.some((n) => (n.type === "ConstDecl" || n.type === "VarDecl") && /^Visual\.route\(/.test(n.expr));
+		const routePatternForNewSystem = hasExplicitRoute ? null : pattern;
+
+		const bundle = generateClientBundle(ast, { baseDir: srcDir, routePattern: routePatternForNewSystem });
+		// Nombre de los ficheros de SALIDA (bundle, .html): igual que
+		// siempre para un fichero suelto en `src/` sin ":" en el nombre
+		// (compatibilidad total — antes nadie podía tener uno con ":",
+		// así que no hay nada que preservar ahí). Para uno en una
+		// subcarpeta (que antes ni se descubría) o con ":param" en el
+		// nombre, se aplana con "-" — evita tanto el choque entre dos
+		// páginas de igual nombre en carpetas distintas como un ":" suelto
+		// en el nombre del fichero de salida.
+		const fileSlug = relNoExt.includes("/") || relNoExt.includes(":") ? relNoExt.split("/").join("-").split(":").join("-") : baseName;
+		const bundleFile = `${fileSlug}.bundle.js`;
+		fs.writeFileSync(path.join(distDir, bundleFile), bundle);
 
 		const staticPathsCall = pattern.includes(":") ? findStaticPathsCall(ast) : null;
 
@@ -298,8 +484,8 @@ async function cmdBuild(targetDir) {
 			}
 			for (const combo of combos) {
 				const rutaResuelta = resolvePatternWithParams(pattern, combo);
-				const ssrHtml = renderPageToHTML(ast, { baseDir: srcDir, requestUrl: rutaResuelta });
-				const htmlFile = fileNameForCombo(baseName, combo);
+				const ssrHtml = renderPageToHTML(ast, { baseDir: srcDir, requestUrl: rutaResuelta, routePattern: routePatternForNewSystem });
+				const htmlFile = fileNameForCombo(fileSlug, combo);
 				const html = `<!DOCTYPE html>\n<html lang="es">\n<head><meta charset="UTF-8"></head>\n<body>${ssrHtml}<script>${bundle}</script></body>\n</html>\n`;
 				fs.writeFileSync(path.join(distDir, htmlFile), html);
 				pages.push({ wsfFile: `../src/${file}`, pattern: rutaResuelta, bundleFile, static: true, htmlFile });
@@ -308,16 +494,47 @@ async function cmdBuild(targetDir) {
 			// alguien visita una combinación que no estaba en la lista
 			// (contenido nuevo, aún no incluido en el build), responde con
 			// SSR real en vez de un 404 sorpresa.
-			pages.push({ wsfFile: `../src/${file}`, pattern, bundleFile, static: false, staticPathsFallback: true });
+			pages.push({ wsfFile: `../src/${file}`, pattern, bundleFile, static: false, staticPathsFallback: true, newSystemRoute: null });
 			continue;
 		}
 
-		const isStatic = !pattern.includes(":") && !usesVisualQuery(ast);
-		const page = { wsfFile: `../src/${file}`, pattern, bundleFile, static: isStatic };
+		// Equivalente de lo de arriba para el sistema NUEVO: los combos
+		// posibles salen de `wconfig.json` (`staticPaths[patrón]`, ver el
+		// comentario al principio de esta función), no de una llamada
+		// dentro del fichero — no hay `screen`/Visual.route() al que
+		// atarla. Mismo criterio de generación: un .html por combinación,
+		// más la ruta dinámica de siempre como red de seguridad.
+		const wconfigCombosRaw = routePatternForNewSystem && pattern.includes(":") ? wconfigStaticPaths[pattern] : undefined;
+		if (wconfigCombosRaw !== undefined) {
+			const combos =
+				typeof wconfigCombosRaw === "string"
+					? JSON.parse(fs.readFileSync(path.join(targetDir, wconfigCombosRaw), "utf8"))
+					: wconfigCombosRaw;
+			if (!Array.isArray(combos)) {
+				throw new Error(`wconfig.json: staticPaths["${pattern}"] debe ser un array de objetos (o la ruta a un .json con ese array), no ${typeof combos}`);
+			}
+			for (const combo of combos) {
+				const rutaResuelta = resolvePatternWithParams(pattern, combo);
+				const ssrHtml = renderPageToHTML(ast, { baseDir: srcDir, requestUrl: rutaResuelta, routePattern: routePatternForNewSystem });
+				const htmlFile = fileNameForCombo(fileSlug, combo);
+				const html = `<!DOCTYPE html>\n<html lang="es">\n<head><meta charset="UTF-8"></head>\n<body>${ssrHtml}<script>${bundle}</script></body>\n</html>\n`;
+				fs.writeFileSync(path.join(distDir, htmlFile), html);
+				pages.push({ wsfFile: `../src/${file}`, pattern: rutaResuelta, bundleFile, static: true, htmlFile });
+			}
+			pages.push({ wsfFile: `../src/${file}`, pattern, bundleFile, static: false, staticPathsFallback: true, newSystemRoute: routePatternForNewSystem });
+			continue;
+		}
+
+		const isStatic = !pattern.includes(":") && !usesVisualQuery(ast) && !usesReservedQuery(ast, routePatternForNewSystem ? findImplicitPageTarget(ast) : null);
+		// `newSystemRoute` viaja hasta pages.json y de ahí al dist/server.js
+		// generado: es lo que le dice, EN CADA PETICIÓN dinámica, si debe
+		// pasarle `routePattern` a renderPageToHTML (sistema nuevo, sin
+		// Visual.route() propio) o no (sistema antiguo, sin tocar).
+		const page = { wsfFile: `../src/${file}`, pattern, bundleFile, static: isStatic, newSystemRoute: routePatternForNewSystem };
 
 		if (isStatic) {
-			const ssrHtml = renderPageToHTML(ast, { baseDir: srcDir, requestUrl: pattern });
-			const htmlFile = `${baseName}.html`;
+			const ssrHtml = renderPageToHTML(ast, { baseDir: srcDir, requestUrl: pattern, routePattern: routePatternForNewSystem });
+			const htmlFile = `${fileSlug}.html`;
 			const html = `<!DOCTYPE html>\n<html lang="es">\n<head><meta charset="UTF-8"></head>\n<body>${ssrHtml}<script>${bundle}</script></body>\n</html>\n`;
 			fs.writeFileSync(path.join(distDir, htmlFile), html);
 			page.htmlFile = htmlFile;
@@ -374,7 +591,7 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const { parse } = require("../compiler/parser");
-const { createRequestHandler } = require("../compiler/codegen-server");
+const { createRequestHandler, wireOnlineFunctionsRpc } = require("../compiler/codegen-server");
 const { renderPageToHTML } = require("../compiler/codegen-ssr");
 const { compileRoutePatternClient } = require("../compiler/runtime");
 
@@ -442,7 +659,7 @@ const server = http.createServer((req, res) => {
 			}
 			const html = page.static
 				? page.html
-				: \`<!DOCTYPE html>\\n<html lang="es">\\n<head><meta charset="UTF-8"></head>\\n<body>\${renderPageToHTML(page.ast, { baseDir: srcDir, requestUrl: req.url })}<script>\${page.bundle}</script></body>\\n</html>\\n\`;
+				: \`<!DOCTYPE html>\\n<html lang="es">\\n<head><meta charset="UTF-8"></head>\\n<body>\${renderPageToHTML(page.ast, { baseDir: srcDir, requestUrl: req.url, routePattern: page.newSystemRoute })}<script>\${page.bundle}</script></body>\\n</html>\\n\`;
 			res.writeHead(200, { "Content-Type": "text/html" });
 			res.end(html);
 			return;
@@ -455,9 +672,90 @@ const server = http.createServer((req, res) => {
 	res.end(JSON.stringify({ error: "no encontrado" }));
 });
 
+if (apiHandler && apiHandler.onlineFunctions.length > 0) wireOnlineFunctionsRpc(server, apiHandler.onlineFunctions);
+
 const port = wconfig.port || 3000;
 server.listen(port, () => console.log(\`Servidor en http://localhost:\${port}/\`));
 `;
+
+// Conecta por WebSocket a `url`, pide reflexión, y devuelve el CONTENIDO del
+// fichero .ws generado (sin escribirlo) — o lanza si algo falla (sin
+// conexión, sin respuesta a tiempo, respuesta no-JSON, o cero `online
+// function` expuestas). Compartida entre `websc client-generate` (falla
+// rápido, es una herramienta de un solo uso) y `websc build --create-clients`
+// (tolerante: quien la llama decide qué hacer si falla — ver más abajo).
+async function generateClientContent(url) {
+	if (!/^wss?:\/\//.test(url)) throw new Error(`"${url}" no es una URL de WebSocket (debe empezar por ws:// o wss://)`);
+
+	const websocket = require(path.join(SELF_COMPILER_DIR, "websocket-runtime"));
+	let ws;
+	try {
+		ws = await websocket.connect(url);
+	} catch (err) {
+		throw new Error(`no se ha podido conectar a "${url}": ${err.message}`);
+	}
+
+	const funciones = await new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`"${url}" no respondió a la reflexión en 10 segundos`)), 10000);
+		ws.parser.on("message", (msg) => {
+			clearTimeout(timer);
+			try {
+				resolve(JSON.parse(msg.text).functions);
+			} catch {
+				reject(new Error(`"${url}" respondió algo que no es JSON válido — ¿es de verdad un servidor WebScript?`));
+			}
+		});
+		ws.parser.on("error", (err) => {
+			clearTimeout(timer);
+			reject(err);
+		});
+		ws.send(JSON.stringify({ type: "reflect" }));
+	}).finally(() => ws.socket.end());
+
+	if (!funciones || funciones.length === 0) throw new Error(`"${url}" no expone ninguna "online function" — nada que generar`);
+
+	const cuerpo = funciones
+		.map(({ name, params, idempotent }) => {
+			const paramList = [...params, "opts"].join(", ");
+			const idemComentario = idempotent
+				? `\t// -> idempotent en el servidor: pasar { idempotencyKey } en \`opts\` para que reintentar sea seguro`
+				: `\t// no declarada -> idempotent: reintentar puede repetir su efecto`;
+			return [`export function ${name}(${paramList})`, idemComentario, `\treturn WSClient.create(${JSON.stringify(url)}).llamar(${JSON.stringify(name)}, [${params.join(", ")}], opts)`].join("\n");
+		})
+		.join("\n\n");
+
+	return { cuerpo, nombresFunciones: funciones.map((f) => f.name) };
+}
+
+async function cmdClientGenerate(url, outPath) {
+	if (!outPath) throw new Error('websc client-generate <url> --out <fichero.ws> — falta "--out"');
+
+	// Deliberadamente NO se usa WSClient aquí: WSClient está pensado para
+	// un cliente que vive dentro de un servidor en marcha, donde "seguir
+	// reintentando en segundo plano" es lo correcto — un fallo de conexión
+	// nunca debería hacer caer al servidor. Este comando es justo lo
+	// contrario: una herramienta de un solo uso, donde lo correcto es
+	// fallar rápido y con un motivo claro. Con WSClient, un servidor que
+	// no expone nada (o que ni siquiera existe) se traduciría en un "sin
+	// respuesta en 10000ms" genérico tras reintentar en silencio — aquí se
+	// conecta directo, una sola vez, y cualquier fallo de conexión se
+	// informa tal cual, al momento.
+	const { cuerpo, nombresFunciones } = await generateClientContent(url);
+
+	const contenido = [
+		`// ${path.basename(outPath)} — generado por \`websc client-generate ${url}\` el ${new Date().toISOString()}`,
+		"// Este fichero se reescribe ENTERO cada vez que se ejecuta ese comando — un cambio",
+		'// hecho a mano aquí se pierde en la siguiente regeneración. Para actualizarlo tras un',
+		"// cambio en el servidor remoto, vuelve a ejecutar el mismo comando.",
+		`// Fuente: ${url}`,
+		"",
+		cuerpo,
+		"",
+	].join("\n");
+
+	fs.writeFileSync(outPath, contenido);
+	console.log(`${outPath}  <- ${url} (${nombresFunciones.length} online function: ${nombresFunciones.join(", ")})`);
+}
 
 async function main() {
 	const [, , command, target] = process.argv;
@@ -466,7 +764,12 @@ async function main() {
 	try {
 		if (command === "init") return cmdInit(targetDir);
 		if (command === "update") return cmdUpdate(targetDir);
-		if (command === "build") return await cmdBuild(targetDir);
+		if (command === "build") return await cmdBuild(targetDir, { createClients: process.argv.includes("--create-clients") });
+		if (command === "client-generate") {
+			const outIdx = process.argv.indexOf("--out");
+			const outPath = outIdx !== -1 ? path.resolve(process.argv[outIdx + 1] || "") : null;
+			return await cmdClientGenerate(target, outPath);
+		}
 	} catch (err) {
 		console.error(`Error: ${err.message}`);
 		process.exitCode = 1;
@@ -477,6 +780,8 @@ async function main() {
 	console.log("  websc init <carpeta>    — crear un proyecto nuevo");
 	console.log("  websc update <carpeta>  — actualizar lib/ y compiler/ de un proyecto existente");
 	console.log("  websc build <carpeta>   — compilar src/ a dist/ (HTML de cliente + server.js)");
+	console.log("    --create-clients      — además, sincronizar los .ws de wconfig.json (\"clients\") contra sus servidores remotos");
+	console.log("  websc client-generate <url> --out <fichero.ws>  — generar un cliente a partir de las online function de otro servidor WebScript");
 	process.exitCode = 1;
 }
 

@@ -10,6 +10,14 @@
 // to/via/from como propiedades normales, pero no hereda comportamiento de
 // WSON.send()/etc. Conectar esto con el runtime y con la resolución de
 // `import` en el servidor es la siguiente pieza pendiente.
+//
+// Sin `httpCode`: era un campo mutable en la instancia que solo tenía
+// sentido si el WSON acababa respondiendo una petición HTTP entrante — y
+// solo ahí (ver WSON.httpSend en codegen-server.js). Un DTO pensado para
+// mensajería normal (WSON.send() saliente, o simplemente el DTO como
+// estructura de datos) lo arrastraba sin usarlo nunca. Ahora el código de
+// estado se pasa como argumento explícito a WSON.httpSend(wson, httpCode),
+// no como propiedad del propio WSON.
 
 const { primitiveCheck } = require("./type-check");
 
@@ -60,7 +68,6 @@ function buildDtoClass(wsonAst, className) {
 			this.to = to;
 			this.via = via;
 			this.from = from;
-			this.httpCode = null;
 			this.id = null;
 			this.createdAt = null;
 
@@ -143,7 +150,6 @@ function genDtoClassSource(wsonAst, className) {
     this.to = ${jsStr(to)};
     this.via = ${jsStr(via)};
     this.from = ${jsStr(from)};
-    this.httpCode = null;
     this.id = null;
     this.createdAt = null;
     ${className}._fields.forEach((field, i) => {

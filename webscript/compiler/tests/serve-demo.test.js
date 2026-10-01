@@ -90,10 +90,10 @@ test("REGRESIÓN nueva capacidad: serve-demo.js sirve VARIAS páginas de golpe, 
 		assert.match(r1.body, /<h1>Página de inicio<\/h1>/);
 
 		const r2 = await get(3912, "/blog/mi-post");
-		assert.match(r2.body, /<h1>Post: mi-post<\/h1>/);
+		assert.match(r2.body, /<h1>(?:<!--t-->)?Post: mi-post(?:<!--\/t-->)?<\/h1>/);
 
 		const r3 = await get(3912, "/blog/otro-post");
-		assert.match(r3.body, /<h1>Post: otro-post<\/h1>/);
+		assert.match(r3.body, /<h1>(?:<!--t-->)?Post: otro-post(?:<!--\/t-->)?<\/h1>/);
 
 		// Con MÁS de una página, ninguna se sirve "de regalo" en "/" — solo
 		// pasa con una sola página.
@@ -128,7 +128,7 @@ test("REGRESIÓN nueva capacidad: serve-demo.js combina varias páginas Y un .ws
 			"",
 			"watch(peticion)",
 			"\tpeticion.content = { ok: true }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -137,7 +137,7 @@ test("REGRESIÓN nueva capacidad: serve-demo.js combina varias páginas Y un .ws
 		assert.match(r1.body, /<h1>Inicio<\/h1>/);
 
 		const r2 = await get(3913, "/blog/x");
-		assert.match(r2.body, /<h1>Post: x<\/h1>/);
+		assert.match(r2.body, /<h1>(?:<!--t-->)?Post: x(?:<!--\/t-->)?<\/h1>/);
 
 		const r3 = await get(3913, "/salud");
 		assert.deepEqual(JSON.parse(r3.body), { ok: true });
@@ -182,7 +182,7 @@ test("REGRESIÓN nueva capacidad: serve-demo.js acepta un directorio entero, con
 			"",
 			"watch(peticion)",
 			"\tpeticion.content = { ok: true }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -191,7 +191,7 @@ test("REGRESIÓN nueva capacidad: serve-demo.js acepta un directorio entero, con
 		assert.match(r1.body, /<h1>Inicio<\/h1>/);
 
 		const r2 = await get(3914, "/blog/x");
-		assert.match(r2.body, /<h1>Post: x<\/h1>/);
+		assert.match(r2.body, /<h1>(?:<!--t-->)?Post: x(?:<!--\/t-->)?<\/h1>/);
 
 		const r3 = await get(3914, "/salud");
 		assert.deepEqual(JSON.parse(r3.body), { ok: true });
@@ -211,7 +211,7 @@ test("serve-demo.js con directorio: un .wsb importado por otro del mismo directo
 			"",
 			"watch(peticionUsuarios)",
 			"\tpeticionUsuarios.content = { ok: true }",
-			"\tWSON.send(peticionUsuarios)",
+			"\tWSON.httpSend(peticionUsuarios)",
 		].join("\n")
 	);
 	fs.writeFileSync(

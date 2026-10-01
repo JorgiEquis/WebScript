@@ -38,7 +38,14 @@ function splitTopLevel(lines) {
 		const header = lines[i];
 		let j = i + 1;
 
-		if (/^visual\s+\w+\s*=/.test(header.text)) {
+		// El HTML SUELTO de un .wsf (la página, sin envolver en `visual
+		// nombre = `) se trocea EXACTAMENTE igual que un `visual`: no se
+		// anida por indentación, se reconoce por tags abrir/cerrar, y se
+		// consumen líneas hasta la siguiente declaración de nivel superior
+		// real. Es lo que permite escribir `if`/`for`/`else` al margen,
+		// mezclado con las etiquetas, tal como ya podía hacerse dentro de
+		// un `visual`.
+		if (/^visual\s+\w+\s*=/.test(header.text) || isBareHtmlStart(header.text)) {
 			while (j < lines.length && !(lines[j].indent === header.indent && isTopLevelBoundary(lines[j].text))) {
 				j++;
 			}
@@ -53,6 +60,16 @@ function splitTopLevel(lines) {
 	}
 
 	return chunks;
+}
+
+// Una línea que abre una etiqueta HTML/JSX a nivel superior (`<html>`,
+// `<div>`, `<Componente />`...) — la señal de que el fichero usa HTML
+// SUELTO como página, en vez de envolverlo en `visual nombre = `. Una
+// etiqueta de CIERRE suelta (`</div>` sin apertura) no cuenta como inicio:
+// se deja caer al camino normal, que la rechazará con un error de sintaxis
+// claro en vez de tragársela como si fuera el arranque de la página.
+function isBareHtmlStart(text) {
+	return /^<[A-Za-z]/.test(text);
 }
 
 // Dentro de la plantilla, si/for SÍ vuelven a usar indentación para acotar
@@ -129,6 +146,39 @@ function parseVisualChunk(header, rest) {
 	return { type: "VisualDecl", name, html: html.children, htmlErrors: errors, line: header.line };
 }
 
+// El HTML SUELTO de la página (sin `visual nombre = `): la propia línea de
+// cabecera YA es contenido HTML de verdad (`<html>`, `<div>`...), a
+// diferencia de un `visual` donde la cabecera es solo la declaración — así
+// que aquí se antepone a `rest` antes de construir la secuencia de
+// plantilla. Mismo criterio que un `visual` para todo lo demás: una
+// `reactive` mezclada con el HTML es un error (debe ir fuera), y el árbol
+// se construye con el mismo `buildHtmlTree`.
+function parsePageChunk(header, rest) {
+	const { buildHtmlTree } = require("./html-parser");
+	const allLines = [header, ...rest];
+
+	const reactiveInside = allLines.filter((l) => /^reactive\b/.test(l.text));
+	const templateLines = allLines.filter((l) => !/^reactive\b/.test(l.text));
+
+	const templateItems = parseTemplateSequence(templateLines);
+	const html = buildHtmlTree(templateItems);
+	const errors = html.errors.concat(
+		reactiveInside.map((l) => ({
+			line: l.line,
+			message: "una 'reactive' mezclada con el HTML suelto de la página no está soportada — declárala fuera, antes o después del HTML",
+		}))
+	);
+
+	return { type: "PageDecl", html: html.children, htmlErrors: errors, line: header.line };
+}
+
+// "Persona[]" es un alias de "Persona(array)" en una declaración tipada —
+// se normaliza aquí para que el resto del compilador solo vea una forma.
+function normalizeArrayType(t) {
+	if (!t) return null;
+	return t.endsWith("[]") ? `${t.slice(0, -2)}(array)` : t;
+}
+
 const RULES = [
 	{
 		type: "Import",
@@ -169,23 +219,25 @@ const RULES = [
 	},
 	{
 		type: "ReactiveDecl",
-		re: /^reactive\s+(?:([\w/]+(?:\(array\))?)\s+)?(\w+)\s*=\s*(.*)$/,
+		re: /^(shared\s+)?(global\s+)?reactive\s+(?:([\w/]+(?:\(array\)|\[\])?)\s+)?(\w+)\s*=\s*(.*)$/,
 		build: (m) => ({
-			varType: m[1] || null,
-			name: m[2],
-			expr: m[3],
-			isListen: /^WSON\.listen\(/.test(m[3]),
+			shared: !!m[1],
+			global: !!m[2],
+			varType: normalizeArrayType(m[3]),
+			name: m[4],
+			expr: m[5],
+			isListen: /^WSON\.listen\(/.test(m[5]),
 		}),
 	},
 	{
 		type: "VarDecl",
-		re: /^var\s+(?:([\w/]+(?:\(array\))?)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
-		build: (m) => ({ varType: m[1] || null, name: m[2], expr: m[3] }),
+		re: /^(global\s+)?var\s+(?:([\w/]+(?:\(array\)|\[\])?)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
+		build: (m) => ({ global: !!m[1], varType: normalizeArrayType(m[2]), name: m[3], expr: m[4] }),
 	},
 	{
 		type: "ConstDecl",
-		re: /^const\s+(?:([\w/]+(?:\(array\))?)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
-		build: (m) => ({ varType: m[1] || null, name: m[2], expr: m[3] }),
+		re: /^(global\s+)?const\s+(?:([\w/]+(?:\(array\)|\[\])?)\s+)?(\{[^}]*\}|\w+)\s*=\s*(.*)$/,
+		build: (m) => ({ global: !!m[1], varType: normalizeArrayType(m[2]), name: m[3], expr: m[4] }),
 	},
 	{
 		type: "WatchDecl",
@@ -219,8 +271,16 @@ const RULES = [
 	},
 	{
 		type: "FunctionDecl",
-		re: /^function\s+(\w+)\(([^)]*)\)$/,
-		build: (m) => ({ name: m[1], params: splitParams(m[2]) }),
+		re: /^(online\s+)?function\s+(\w+)\(([^)]*)\)(?:\s*->\s*(\w+))?$/,
+		build: (m) => {
+			if (m[4] && m[4] !== "idempotent") {
+				throw new Error(`function ${m[2]}: modificador desconocido "-> ${m[4]}" (solo se admite "-> idempotent", y solo en "online function")`);
+			}
+			if (m[4] && !m[1]) {
+				throw new Error(`function ${m[2]}: "-> idempotent" solo tiene sentido en una "online function" (esta no lleva "online")`);
+			}
+			return { name: m[2], params: splitParams(m[3]), online: !!m[1], idempotent: m[4] === "idempotent" };
+		},
 		body: (node) => node.children.map(parseNode),
 	},
 ];
@@ -296,11 +356,110 @@ function parseWsonFile(topLevelNodes) {
 }
 
 // Fichero .wsdb: mismo formato de líneas "-> clave: valor" que un .wson,
-// pero con "-> schema:" en vez de "-> content:", y su propio tipo de nodo
-// raíz (WsdbSchema) — para que codegen-wsdb.js lo reconozca sin
-// confundirlo con un DTO de mensajería puntual.
+// con cabecera ("-> name:", min/max/depends), "-> schema" con o sin ":",
+// campos con o sin "->" delante, y tipos con longitud/clave primaria —
+// integer(10)(primary), decimal(2,3)... Tiene su propio tipo de nodo raíz
+// (WsdbSchema) — para que codegen-wsdb.js lo reconozca sin confundirlo con
+// un DTO de mensajería puntual.
+//
+// Solo existe este formato. El anterior ("-> collection:", con find/
+// findOne/findById/deleteMany) se eliminó — se rechaza aquí con un error
+// que dice cómo migrarlo, en vez de interpretarlo a medias en silencio.
 function parseWsdbFile(topLevelNodes) {
-	return { type: "WsdbSchema", fields: topLevelNodes.map(parseWsonMetaLine) };
+	const nodes = topLevelNodes.map(stripWsdbComments);
+	const hasName = nodes.some((n) => /^->\s*name\s*:/.test(n.text));
+	if (!hasName) {
+		if (nodes.some((n) => /^->\s*collection\s*:/.test(n.text))) {
+			throw new Error(
+				'este .wsdb usa el formato antiguo ("-> collection:"), que ya no se admite — ' +
+					'usa el formato actual: "-> name: \'nombre\'" y "-> schema:" con los campos ' +
+					"(p. ej. \"id: integer(10)(primary)/\"). Se importa con las dos clases que genera " +
+					'(<Nombre> y <Nombre>Schema) y se consulta con save/selectAll/select/delete/deleteWhere ' +
+					"en vez de find/findOne/findById/deleteMany. Ver DISEÑO.md, sección .wsdb."
+			);
+		}
+		throw new Error('este .wsdb no declara "-> name: \'nombre\'" — es obligatorio (da nombre a las clases <Nombre> y <Nombre>Schema)');
+	}
+
+	const fields = nodes.map((node) => {
+		if (/^->\s*schema\s*:?\s*$/.test(node.text)) {
+			return { type: "ContentSchema", fields: node.children.map(parseWsdbField), line: node.line };
+		}
+		return parseWsonMetaLine(node);
+	});
+	return { type: "WsdbSchema", fields };
+}
+
+// Quita comentarios "// ..." de una línea de .wsdb (y de sus hijas), sin
+// tocar un "//" que esté dentro de comillas — p. ej. una URL en un valor.
+function stripWsdbComments(node) {
+	let out = "";
+	let quote = null;
+	const t = node.text;
+	for (let i = 0; i < t.length; i++) {
+		const c = t[i];
+		if (quote) {
+			if (c === quote && t[i - 1] !== "\\") quote = null;
+		} else if (c === '"' || c === "'" || c === "`") {
+			quote = c;
+		} else if (c === "/" && t[i + 1] === "/") {
+			break;
+		}
+		out += c;
+	}
+	return { ...node, text: out.trim(), children: (node.children || []).map(stripWsdbComments) };
+}
+
+// Campo de un esquema .wsdb v2: "[->] nombre: tipo(args)(modificadores)[/]"
+//   integer(10)(primary)  -> longitud 10, clave primaria
+//   decimal(2,3)          -> 2 dígitos enteros, 3 decimales
+//   string(40)/           -> longitud máxima 40, opcional
+//   string(array)         -> igual que en .wson
+// Los números van en su propio paréntesis; los modificadores (primary,
+// array) en el suyo — el orden entre paréntesis no importa.
+function parseWsdbField(node) {
+	const text = node.text.replace(/^->\s*/, "");
+	const m = /^(\w+)\s*:\s*(.*)$/.exec(text);
+	if (!m) {
+		throw new Error(`Línea ${node.line} del .wsdb: se esperaba "nombre: tipo", encontrado "${node.text}"`);
+	}
+	const [, name, rawTypeFull] = m;
+	let rawType = rawTypeFull.trim();
+	const optional = rawType.endsWith("/");
+	if (optional) rawType = rawType.slice(0, -1).trim();
+
+	if (node.children.length > 0) {
+		return { type: "SchemaField", name, fieldType: "object", optional, fields: node.children.map(parseSchemaField), line: node.line };
+	}
+
+	const tm = /^(\w+)((?:\s*\([^)]*\))*)$/.exec(rawType);
+	if (!tm) {
+		throw new Error(`Línea ${node.line} del .wsdb: tipo no válido "${rawTypeFull.trim()}" en el campo "${name}"`);
+	}
+	const base = tm[1];
+	let size = null;
+	let primary = false;
+	let isArray = false;
+	for (const [, inner] of tm[2].matchAll(/\(([^)]*)\)/g)) {
+		const content = inner.trim();
+		if (content === "primary") primary = true;
+		else if (content === "array") isArray = true;
+		else if (/^\d+(\s*,\s*\d+)?$/.test(content)) {
+			if (size) throw new Error(`Línea ${node.line} del .wsdb: el campo "${name}" declara la longitud dos veces`);
+			size = content.split(",").map((n) => parseInt(n.trim(), 10));
+		} else {
+			throw new Error(`Línea ${node.line} del .wsdb: modificador desconocido "(${content})" en el campo "${name}" (se admite una longitud, "primary" o "array")`);
+		}
+	}
+	return {
+		type: "SchemaField",
+		name,
+		fieldType: isArray ? `${base}(array)` : base,
+		optional,
+		size,
+		primary,
+		line: node.line,
+	};
 }
 
 function parseNode(node) {
@@ -345,6 +504,9 @@ function parse(source, { isWsonFile = false, isWsdbFile = false } = {}) {
 	const body = chunks.map(({ header, rest }) => {
 		if (/^visual\s+\w+\s*=/.test(header.text)) {
 			return parseVisualChunk(header, rest);
+		}
+		if (isBareHtmlStart(header.text)) {
+			return parsePageChunk(header, rest);
 		}
 		return parseNode({ ...header, children: buildTree(rest) });
 	});

@@ -194,18 +194,34 @@ test("function con parámetros tipados y sin tipar (mezcla permitida)", () => {
 });
 
 test("REGRESIÓN nueva capacidad: fichero .wsdb — \"-> schema:\" anidado, mismo formato de campo que \"-> content:\" en .wson", () => {
-	const source = ['-> collection: "usuarios"', "-> schema:", "\tnombre: string", "\tedad: integer"].join("\n");
+	const source = ["-> name: 'usuario'", "-> schema:", "\t-> nombre: string(40)", "\t-> edad: integer(3)/"].join("\n");
 	const ast = parse(source, { isWsdbFile: true });
 
 	assert.equal(ast.type, "WsdbSchema");
 	assert.equal(ast.fields[0].type, "MetaField");
-	assert.equal(ast.fields[0].key, "collection");
-	assert.equal(ast.fields[0].value, '"usuarios"');
+	assert.equal(ast.fields[0].key, "name");
+	assert.equal(ast.fields[0].value, "'usuario'");
 	assert.equal(ast.fields[1].type, "ContentSchema");
 	assert.deepEqual(
 		ast.fields[1].fields.map((f) => f.name),
 		["nombre", "edad"]
 	);
+});
+
+test("REGRESIÓN (eliminación del formato antiguo): un .wsdb con \"-> collection:\" se rechaza con un error que explica cómo migrar, no se interpreta a medias", () => {
+	const source = ['-> collection: "usuarios"', "-> schema:", "\tnombre: string"].join("\n");
+	assert.throws(() => parse(source, { isWsdbFile: true }), (e) => {
+		assert.match(e.message, /formato antiguo \("-> collection:"\), que ya no se admite/);
+		assert.match(e.message, /-> name:/, "dice cuál es el formato actual");
+		assert.match(e.message, /find\/findOne\/findById\/deleteMany/, "nombra lo que ya no existe");
+		assert.match(e.message, /save\/selectAll\/select\/delete\/deleteWhere/, "y por qué se sustituye");
+		return true;
+	});
+});
+
+test("REGRESIÓN (eliminación del formato antiguo): un .wsdb sin \"-> name:\" (y sin \"-> collection:\") también da un error claro", () => {
+	assert.throws(() => parse(["-> schema:", "\t-> nombre: string(10)"].join("\n"), { isWsdbFile: true }), /no declara "-> name:/);
+	assert.throws(() => parse("", { isWsdbFile: true }), /no declara "-> name:/);
 });
 
 test(".wson sigue usando \"-> content:\" igual que antes, sin verse afectado por \"-> schema:\"", () => {

@@ -73,7 +73,7 @@ test("import .wsb: una función exportada se puede importar y usar, igual que un
 			"",
 			"watch(peticion)",
 			"\tpeticion.content = { mensaje: saluda(\"Ana\") }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -100,9 +100,9 @@ test("import .wsb: una ruta completa (WSON + reactive + watch) exportada se sirv
 			"export reactive any peticionUsuarios = WSON.listen(wsonUsuarios)",
 			"",
 			"watch(peticionUsuarios)",
-			"\tconst { id } = WSON.params(peticionUsuarios)",
+			"\tconst { id } = WSON.httpParams(peticionUsuarios)",
 			'\tpeticionUsuarios.content = { id: id, nombre: "Usuario " + id }',
-			"\tWSON.send(peticionUsuarios)",
+			"\tWSON.httpSend(peticionUsuarios)",
 		].join("\n")
 	);
 	fs.writeFileSync(
@@ -118,7 +118,7 @@ test("import .wsb: una ruta completa (WSON + reactive + watch) exportada se sirv
 			"",
 			"watch(peticionSalud)",
 			"\tpeticionSalud.content = { ok: true }",
-			"\tWSON.send(peticionSalud)",
+			"\tWSON.httpSend(peticionSalud)",
 		].join("\n")
 	);
 
@@ -158,7 +158,7 @@ test("import .wsb: una ruta importada que a su vez importa un DTO .wson se resue
 			"\tconst datos = WSON.showContent(peticionPersona)",
 			"\tconst p = new Persona(datos.nombre, datos.edad)",
 			"\tpeticionPersona.content = { creado: true, nombre: p.nombre, edad: p.edad }",
-			"\tWSON.send(peticionPersona)",
+			"\tWSON.httpSend(peticionPersona)",
 		].join("\n")
 	);
 	fs.writeFileSync(
@@ -174,7 +174,7 @@ test("import .wsb: una ruta importada que a su vez importa un DTO .wson se resue
 			"",
 			"watch(peticionSalud)",
 			"\tpeticionSalud.content = { ok: true }",
-			"\tWSON.send(peticionSalud)",
+			"\tWSON.httpSend(peticionSalud)",
 		].join("\n")
 	);
 
@@ -201,7 +201,7 @@ test("import .wsb: una colisión entre ruta propia e importada se detecta igual 
 			"export reactive any peticionSalud2 = WSON.listen(wsonSalud2)",
 			"",
 			"watch(peticionSalud2)",
-			"\tWSON.send(peticionSalud2)",
+			"\tWSON.httpSend(peticionSalud2)",
 		].join("\n")
 	);
 	fs.writeFileSync(
@@ -216,7 +216,7 @@ test("import .wsb: una colisión entre ruta propia e importada se detecta igual 
 			"reactive any peticionSalud = WSON.listen(wsonSalud)",
 			"",
 			"watch(peticionSalud)",
-			"\tWSON.send(peticionSalud)",
+			"\tWSON.httpSend(peticionSalud)",
 		].join("\n")
 	);
 
@@ -241,7 +241,7 @@ test("import .wsb: un nombre que no existe en absoluto da un error claro", () =>
 			"reactive any peticion = WSON.listen(wsonX)",
 			"",
 			"watch(peticion)",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -267,7 +267,7 @@ test("import .wsb: una función de nivel superior es importable aunque no lleve 
 			"",
 			"watch(peticion)",
 			"\tpeticion.content = { valor: algo() }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -297,9 +297,9 @@ test("REGRESIÓN bug real: una ruta importada que depende de una var 'hermana' d
 			"",
 			"watch(peticionUsuarios)",
 			"\tcontadorVisitas = contadorVisitas + 1",
-			"\tconst { id } = WSON.params(peticionUsuarios)",
+			"\tconst { id } = WSON.httpParams(peticionUsuarios)",
 			"\tpeticionUsuarios.content = { id: id, visitas: contadorVisitas }",
-			"\tWSON.send(peticionUsuarios)",
+			"\tWSON.httpSend(peticionUsuarios)",
 		].join("\n")
 	);
 	fs.writeFileSync(
@@ -315,7 +315,7 @@ test("REGRESIÓN bug real: una ruta importada que depende de una var 'hermana' d
 			"",
 			"watch(peticionSalud)",
 			"\tpeticionSalud.content = { ok: true }",
-			"\tWSON.send(peticionSalud)",
+			"\tWSON.httpSend(peticionSalud)",
 		].join("\n")
 	);
 
@@ -349,7 +349,7 @@ test("import .wsb: colisión de nombre de estado entre el fichero importador y e
 			"export reactive any peticionUsuarios = WSON.listen(wsonUsuarios)",
 			"",
 			"watch(peticionUsuarios)",
-			"\tWSON.send(peticionUsuarios)",
+			"\tWSON.httpSend(peticionUsuarios)",
 		].join("\n")
 	);
 	fs.writeFileSync(
@@ -366,7 +366,7 @@ test("import .wsb: colisión de nombre de estado entre el fichero importador y e
 			"reactive any peticionSalud = WSON.listen(wsonSalud)",
 			"",
 			"watch(peticionSalud)",
-			"\tWSON.send(peticionSalud)",
+			"\tWSON.httpSend(peticionSalud)",
 		].join("\n")
 	);
 
@@ -393,7 +393,7 @@ test("REGRESIÓN bug real: un var importado explícitamente por nombre de otro .
 			"watch(peticion)",
 			"\tcontadorServidor = contadorServidor + 1",
 			"\tpeticion.content = { contador: contadorServidor }",
-			"\tWSON.send(peticion)",
+			"\tWSON.httpSend(peticion)",
 		].join("\n")
 	);
 
@@ -427,7 +427,7 @@ test("REGRESIÓN nueva capacidad: import de un paquete npm real (nombres) y un m
 		"watch(peticion)",
 		'\tconst ast = parse("1 + 1", { ecmaVersion: "latest" })',
 		'\tpeticion.content = { tipo: ast.body[0].type, ext: path.extname("archivo.wsf") }',
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	const server = createServer(parse(source), {}, { baseDir: __dirname });
@@ -457,7 +457,7 @@ test("REGRESIÓN nueva capacidad: import de un .js normal (CommonJS) funciona en
 		"",
 		"watch(peticion)",
 		'\tpeticion.content = { mensaje: saludar("Ana") }',
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	const server = createServer(parse(source), {}, { baseDir: dir });
@@ -481,7 +481,7 @@ test("REGRESIÓN nueva capacidad: un .wsb puede importar un .wsdb y hacer CRUD r
 	const dir = tmpDir();
 	fs.writeFileSync(
 		path.join(dir, "usuarios.wsdb"),
-		['-> collection: "usuarios"', "-> schema:", "\tnombre: string", "\tedad: integer"].join("\n")
+		["-> name: 'usuario'", "-> schema:", "\t-> id: integer(10)(primary)/", "\t-> nombre: string(40)", "\t-> edad: integer(3)"].join("\n")
 	);
 	fs.writeFileSync(
 		path.join(dir, "api.wsb"),
@@ -496,10 +496,9 @@ test("REGRESIÓN nueva capacidad: un .wsb puede importar un .wsdb y hacer CRUD r
 			"",
 			"watch(peticionCrear)",
 			"\tconst datos = WSON.showContent(peticionCrear)",
-			"\tconst usuario = new Usuario(datos.nombre, datos.edad)",
-			"\tusuario.save()",
+			"\tconst usuario = Usuario.save({ nombre: datos.nombre, edad: datos.edad })",
 			"\tpeticionCrear.content = { id: usuario.id }",
-			"\tWSON.send(peticionCrear)",
+			"\tWSON.httpSend(peticionCrear)",
 			"",
 			"const WSON wsonListar =",
 			'\t-> to: "/usuarios"',
@@ -508,9 +507,9 @@ test("REGRESIÓN nueva capacidad: un .wsb puede importar un .wsdb y hacer CRUD r
 			"reactive any peticionListar = WSON.listen(wsonListar)",
 			"",
 			"watch(peticionListar)",
-			"\tconst todos = Usuario.find()",
+			"\tconst todos = Usuario.selectAll()",
 			"\tpeticionListar.content = { usuarios: todos.map(u => ({ id: u.id, nombre: u.nombre, edad: u.edad })) }",
-			"\tWSON.send(peticionListar)",
+			"\tWSON.httpSend(peticionListar)",
 		].join("\n")
 	);
 
@@ -537,11 +536,20 @@ test("REGRESIÓN nueva capacidad: un .wsb puede importar un .wsdb y hacer CRUD r
 	}
 });
 
+test("REGRESIÓN (eliminación del formato antiguo): importar un .wsdb de \"-> collection:\" desde un .wsb da un error que nombra el import y cómo migrar", () => {
+	const dir = tmpDir();
+	fs.writeFileSync(path.join(dir, "viejo.wsdb"), ['-> collection: "viejos"', "-> schema:", "\tnombre: string"].join("\n"));
+	assert.throws(
+		() => createServer(parse('import { Viejo } from "./viejo.wsdb"'), {}, { baseDir: dir }),
+		/"\.\/viejo\.wsdb": este \.wsdb usa el formato antiguo \("-> collection:"\), que ya no se admite/
+	);
+});
+
 test("integración real: los datos de un .wsdb sobreviven a un reinicio completo del servidor (fichero .wsdb-data/webscript.db real)", async () => {
 	const dir = tmpDir();
 	fs.writeFileSync(
 		path.join(dir, "usuarios.wsdb"),
-		['-> collection: "usuarios"', "-> schema:", "\tnombre: string"].join("\n")
+		["-> name: 'usuario'", "-> schema:", "\t-> id: integer(10)(primary)/", "\t-> nombre: string(40)"].join("\n")
 	);
 	const wsbSource = [
 		'import { Usuario } from "./usuarios.wsdb"',
@@ -554,9 +562,9 @@ test("integración real: los datos de un .wsdb sobreviven a un reinicio completo
 		"",
 		"watch(peticionCrear)",
 		"\tconst datos = WSON.showContent(peticionCrear)",
-		"\tnew Usuario(datos.nombre).save()",
+		"\tUsuario.save({ nombre: datos.nombre })",
 		"\tpeticionCrear.content = { ok: true }",
-		"\tWSON.send(peticionCrear)",
+		"\tWSON.httpSend(peticionCrear)",
 		"",
 		"const WSON wsonListar =",
 		'\t-> to: "/usuarios"',
@@ -565,8 +573,8 @@ test("integración real: los datos de un .wsdb sobreviven a un reinicio completo
 		"reactive any peticionListar = WSON.listen(wsonListar)",
 		"",
 		"watch(peticionListar)",
-		"\tpeticionListar.content = { usuarios: Usuario.find().map(u => u.nombre) }",
-		"\tWSON.send(peticionListar)",
+		"\tpeticionListar.content = { usuarios: Usuario.selectAll().map(u => u.nombre) }",
+		"\tWSON.httpSend(peticionListar)",
 	].join("\n");
 	fs.writeFileSync(path.join(dir, "api.wsb"), wsbSource);
 
@@ -605,3 +613,75 @@ function postJson(port, pathname, body) {
 		req.end(JSON.stringify(body));
 	});
 }
+
+test("wsdb v2 vía HTTP: import de Persona/PersonaSchema, save() como upsert y where()/sort dentro de un watch()", async () => {
+	const dir = tmpDir();
+	fs.writeFileSync(
+		path.join(dir, "personas.wsdb"),
+		[
+			"-> name: 'persona'",
+			"-> schema",
+			"     -> idPerson: integer(10)(primary)",
+			"     -> edad: integer(5)",
+			"     -> nombre: string(40)/",
+			"     -> mayor: boolean",
+		].join("\n")
+	);
+	fs.writeFileSync(
+		path.join(dir, "api.wsb"),
+		[
+			'import { Persona, PersonaSchema } from "./personas.wsdb"',
+			"",
+			"const WSON wsonGuardar =",
+			'\t-> to: "/personas"',
+			'\t-> via: "POST"',
+			"",
+			"reactive any peticionGuardar = WSON.listen(wsonGuardar)",
+			"",
+			"watch(peticionGuardar)",
+			"\tvar Persona personaInsert = new Persona(WSON.showContent(peticionGuardar))",
+			"\tpeticionGuardar.content = Persona.save(personaInsert)",
+			"\tWSON.httpSend(peticionGuardar)",
+			"",
+			"const WSON wsonListar =",
+			'\t-> to: "/personas"',
+			'\t-> via: "GET"',
+			"",
+			"reactive any peticionListar = WSON.listen(wsonListar)",
+			"",
+			"watch(peticionListar)",
+			"\tconst PersonaSchema personaSchema = PersonaSchema.getSchema()",
+			"\tconst Persona[] personas = Persona.selectAll().where((personaSchema.edad > 10 && personaSchema.nombre != 'Juan') || personaSchema.mayor).sortAsc(personaSchema.nombre)",
+			"\tif (personas.length > 0)",
+			"\t\tpeticionListar.content = { ids: personas.map(p => p.idPerson) }",
+			"\telse",
+			"\t\tpeticionListar.content = { ids: Persona.select(personaSchema.idPerson).where(personaSchema.edad < 0) }",
+			"\tWSON.httpSend(peticionListar)",
+		].join("\n")
+	);
+
+	const server = createServer(parse(fs.readFileSync(path.join(dir, "api.wsb"), "utf8")), {}, { baseDir: dir });
+	try {
+		await new Promise((resolve) => server.listen(0, resolve));
+		const port = server.address().port;
+
+		const vacio = await get(port, "/personas");
+		assert.deepEqual(JSON.parse(vacio.body), { ids: [] });
+
+		await postJson(port, "/personas", { idPerson: 1, edad: 30, nombre: "Ana", mayor: true });
+		await postJson(port, "/personas", { idPerson: 2, edad: 15, nombre: "Juan", mayor: false });
+		await postJson(port, "/personas", { idPerson: 3, edad: 40, nombre: "Juan", mayor: true });
+		await postJson(port, "/personas", { idPerson: 4, edad: 12, nombre: "Bea", mayor: false });
+		const upd = await postJson(port, "/personas", { idPerson: 4, edad: 5, nombre: "Bea", mayor: false });
+		assert.deepEqual(JSON.parse(upd.body), { idPerson: 4, edad: 5, nombre: "Bea", mayor: false });
+
+		const lista = await get(port, "/personas");
+		assert.deepEqual(JSON.parse(lista.body), { ids: [1, 3] });
+
+		const malo = await postJson(port, "/personas", { idPerson: 9, edad: 1, nombre: "x".repeat(41), mayor: false });
+		assert.equal(malo.status, 400);
+		assert.match(malo.body, /máximo 40 caracteres/);
+	} finally {
+		server.close();
+	}
+});

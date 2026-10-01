@@ -94,7 +94,7 @@ test("integración real: un typo en una var de servidor dentro de watch() se det
 		"watch(peticion)",
 		"\tcontadr = contadr + 1",
 		"\tpeticion.content = { contador: contador }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	assert.throws(() => createServer(parse(source), {}), /"contadr"/);
@@ -115,7 +115,7 @@ test("integración real: una var declarada dentro de un if y usada fuera en watc
 		"\tif (true)",
 		"\t\tvar resultado = 42",
 		"\tpeticion.content = { resultado: resultado }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	assert.throws(() => createServer(parse(source), {}), /"resultado"/);

@@ -97,9 +97,8 @@ test("integración real de extremo a extremo: clic en el navegador -> fetch real
 		"",
 		"watch(peticion)",
 		"\tvar contenido = WSON.showContent(peticion, null)",
-		"\tpeticion.httpCode = 201",
 		'\tpeticion.content = { mensaje: "recibido", texto: contenido.texto }',
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion, 201)",
 	].join("\n");
 
 	const CLIENT_SOURCE = [
@@ -164,8 +163,8 @@ test("REGRESIÓN bug real: WSON.send() con via GET, cliente real (fetch de Node)
 		"reactive any peticion = WSON.listen(wsonEco)",
 		"",
 		"watch(peticion)",
-		"\tpeticion.content = WSON.query(peticion)",
-		"\tWSON.send(peticion)",
+		"\tpeticion.content = WSON.httpQuery(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	const CLIENT_SOURCE = [
@@ -607,7 +606,7 @@ test("REGRESIÓN nueva capacidad: import de un .wsdb desde el cliente se rechaza
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "websc-wsdb-cliente-"));
 	fs.writeFileSync(
 		path.join(dir, "usuarios.wsdb"),
-		['-> collection: "usuarios"', "-> schema:", "\tnombre: string"].join("\n")
+		["-> name: 'usuario'", "-> schema:", "\t-> nombre: string(20)"].join("\n")
 	);
 	const source = [
 		'import { Usuario } from "./usuarios.wsdb"',

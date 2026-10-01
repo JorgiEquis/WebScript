@@ -89,7 +89,7 @@ test("SSR: valor inicial que no coincide con el tipo declarado lanza al renderiz
 test("SSR: valor inicial correcto no lanza", () => {
 	const source = ["reactive decimal precio = 9.99", "visual app =", "<p>{precio}</p>", "Visual.render(app)"].join("\n");
 	const html = renderPageToHTML(parse(source), {});
-	assert.equal(html, "<p>9.99</p>");
+	assert.equal(html, "<p><!--t-->9.99<!--/t--></p>");
 });
 
 // --- Servidor: además de validar, comprueba que NO tira el proceso -------
@@ -115,7 +115,7 @@ test("servidor real: una var de servidor con tipo mal declarado responde 500 SIN
 		"reactive any peticion = WSON.listen(wsonVisita)",
 		"",
 		"watch(peticion)",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	const server = createServer(parse(source), {});
@@ -152,7 +152,7 @@ test("servidor real: una var de servidor con tipo bien declarado funciona con no
 		"watch(peticion)",
 		"\tvisitas++",
 		"\tpeticion.content = { visitas: visitas }",
-		"\tWSON.send(peticion)",
+		"\tWSON.httpSend(peticion)",
 	].join("\n");
 
 	const server = createServer(parse(source), {});

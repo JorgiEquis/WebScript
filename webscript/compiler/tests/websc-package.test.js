@@ -111,7 +111,7 @@ test(
 					r.on("end", () => resolve(out));
 				});
 			});
-			assert.match(body, /<div id="raiz"><p>Valor: 0<\/p><\/div>/);
+			assert.match(body, /<div id="raiz"><p>(?:<!--t-->)?Valor: 0(?:<!--\/t-->)?<\/p><\/div>/);
 		} finally {
 			child.kill();
 		}
@@ -156,7 +156,7 @@ test(
 				"watch(peticion)",
 				"\tcontadr = contadr + 1", // typo real
 				"\tpeticion.content = { contador: contador }",
-				"\tWSON.send(peticion)",
+				"\tWSON.httpSend(peticion)",
 			].join("\n")
 		);
 

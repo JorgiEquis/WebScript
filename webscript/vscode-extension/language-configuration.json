@@ -1,0 +1,32 @@
+{
+	"comments": {
+		"lineComment": "//"
+	},
+	"brackets": [
+		["{", "}"],
+		["[", "]"],
+		["(", ")"]
+	],
+	"autoClosingPairs": [
+		{ "open": "{", "close": "}" },
+		{ "open": "[", "close": "]" },
+		{ "open": "(", "close": ")" },
+		{ "open": "\"", "close": "\"", "notIn": ["string"] },
+		{ "open": "'", "close": "'", "notIn": ["string"] },
+		{ "open": "`", "close": "`", "notIn": ["string"] },
+		{ "open": "<", "close": ">", "notIn": ["string", "comment"] }
+	],
+	"surroundingPairs": [
+		["{", "}"],
+		["[", "]"],
+		["(", ")"],
+		["\"", "\""],
+		["'", "'"],
+		["<", ">"]
+	],
+	"indentationRules": {
+		"increaseIndentPattern": "^\\s*((visual|style)\\s+\\w+\\s*=\\s*$|const\\s+WSON\\s+\\w+\\s*=\\s*$|(global\\s+)?(reactive|var|const)\\b.*=\\s*$|watch\\(\\w+\\)\\s*$|if\\s*\\(.*\\)\\s*$|else if\\s*\\(.*\\)\\s*$|else\\s*$|for\\s*\\(\\w+\\s+in\\s+.*\\)\\s*$|(online\\s+)?function\\s+\\w+\\(.*\\)\\s*(->\\s*\\w+\\s*)?$|->\\s*(content|schema)\\s*:?\\s*$|<[A-Za-z][^/>]*[^/]>\\s*$)",
+		"decreaseIndentPattern": "^\\s*(</[A-Za-z][\\w-]*>)\\s*$"
+	},
+	"wordPattern": "(-?\\d*\\.\\d\\w*)|([^\\`\\~\\!\\@\\#\\%\\^\\&\\*\\(\\)\\-\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\:\\'\\\"\\,\\.\\<\\>\\/\\?\\s]+)"
+}

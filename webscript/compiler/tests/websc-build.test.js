@@ -116,8 +116,8 @@ test("dist/server.js hace SSR real por petición: distinto :id da distinto HTML,
 		const html7 = await get("/personas/7");
 		const html99 = await get("/personas/99");
 
-		assert.match(html7, /<h1>Persona numero 7<\/h1>/);
-		assert.match(html99, /<h1>Persona numero 99<\/h1>/);
+		assert.match(html7, /<h1>(?:<!--t-->)?Persona numero 7(?:<!--\/t-->)?<\/h1>/);
+		assert.match(html99, /<h1>(?:<!--t-->)?Persona numero 99(?:<!--\/t-->)?<\/h1>/);
 	} finally {
 		child.kill();
 	}

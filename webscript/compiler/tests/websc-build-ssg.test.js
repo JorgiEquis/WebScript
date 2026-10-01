@@ -142,9 +142,9 @@ test(
 			assert.match(estatica.body, /<h1>Página estática<\/h1>/);
 
 			const p7 = await get(port, "/personas/7");
-			assert.match(p7.body, /<p>Persona 7<\/p>/);
+			assert.match(p7.body, /<p>(?:<!--t-->)?Persona 7(?:<!--\/t-->)?<\/p>/);
 			const p99 = await get(port, "/personas/99");
-			assert.match(p99.body, /<p>Persona 99<\/p>/);
+			assert.match(p99.body, /<p>(?:<!--t-->)?Persona 99(?:<!--\/t-->)?<\/p>/);
 		} finally {
 			child.kill();
 		}

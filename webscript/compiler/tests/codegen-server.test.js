@@ -53,12 +53,11 @@ const DEMO_SOURCE = [
 	"",
 	"watch(peticion)",
 	"\tvar contenido = WSON.showContent(peticion, null)",
-	"\tpeticion.httpCode = 201",
 	'\tpeticion.content = { mensaje: "recibido", texto: contenido.texto }',
-	"\tWSON.send(peticion)",
+	"\tWSON.httpSend(peticion, 201)",
 ].join("\n");
 
-test("servidor real: WSON.listen()+watch()+httpCode+WSON.send() responde una petición HTTP real", async () => {
+test("servidor real: WSON.listen()+watch()+WSON.httpSend(código) responde una petición HTTP real", async () => {
 	await withServer(DEMO_SOURCE, {}, async (port) => {
 		const res = await post(port, { texto: "Hola WebScript" });
 		assert.equal(res.status, 201);
@@ -262,9 +261,9 @@ const GET_SOURCE = [
 	"reactive any peticion = WSON.listen(wsonGetPersona)",
 	"",
 	"watch(peticion)",
-	"\tvar id = WSON.params(peticion).id",
+	"\tvar id = WSON.httpParams(peticion).id",
 	'\tpeticion.content = { id: id, nombre: "Ana" }',
-	"\tWSON.send(peticion)",
+	"\tWSON.httpSend(peticion)",
 ].join("\n");
 
 test("GET vía WSON.listen()+watch() funciona igual que POST/PUT/DELETE", async () => {

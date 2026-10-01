@@ -8,9 +8,9 @@
 //
 // LIMITACIONES DE ESTA VERSIÓN (deliberadas, no descuidos):
 // - Dentro de un `watch()`, las sentencias que no son `WSON.showContent`/
-//   `WSON.send`/asignación a `httpCode`/`var`/`const` simples se copian
-//   tal cual al JS generado sin comprobar que tengan sentido — es un
-//   "mejor esfuerzo", no un intérprete completo de WebScript todavía.
+//   `WSON.send`/`WSON.httpSend`/`var`/`const` simples se copian tal cual
+//   al JS generado sin comprobar que tengan sentido — es un "mejor
+//   esfuerzo", no un intérprete completo de WebScript todavía.
 
 const crypto = require("crypto");
 const http = require("http");
@@ -21,24 +21,419 @@ const WSON = require("./wson-runtime");
 const { findUndeclaredReferences } = require("./validate-js-body");
 const { resolveImportPath, isPackageSpecifier, resolvePackage } = require("./resolve-imports");
 const { buildDtoClass } = require("./codegen-dto");
+const { __wsq, rewriteWhereCalls } = require("./wsdb-query");
 
 // --- Resolución de import: .wson -> clase DTO real, .ws -> funciones/valores
 
 function compileFunctionDecl(fnNode) {
-	const paramNames = (fnNode.params || []).map((p) => p.name);
-	const body = (fnNode.body || []).map(genStatement).join("\n");
+	return compileFunctionBatch([fnNode])[fnNode.name];
+}
+
+// Envuelve con `await` cualquier llamada a un identificador SUELTO (no un
+// método `objeto.algo()` — eso sigue su propio camino, p. ej. WSON.send()/
+// WSON.httpSend()
+// o cualquier .wsdb) que esté en `knownNames` — las funciones hermanas
+// del mismo lote, o algo inyectado en `extraBindings`/importado. Es lo
+// que hace posible "Async/await implícito" también para `function`:
+// llamar a otra función (local, importada, u `online function` que en
+// realidad habla por WSClient) se espera solo, sin que nadie escriba
+// `await` en ningún sitio — ni falta, porque TODAS las `function` se
+// compilan ahora como async (ver más abajo), así que awaitar un valor
+// normal (no una promesa) es inofensivo: se resuelve igual, solo que en
+// el siguiente tick de microtareas.
+function injectAwaitForKnownCalls(bodyText, knownNames) {
+	if (!knownNames || knownNames.size === 0) return bodyText;
+	let ast;
+	try {
+		ast = acorn.parse(bodyText, { ecmaVersion: "latest", sourceType: "script", allowReturnOutsideFunction: true, allowAwaitOutsideFunction: true });
+	} catch {
+		return bodyText; // no es JS completo por sí solo — se deja tal cual (mismo criterio que rewriteWhereCalls)
+	}
+	const targets = [];
+	walk.ancestor(ast, {
+		CallExpression(node, _state, ancestors) {
+			if (node.callee.type !== "Identifier" || !knownNames.has(node.callee.name)) return;
+			const parent = ancestors[ancestors.length - 2];
+			if (parent && parent.type === "AwaitExpression") return; // ya envuelto (código idempotente, o alguien escribió await a mano)
+			targets.push(node);
+		},
+	});
+	if (targets.length === 0) return bodyText;
+	targets.sort((a, b) => b.start - a.start);
+	let out = bodyText;
+	for (const node of targets) out = `${out.slice(0, node.start)}await ${out.slice(node.start, node.end)}${out.slice(node.end)}`;
+	return out;
+}
+
+// Compila varias `function` A LA VEZ, en un único ámbito compartido — a
+// diferencia de una versión anterior de `compileFunctionDecl`, que
+// aislaba cada una por completo con su propio `new Function()`, sin
+// visibilidad ni de sus hermanas del mismo fichero ni de nada externo
+// salvo lo inyectado a mano (así fue como se detectó este límite: ni
+// siquiera dos funciones del MISMO fichero podían llamarse entre sí).
+// Esto reproduce, en el servidor, lo que el lado cliente ya hacía bien:
+// las `function` de un mismo `.wsf`/`.ws` se concatenan como texto JS
+// normal en un único script, compartiendo ámbito por las reglas
+// corrientes de JS — aquí se hace lo mismo, pero en un `new Function()`
+// por lote en vez de un único script para todo el proyecto.
+// `extraBindings` son valores adicionales visibles dentro de las
+// funciones del lote (p. ej., los imports ya resueltos de un .wsb, para
+// que sus propias funciones puedan llamar a algo importado). Devuelve
+// `{ nombre: función }` por cada una.
+//
+// Todas se compilan como `AsyncFunction` (antes: síncronas, sin `await`
+// soportado en absoluto en su propio cuerpo) — necesario para que
+// `online function`/`function` puedan esperar de verdad el resultado de
+// llamar a otra (p. ej. una función generada por `websc client-generate`,
+// que habla por WSClient y devuelve una promesa real). El `await` en sí
+// nunca lo escribe quien usa el lenguaje: lo inyecta `injectAwaitForKnownCalls`.
+// Comprueba que el cuerpo de una function/online function no toque, como
+// identificador suelto, ninguna reactive de SESIÓN (declarada sin
+// `global`). Antes de esto, tocar una de estas no daba ningún error —
+// leía/escribía en silencio la copia GLOBAL compartida, produciendo datos
+// incorrectos sin ningún aviso (así se descubrió: una function llamada
+// desde un watch() de sesión escribía en un sitio que ese mismo watch()
+// nunca llegaba a leer). Ahora es un error claro al compilar.
+function checkNoSessionOnlyReferences(bodyText, forbiddenNames, label) {
+	if (!forbiddenNames || forbiddenNames.size === 0) return;
+	let ast;
+	try {
+		ast = acorn.parse(bodyText, SERVER_STATE_ACORN_OPTS);
+	} catch {
+		return; // no analizable con un parser real — no bloqueamos por esto
+	}
+	const found = new Set();
+	walk.ancestor(ast, {
+		Identifier(node, _state, ancestors) {
+			if (!forbiddenNames.has(node.name)) return;
+			const parent = ancestors[ancestors.length - 2];
+			if (!parent) return;
+			if (ancestors.some((a) => a.type === "ObjectPattern" || a.type === "ArrayPattern" || a.type === "AssignmentPattern" || a.type === "RestElement")) return;
+			if (parent.type === "MemberExpression" && !parent.computed && parent.property === node) return;
+			if (parent.type === "Property" && !parent.computed && parent.key === node && !parent.shorthand) return;
+			if ((parent.type === "BreakStatement" || parent.type === "ContinueStatement" || parent.type === "LabeledStatement") && parent.label === node) return;
+			found.add(node.name);
+		},
+		VariablePattern(node, _state, ancestors) {
+			if (!forbiddenNames.has(node.name)) return;
+			const parent = ancestors[ancestors.length - 2];
+			if (parent && parent.type === "AssignmentExpression" && parent.left === node) found.add(node.name);
+		},
+	});
+	if (found.size > 0) {
+		const lista = [...found].map((n) => `"${n}"`).join(", ");
+		throw new Error(
+			`En ${label}: ${lista} es una reactive/var POR SESIÓN — una function/online function no puede tocarla sin sesión. Decláralo con \`global\` (p. ej. "global reactive ...") si quieres compartirla entre cualquiera que llame.`
+		);
+	}
+}
+
+// `origin` (opcional) se añade a la etiqueta de los errores de compilación
+// — p. ej. `importada de "./logica.ws"` — para que un error en una function
+// que viene de otro fichero diga DE QUÉ fichero, no solo su nombre.
+function compileFunctionBatch(fnNodes, extraBindings = {}, globalInfo = null, { origin = null } = {}) {
+	if (fnNodes.length === 0) return {};
+	const names = fnNodes.map((n) => n.name);
+	const knownNames = new Set([...names, ...Object.keys(extraBindings)]);
+	const hasGlobalState = globalInfo && globalInfo.names && globalInfo.names.length > 0;
+	const forbiddenNames = (globalInfo && globalInfo.forbiddenNames) || null;
+	const globalWatchGroups =
+		hasGlobalState && globalInfo.watchedNames && globalInfo.watchedNames.size > 0
+			? [{ names: globalInfo.watchedNames, prefix: "getGlobalState().", triggerFn: "__triggerGlobal" }]
+			: [];
+	const body = fnNodes
+		.map((n) => {
+			let raw = (n.body || []).map(genStatement).join("\n");
+			checkNoSessionOnlyReferences(raw, forbiddenNames, origin ? `function ${n.name} (${origin})` : `function ${n.name}`);
+			// "getGlobalState()" como nombre destino, no un identificador
+			// suelto — así la sustitución produce `getGlobalState().nombre`,
+			// que llama a la función memorizada en el momento de usarse, en
+			// vez de cerrar sobre un valor ya creado al compilar (ver el
+			// porqué en createRequestHandler: crearlo de forma anticipada
+			// tira todo el arranque del servidor si el valor inicial de
+			// algún reactive/var no es válido, en vez de fallar solo en la
+			// llamada que lo dispare, como ya pasa con cualquier sesión).
+			if (hasGlobalState) raw = substituteServerState(raw, globalInfo.names, "getGlobalState()");
+			raw = injectAwaitForKnownCalls(raw, knownNames);
+			// Si esta function reasigna una reactive `global` que tiene su
+			// propio watch(), ese watch() se dispara igual que si la
+			// reasignación hubiera ocurrido dentro de un watch() — `global`
+			// nunca tiene "sabor sesión" que mezclar (ver DISEÑO.md), así
+			// que no hay ambigüedad sobre qué watch() debe correr ni con
+			// qué contexto.
+			if (globalWatchGroups.length > 0) raw = injectAsyncTriggers(raw, globalWatchGroups);
+			return `async function ${n.name}(${(n.params || []).map((p) => p.name).join(", ")}) {\n${raw}\n}`;
+		})
+		.join("\n\n");
+	const extraNames = Object.keys(extraBindings);
+	const wrapperBody = `${body}\nreturn { ${names.join(", ")} };`;
+	// El envoltorio en sí no necesita ser async — solo declara funciones
+	// `async function` (ya en el texto de `body`) y las devuelve.
 	// eslint-disable-next-line no-new-func
-	return new Function(...paramNames, body);
+	const factory = new Function("__wsq", "WSClient", "getGlobalState", "__triggerGlobal", ...extraNames, wrapperBody);
+	const getGlobalStateFn = hasGlobalState ? globalInfo.getValue : () => ({});
+	const triggerGlobalFn = (globalInfo && globalInfo.triggerGlobal) || (async () => {});
+	return factory(__wsq, require("./wsclient-runtime").WSClient, getGlobalStateFn, triggerGlobalFn, ...extraNames.map((n) => extraBindings[n]));
+}
+
+// --- Ámbito de imports de un .ws ---------------------------------------
+// Un `.ws` puede importar de otro `.ws`, de un `.js`, de un paquete npm, de
+// un `.wson` o de un `.wsdb`, igual que un `.wsb`. Esos imports son PRIVADOS
+// de ese `.ws` (su ámbito propio, resuelto contra SU carpeta, no contra la
+// del `.wsb` que lo importa) — no se filtran a quien lo importa. Antes no se
+// resolvían en absoluto: el lote de function de un `.ws` se compilaba sin
+// nada de lo que ese fichero importaba, así que cualquier llamada a algo
+// importado fallaba en ejecución con `X is not defined` (ver INSTRUCCIONES.md).
+//
+// Un `registry` recoge, para todo el proyecto, un `entry` por cada `.ws`
+// alcanzable (una sola vez por fichero, aunque lo importen varios):
+//   scope.bindings  -> lo importado que no es una function de otro .ws
+//                      (clases .wson/.wsdb, funciones .js, paquetes, constantes)
+//   scope.fnImports -> nombre local -> ruta del .ws del que viene esa function
+//   names           -> nombres que pide el ámbito RAÍZ (el .wsb) de ese .ws
+//   scopeReady      -> false mientras se resuelven sus propios imports (ciclos)
+function createWsRegistry(rootBaseDir) {
+	return { rootBaseDir, list: [], byPath: new Map(), compiled: new Map() };
+}
+
+// Una function importada de otro .ws se llama a través de este reenviador,
+// que busca el lote YA compilado en el momento de la llamada — no al
+// compilar. Es lo que hace innecesario ordenar los lotes entre sí, y lo que
+// permite que dos .ws se importen mutuamente sin recursar sin fin.
+function lateBoundWsFunction(registry, targetPath, name) {
+	return (...args) => registry.compiled.get(targetPath)[name](...args);
+}
+
+function wsScopeValues(registry, entry) {
+	const scope = { ...entry.scope.bindings };
+	for (const [localName, depPath] of Object.entries(entry.scope.fnImports)) {
+		scope[localName] = lateBoundWsFunction(registry, depPath, localName);
+	}
+	return scope;
+}
+
+// Un export que no es una function (una constante, p. ej.) se evalúa UNA vez,
+// con lo que ese .ws importa a la vista, Y CON SUS PROPIAS CONSTANTES
+// HERMANAS del mismo fichero (`export const B = A + 1`, con `A` declarada en
+// el mismo `.ws`) — antes el ámbito de una constante eran solo los imports
+// de su fichero, nunca sus hermanas, así que `A is not defined` incluso
+// estando las dos en el mismo sitio. No se puede evaluar mientras el .ws aún
+// está resolviendo sus propios imports (importación circular): el ámbito
+// estaría a medias, y una constante que use algo aún sin resolver daría un
+// `ReferenceError` engañoso en vez de un error que explique la causa.
+//
+// Una constante hermana solo se añade al ámbito si el texto de `decl.expr`
+// la menciona por nombre (igual criterio, por simplicidad y consistencia,
+// que el análisis de referencias del cliente) — así una hermana rota o con
+// un import que no existe no tumba a las demás si nadie la usa.
+//
+// Una constante que llama a una FUNCTION hermana del mismo `.ws` sigue sin
+// resolverse aquí (`doble is not defined` si `doble` es una function del
+// mismo fichero): esa function puede tocar `global`, que en este punto
+// (resolución de imports, en el arranque) todavía no existe — se compila
+// más tarde, cuando `createRequestHandler` ya sabe qué es `global` y qué es
+// de sesión (ver `compileWsRegistry`). Resolverlo exigiría decidir contra
+// qué estado compilar esa function en este punto, la misma pregunta de
+// diseño abierta que la function exportada por un `.wsb` (ver DISEÑO.md).
+function evaluateWsConst(registry, entry, decl) {
+	if (!entry.scopeReady) {
+		throw new Error(
+			`"${decl.name}" de ${entry.targetPath} se pide mientras se resuelven los imports de ese mismo fichero (importación circular): ` +
+				"una constante no se puede evaluar hasta tener resuelto todo lo que su fichero importa"
+		);
+	}
+	const scope = { ...wsScopeValues(registry, entry), ...siblingConstScope(registry, entry, decl) };
+	const names = Object.keys(scope);
+	// eslint-disable-next-line no-new-func
+	return new Function(...names, `return (${decl.expr});`)(...names.map((n) => scope[n]));
+}
+
+// Constantes/var hermanas del mismo `.ws` que `decl.expr` menciona por
+// nombre, cada una resuelta (y cacheada) a través de `getWsConstValue` —
+// que a su vez puede necesitar resolver SUS propias hermanas, de forma
+// recursiva (cubre cadenas: `const C = B + 1` con `B = A + 1`).
+function siblingConstScope(registry, entry, decl) {
+	const scope = {};
+	for (const sibling of entry.declared) {
+		if (!sibling || sibling.name === decl.name) continue;
+		if (sibling.type !== "ConstDecl" && sibling.type !== "VarDecl") continue;
+		if (!new RegExp(`\\b${sibling.name}\\b`).test(decl.expr)) continue;
+		scope[sibling.name] = getWsConstValue(registry, entry, sibling);
+	}
+	return scope;
+}
+
+// Cachea el valor de una constante/var de un `.ws` por nombre (se pida
+// desde fuera del fichero, vía `import`, o desde una hermana del mismo
+// fichero, vía `siblingConstScope`) — una sola evaluación por nombre, se
+// pida una o varias veces. Detecta una dependencia circular ENTRE
+// constantes hermanas (`const A = B` / `const B = A`) con un error que
+// nombra la constante y el fichero, en vez de una recursión infinita o un
+// `ReferenceError` que no explica la causa.
+function getWsConstValue(registry, entry, decl) {
+	if (!entry.constValues) entry.constValues = new Map();
+	if (entry.constValues.has(decl.name)) return entry.constValues.get(decl.name);
+	if (!entry.constEvaluating) entry.constEvaluating = new Set();
+	if (entry.constEvaluating.has(decl.name)) {
+		throw new Error(`"${decl.name}" de ${entry.targetPath}: depende circularmente de otra constante del mismo .ws (a través de sus hermanas)`);
+	}
+	entry.constEvaluating.add(decl.name);
+	try {
+		const value = evaluateWsConst(registry, entry, decl);
+		entry.constValues.set(decl.name, value);
+		return value;
+	} finally {
+		entry.constEvaluating.delete(decl.name);
+	}
+}
+
+function getWsEntry(registry, targetPath, from, importer, dbBaseDir) {
+	const existing = registry.byPath.get(targetPath);
+	if (existing) return existing;
+
+	const { parse } = require("./parser");
+	const wsAst = parse(fs.readFileSync(targetPath, "utf8"));
+	const declared = wsAst.body.map((n) => (n.type === "Export" ? n.declaration : n));
+	const entry = {
+		targetPath,
+		from,
+		importedBy: importer ? importer.targetPath : null,
+		declared,
+		// Se compilan TODAS las function del fichero a la vez (se pidan o no
+		// por nombre) — así una exportada puede llamar a un helper interno sin
+		// exportar, y dos exportadas pueden llamarse entre sí.
+		fnDecls: declared.filter((d) => d && d.type === "FunctionDecl"),
+		names: new Set(),
+		scope: { bindings: {}, fnImports: {} },
+		scopeReady: false,
+	};
+	// Se registra ANTES de resolver sus imports: si un ciclo vuelve a este
+	// mismo fichero, lo encuentra ya registrado en vez de recursar sin fin.
+	registry.byPath.set(targetPath, entry);
+	registry.list.push(entry);
+
+	// `targetPath` puede ser un `.wsb` (una function exportada por un .wsb,
+	// importada por otro): a diferencia de un `.ws`, un `.wsb` SÍ puede
+	// tener su propio estado de servidor (global, sesión, rutas) — así que
+	// sus imports hacia OTRO `.wsb` no se resuelven aquí. Encadenar otro
+	// `.wsb` reintroduciría, un nivel más allá, la misma pregunta sin
+	// resolver: contra qué estado compilar esa cadena. Se filtran esos
+	// import ANTES de resolver los demás (los normales — .ws, .js, .wson,
+	// .wsdb, paquetes — sí se resuelven con normalidad): si una function
+	// realmente necesitara algo de ahí, falla con un "X is not defined"
+	// tan claro como cualquier otro nombre sin resolver, no con una
+	// recursión silenciosa hacia el estado de otro servidor.
+	const importsToResolve = targetPath.endsWith(".wsb")
+		? { ...wsAst, body: wsAst.body.filter((n) => n.type !== "Import" || !n.from.endsWith(".wsb")) }
+		: wsAst;
+	resolveImports(importsToResolve, path.dirname(targetPath), dbBaseDir, { wsRegistry: registry, wsScopeOwner: entry });
+	entry.scopeReady = true;
+	return entry;
+}
+
+// Compila el lote de function de cada entrada del registro, cada una con SU
+// ámbito de imports. `globalInfo` es el del .wsb raíz (un .ws no tiene estado
+// de servidor propio — ver DISEÑO.md); sin él (uso directo de resolveImports),
+// se compila sin estado, como siempre.
+//
+// Una entrada de origen `.wsb` (una function exportada por un .wsb, ver
+// `getWsEntry`) es distinta: SIEMPRE se compila sin `global` en absoluto
+// (`globalInfo: null`), nunca con el del `.wsb` raíz que la importa — darle
+// el `global` del importador sería tan arbitrario como darle el de su
+// propio fichero de origen, y además podría "funcionar" por casualidad si
+// coincide un nombre, resolviendo mal en silencio. Antes de compilar, se
+// comprueba que ninguna de sus function mencione por nombre una `reactive`/
+// `var`/`const` de nivel superior DE ESE MISMO `.wsb` (sea `global` o de
+// sesión): si lo hace, es exactamente el hueco sin resolver (contra qué
+// estado compilarla) y se da un error explícito, no un `ReferenceError`
+// confuso en tiempo de ejecución.
+function compileWsRegistry(registry, globalInfo) {
+	for (const entry of registry.list) {
+		const importer = entry.importedBy ? `, a su vez importada por "${path.relative(registry.rootBaseDir, entry.importedBy)}"` : "";
+		const isWsbOrigin = entry.targetPath.endsWith(".wsb");
+		if (isWsbOrigin) checkWsbFunctionsDontTouchOwnState(entry);
+		const compiled = compileFunctionBatch(entry.fnDecls, wsScopeValues(registry, entry), isWsbOrigin ? null : globalInfo, {
+			origin: `importada de "${entry.from}"${importer}`,
+		});
+		registry.compiled.set(entry.targetPath, compiled);
+	}
+}
+
+// Nombres de nivel superior de un `.wsb` que son estado real (reactive/var/
+// const, sea `global` o de sesión) — ninguno está disponible para una
+// function que ese `.wsb` exporta y que otro `.wsb` importa (ver
+// `compileWsRegistry`). Solo se comprueban las function REALMENTE
+// ALCANZABLES desde lo que se pidió (`entry.names`, más lo que esas llamen
+// entre sí, transitivamente) — no todas las del fichero: una function del
+// mismo `.wsb` que nadie pidió, y que sí toca su propio estado, no debe
+// tumbar la que sí se pidió y no lo toca (mismo criterio — "una hermana que
+// nadie usa no tumba a las demás" — que ya se aplicó a las constantes
+// hermanas de un `.ws`). Un error aquí nombra la function, el nombre no
+// disponible, y el motivo — no deja que llegue a un `ReferenceError` en
+// tiempo de ejecución que no explica nada.
+function checkWsbFunctionsDontTouchOwnState(entry) {
+	const ownStateNames = entry.declared.filter((d) => d && (d.type === "ReactiveDecl" || d.type === "VarDecl" || d.type === "ConstDecl")).map((d) => d.name);
+	if (ownStateNames.length === 0) return;
+
+	const fnByName = new Map(entry.fnDecls.map((f) => [f.name, f]));
+	const reachable = new Set();
+	const queue = [...entry.names];
+	while (queue.length > 0) {
+		const name = queue.pop();
+		if (reachable.has(name) || !fnByName.has(name)) continue;
+		reachable.add(name);
+		const body = (fnByName.get(name).body || []).map(genStatement).join("\n");
+		for (const other of fnByName.keys()) {
+			if (other !== name && new RegExp(`\\b${other}\\b`).test(body)) queue.push(other);
+		}
+	}
+
+	for (const fn of entry.fnDecls) {
+		if (!reachable.has(fn.name)) continue;
+		const body = (fn.body || []).map(genStatement).join("\n");
+		for (const name of ownStateNames) {
+			if (new RegExp(`\\b${name}\\b`).test(body)) {
+				throw new Error(
+					`"${fn.name}" (exportada por ${entry.targetPath}) usa "${name}", que es estado propio de ese .wsb (reactive/var/const de nivel superior): ` +
+						"una function exportada por un .wsb no tiene acceso al estado de su fichero de origen (global ni de sesión) — solo a lo que ese .wsb, a su vez, importa de otro sitio (.ws, .js, .wson, .wsdb, un paquete)."
+				);
+			}
+		}
+	}
 }
 
 // Además de las bindings (nombre -> valor/función ya resuelto), un import
 // hacia un .wsb puede traer consigo una RUTA completa (WSON + reactive +
 // watch) que hay que añadir al AST antes de extraer las rutas — de ahí que
 // esta función devuelva también `extraNodes`.
-function resolveImports(ast, baseDir, dbBaseDir) {
+//
+// `deferWsFunctions` (lo usa createRequestHandler): las `function` de un
+// `.ws` NO se compilan aquí, sino que se dejan en el registro (`wsRegistry`,
+// un lote por fichero, sin repetir aunque se importe desde varias líneas)
+// para compilarlas DESPUÉS, cuando ya se sabe qué es `global` y qué es de
+// sesión en el .wsb que las importa. Compilarlas aquí mismo era la causa
+// de que una function importada de un .ws no tuviera ni acceso a `global`
+// ni la protección contra tocar una reactive de sesión: este es el primer
+// paso de createRequestHandler, y el estado del .wsb (incluido el que
+// traen consigo los import de rutas entre .wsb, que salen de AQUÍ mismo,
+// en `extraNodes`) todavía no se conoce. Sin la opción, se compilan al
+// momento, sin estado — el comportamiento de siempre, para quien llame a
+// resolveImports directamente.
+//
+// `wsRegistry`/`wsScopeOwner` son internas: la llamada más externa crea el
+// registro y lo comparte con las recursivas (imports de rutas entre .wsb,
+// e imports propios de cada .ws — con `wsScopeOwner` = el .ws cuyos imports
+// se están resolviendo, que es donde van a parar sus resultados).
+function resolveImports(ast, baseDir, dbBaseDir, { deferWsFunctions = false, wsRegistry = null, wsScopeOwner = null } = {}) {
 	const { parse } = require("./parser");
-	const bindings = {};
+	const isOutermost = !wsRegistry;
+	const registry = wsRegistry || createWsRegistry(baseDir);
+	// Los imports de un .ws son privados de ese .ws: van directos a su ámbito.
+	const bindings = wsScopeOwner ? wsScopeOwner.scope.bindings : {};
 	const extraNodes = [];
+	// Un import roto dentro de un .ws anidado no es obvio de localizar (el
+	// .wsb raíz no lo escribió): los errores de resolución nombran el .ws.
+	const inWs = wsScopeOwner ? `${path.relative(registry.rootBaseDir, wsScopeOwner.targetPath)}: ` : "";
 
 	for (const node of ast.body) {
 		if (node.type !== "Import") continue;
@@ -49,7 +444,7 @@ function resolveImports(ast, baseDir, dbBaseDir) {
 			// falta un require() real, nada propio del lenguaje aquí.
 			const resolvedPkgPath = resolvePackage(baseDir, node.from);
 			if (!resolvedPkgPath) {
-				throw new Error(`No se pudo resolver el paquete "${node.from}" (¿está instalado? buscado desde ${baseDir})`);
+				throw new Error(`${inWs}No se pudo resolver el paquete "${node.from}" (¿está instalado? buscado desde ${baseDir})`);
 			}
 			const mod = require(resolvedPkgPath);
 			if (node.isDefault) {
@@ -62,7 +457,7 @@ function resolveImports(ast, baseDir, dbBaseDir) {
 
 		const targetPath = resolveImportPath(baseDir, node.from);
 		if (!targetPath) {
-			throw new Error(`No se pudo resolver el import "${node.from}" (buscado desde ${baseDir})`);
+			throw new Error(`${inWs}No se pudo resolver el import "${node.from}" (buscado desde ${baseDir})`);
 		}
 
 		if (targetPath.endsWith(".js")) {
@@ -85,34 +480,58 @@ function resolveImports(ast, baseDir, dbBaseDir) {
 		}
 
 		if (targetPath.endsWith(".wsdb")) {
-			const { buildWsdbClass } = require("./codegen-wsdb");
-			const wsdbAst = parse(fs.readFileSync(targetPath, "utf8"), { isWsdbFile: true });
+			const { buildWsdbV2 } = require("./codegen-wsdb");
+			let wsdbAst;
+			try {
+				wsdbAst = parse(fs.readFileSync(targetPath, "utf8"), { isWsdbFile: true });
+			} catch (e) {
+				throw new Error(`"${node.from}": ${e.message}`);
+			}
 			// Un solo fichero .db para todo el proyecto (varias colecciones,
 			// varias tablas) — igual criterio que ".sessions/": vive junto al
 			// proyecto, no junto al código fuente, y no es configurable en
 			// esta primera versión (fijo, sencillo).
-			const dbPath = path.join(dbBaseDir || baseDir, ".wsdb-data", "webscript.db");
-			for (const name of node.names) bindings[name] = buildWsdbClass(wsdbAst, name, dbPath);
+			const dbPath = path.join(dbBaseDir || registry.rootBaseDir, ".wsdb-data", "webscript.db");
+			// El .wsdb define él mismo sus dos clases (<Nombre> y
+			// <Nombre>Schema, según "-> name:") — el import tiene que
+			// pedirlas por ese nombre exacto.
+			const { classes } = buildWsdbV2(wsdbAst, dbPath, path.basename(targetPath), path.dirname(targetPath));
+			for (const name of node.names) {
+				if (!classes[name]) {
+					throw new Error(`"${node.from}" no exporta "${name}" — exporta ${Object.keys(classes).map((n) => `"${n}"`).join(" y ")} (según su "-> name:")`);
+				}
+				bindings[name] = classes[name];
+			}
 			continue;
 		}
 
 		if (targetPath.endsWith(".ws")) {
-			const wsAst = parse(fs.readFileSync(targetPath, "utf8"));
-			const declared = wsAst.body.map((n) => (n.type === "Export" ? n.declaration : n));
+			const entry = getWsEntry(registry, targetPath, node.from, wsScopeOwner, dbBaseDir);
 			for (const name of node.names) {
-				const decl = declared.find((d) => d && d.name === name);
-				if (!decl) throw new Error(`"${name}" no está exportado en ${targetPath}`);
+				const decl = entry.declared.find((d) => d && d.name === name);
+				if (!decl) throw new Error(`${inWs}"${name}" no está exportado en ${targetPath}`);
 				if (decl.type === "FunctionDecl") {
-					bindings[name] = compileFunctionDecl(decl);
+					// Desde un .wsb, la function llega al ámbito raíz (se enlaza
+					// al compilar); desde otro .ws, se anota en el ámbito de ESE
+					// .ws y se llama con enlace tardío — ver lateBoundWsFunction.
+					if (wsScopeOwner) wsScopeOwner.scope.fnImports[name] = targetPath;
+					else entry.names.add(name);
 				} else {
-					// eslint-disable-next-line no-new-func
-					bindings[name] = new Function(`return (${decl.expr});`)();
+					bindings[name] = getWsConstValue(registry, entry, decl);
 				}
 			}
 			continue;
 		}
 
 		if (targetPath.endsWith(".wsb")) {
+			// Un .ws es lógica compartida entre .wsf y .wsb (el cliente también
+			// lo usa), y un .wsb es solo de servidor: importarlo desde un .ws
+			// no tiene sentido y rompería el bundle del cliente.
+			if (wsScopeOwner) {
+				throw new Error(
+					`${path.relative(registry.rootBaseDir, wsScopeOwner.targetPath)} (un .ws) importa "${node.from}": un .ws es lógica compartida (también la usa el cliente) y no puede importar un .wsb`
+				);
+			}
 			const targetBaseDir = path.dirname(targetPath);
 			const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
 			const declared = targetAst.body.map((n) => (n.type === "Export" ? n.declaration : n));
@@ -122,7 +541,21 @@ function resolveImports(ast, baseDir, dbBaseDir) {
 				if (!decl) throw new Error(`"${name}" no está exportado en ${targetPath}`);
 
 				if (decl.type === "FunctionDecl") {
-					bindings[name] = compileFunctionDecl(decl);
+					// Se resuelve como una entrada más del mismo registro que ya
+					// usan los `.ws` (ver `getWsEntry`) — mismo ámbito por
+					// fichero, mismo enlace tardío, mismo "se compilan TODAS las
+					// function de ese fichero a la vez" (así una exportada puede
+					// llamar a un helper interno sin exportar, o a otra
+					// exportada, del MISMO .wsb). Antes se compilaba sola y
+					// aislada (`compileFunctionDecl`), sin ver ni sus propios
+					// imports ni sus hermanas — `X is not defined` con
+					// cualquiera de las dos. `wsScopeOwner` aquí siempre es
+					// nulo (una function exportada por un .wsb importando OTRO
+					// .wsb ya se filtró en `getWsEntry`), así que el nombre
+					// pedido va directo a `entry.names` — igual que hace el
+					// ámbito raíz con la de un `.ws`.
+					const wsbEntry = getWsEntry(registry, targetPath, node.from, wsScopeOwner, dbBaseDir);
+					wsbEntry.names.add(name);
 					continue;
 				}
 
@@ -181,7 +614,7 @@ function resolveImports(ast, baseDir, dbBaseDir) {
 					// Lo que ese watch() importado necesite (p. ej. un DTO
 					// .wson) se resuelve contra la carpeta del fichero
 					// ORIGEN de la ruta, no la de quien la importa.
-					const nested = resolveImports(targetAst, targetBaseDir, dbBaseDir);
+					const nested = resolveImports(targetAst, targetBaseDir, dbBaseDir, { wsRegistry: registry });
 					Object.assign(bindings, nested.bindings);
 					extraNodes.push(...nested.extraNodes);
 					continue;
@@ -193,7 +626,18 @@ function resolveImports(ast, baseDir, dbBaseDir) {
 		throw new Error(`Import no soportado en el servidor todavía: "${node.from}" (solo .wson, .ws y .wsb)`);
 	}
 
-	return { bindings, extraNodes };
+	// Sin `deferWsFunctions`, la llamada más externa compila ya los lotes de
+	// todos los .ws alcanzados (sin estado) y enlaza lo que pidió el ámbito
+	// raíz. Las llamadas recursivas nunca compilan: se limitan a rellenar el
+	// registro compartido.
+	const compileNow = isOutermost && !deferWsFunctions;
+	if (compileNow) {
+		compileWsRegistry(registry, null);
+		for (const entry of registry.list) {
+			for (const name of entry.names) bindings[name] = registry.compiled.get(entry.targetPath)[name];
+		}
+	}
+	return { bindings, extraNodes, deferredWs: compileNow ? [] : registry.list, wsRegistry: registry };
 }
 
 // --- Sesión por visitante ---------------------------------------------
@@ -264,20 +708,39 @@ function wrapReactiveState(state, typeSchema) {
 // exactamente lo que pide "Async/await implícito". Se opera línea a línea
 // porque genStatement ya emite una sentencia por línea (incluidos los
 // bloques for/while, con sus hijos en líneas propias).
-function injectAsyncTriggers(bodyText, watchTargetNames) {
-	if (!watchTargetNames || watchTargetNames.size === 0) return bodyText;
-	const assignmentRes = [...watchTargetNames].map(
-		(name) => new RegExp(`^\\s*serverState\\.${name}\\s*(=(?!=)|\\+\\+|--|[-+*/%&|^]=|\\*\\*=|&&=|\\|\\|=|\\?\\?=)`)
-	);
-	const names = [...watchTargetNames];
+// Convierte una reasignación real (no una simple lectura) de una reactive
+// CON SU PROPIO watch() en "reasigna, y además dispara ese watch()" —
+// `await __trigger("nombre")` justo después de la línea que reasigna.
+//
+// `groups` es una lista de { names, prefix, triggerFn } — antes solo
+// existía un grupo (las reactives de SESIÓN, con prefijo `serverState.` y
+// disparador `__trigger`); ahora también hay un segundo grupo posible
+// para las reactives `global` (prefijo `getGlobalState().`, disparador
+// `__triggerGlobal`) — dos disparadores distintos, nunca mezclados en una
+// misma reactive, porque una reactive es de sesión O global, nunca las
+// dos cosas. Se usa tanto para el texto de un watch() como para el de
+// una function/online function (una function puede reasignar una
+// reactive `global` y disparar su watch() igual que un watch() lo haría).
+function injectAsyncTriggers(bodyText, groups) {
+	const specs = [];
+	for (const g of groups || []) {
+		if (!g.names || g.names.size === 0) continue;
+		const escapedPrefix = g.prefix.replace(/[.()[\]{}*+?^$|\\]/g, "\\$&");
+		for (const name of g.names) {
+			specs.push({
+				name,
+				re: new RegExp(`^\\s*${escapedPrefix}${name}\\s*(=(?!=)|\\+\\+|--|[-+*/%&|^]=|\\*\\*=|&&=|\\|\\|=|\\?\\?=)`),
+				triggerFn: g.triggerFn,
+			});
+		}
+	}
+	if (specs.length === 0) return bodyText;
 	const lines = bodyText.split("\n");
 	const out = [];
 	for (const line of lines) {
 		out.push(line);
-		for (let i = 0; i < assignmentRes.length; i++) {
-			if (assignmentRes[i].test(line)) {
-				out.push(`await __trigger(${JSON.stringify(names[i])});`);
-			}
+		for (const spec of specs) {
+			if (spec.re.test(line)) out.push(`await ${spec.triggerFn}(${JSON.stringify(spec.name)});`);
 		}
 	}
 	return out.join("\n");
@@ -674,19 +1137,129 @@ function createSessionStore(decls, wconfig, baseDir) {
 	return createMemorySessionStore(decls, wconfig);
 }
 
-function substituteServerState(code, names) {
+const acorn = require("acorn");
+const walk = require("acorn-walk");
+const { acceptUpgrade, OPCODE } = require("./websocket-runtime");
+
+const SERVER_STATE_ACORN_OPTS = { ecmaVersion: "latest", sourceType: "script", allowReturnOutsideFunction: true, allowAwaitOutsideFunction: true };
+
+// Antes de esta versión, la sustitución se hacía con una expresión
+// regular sobre el texto crudo — así que un `nombre` de reactive que
+// coincidiera con una palabra suelta DENTRO de un string o de un template
+// literal también se sustituía (p. ej. una reactive llamada "persona" y
+// un mensaje `"persona creada"` en el propio watch() se corrompía a
+// `"serverState.persona creada"`). Se mantiene como red de seguridad para
+// el caso (raro) de que el cuerpo del watch(), ya ensamblado, no sea JS
+// válido por sí solo — nunca debería pasar dado cómo se construye `raw`
+// en genHandlerBody, pero fallar en silencio dejando referencias sin
+// cualificar sería peor (ReferenceError en producción) que aplicar la
+// heurística antigua.
+function substituteServerStateNaive(code, names, targetName = "serverState") {
 	let out = code;
 	for (const name of names) {
-		// No sustituir si es una CLAVE de objeto literal ({ nombre: ... } o
-		// , nombre: ...) — solo el valor debe convertirse en
-		// serverState.nombre, la clave se queda tal cual. El espacio antes
-		// de la clave es SOLO en la misma línea ([ \t], no \s) — un salto
-		// de línea antes no cuenta, si no un `{` de apertura de bloque
-		// (for/if en la línea anterior) se confundiría con el de un objeto
-		// literal y dejaría sin sustituir la primera sentencia del cuerpo.
 		const re = new RegExp(`(?<![.\\w])(?<![{,][ \\t]{0,20})\\b${name}\\b(?![ \\t]{0,20}:)`, "g");
-		out = out.replace(re, `serverState.${name}`);
+		out = out.replace(re, `${targetName}.${name}`);
 	}
+	return out;
+}
+
+// Sustituye cada referencia real a una reactive de servidor (`names`) por
+// `serverState.<nombre>`, usando un parser real en vez de una expresión
+// regular — para no tocar nunca el contenido de un string, un template
+// literal o un comentario, que un simple `\b<nombre>\b` no puede
+// distinguir del código de verdad.
+//
+// Casos que NO se sustituyen (son la misma palabra, pero no una lectura
+// de la reactive):
+// - la propiedad de un acceso `objeto.nombre` (no `nombre` en sí)
+// - la CLAVE de un `{ nombre: valor }` (el valor si se sustituye)
+// - cualquier identificador dentro de un patrón de desestructuración
+//   (`const { nombre } = x`, un parámetro `{ nombre }`, `...nombre`) — ahí
+//   `nombre` se está DECLARANDO, no leyendo; sustituirlo generaría una
+//   declaración inválida (`const serverState.nombre = ...` no es JS
+//   válido)
+// - la etiqueta de un `break`/`continue`/una sentencia etiquetada
+//
+// Caso que SÍ se sustituye y que la versión anterior (regex) dejaba mal:
+// una propiedad abreviada `{ nombre }` como VALOR (no como patrón) se
+// expande a `{ nombre: serverState.nombre }` — la regex antigua la
+// trataba como si fuera una clave y la dejaba tal cual, lo que habría
+// producido un `ReferenceError: nombre is not defined` en tiempo de
+// ejecución (nunca se detectó porque no hay ningún test que construya un
+// objeto así a partir de una reactive).
+function substituteServerState(code, names, targetName = "serverState") {
+	if (!names || names.length === 0) return code;
+	const nameSet = new Set(names);
+	let ast;
+	try {
+		ast = acorn.parse(code, SERVER_STATE_ACORN_OPTS);
+	} catch {
+		return substituteServerStateNaive(code, names, targetName);
+	}
+
+	const actions = [];
+	const shorthandDone = new Set(); // "start-end" — evita procesar dos veces la clave y el valor de una misma propiedad abreviada
+
+	walk.ancestor(ast, {
+		// acorn-walk enruta el lado izquierdo de una asignación simple
+		// (`persona = valor`) como "Pattern" -> "VariablePattern" en vez de
+		// como un Identifier normal (mismo mecanismo que usa para
+		// declaraciones y parámetros) — y por defecto NO llama a ningún
+		// visitor para ese tipo. Sin este visitor propio, el caso más
+		// importante de todos (reasignar la reactive para disparar su
+		// cascada) se quedaba sin sustituir, dejando `persona = ...` tal
+		// cual en vez de `serverState.persona = ...` — un ReferenceError
+		// en cuanto se ejecutara.
+		VariablePattern(node, _state, ancestors) {
+			if (!nameSet.has(node.name)) return;
+			const parent = ancestors[ancestors.length - 2];
+			// El mismo tipo "VariablePattern" cubre también un `var`/
+			// parámetro/`catch` NUEVO con ese nombre — eso sí es una
+			// declaración local, no una reactive, y no se toca. Solo nos
+			// interesa el caso de una reasignación real (con cualquier
+			// operador: =, +=, etc.), que sí lee/escribe la reactive.
+			if (parent && parent.type === "AssignmentExpression" && parent.left === node) {
+				actions.push({ start: node.start, end: node.end, text: `${targetName}.${node.name}` });
+			}
+		},
+		Identifier(node, _state, ancestors) {
+			if (!nameSet.has(node.name)) return;
+			// ancestors incluye al propio nodo como último elemento.
+			const parent = ancestors[ancestors.length - 2];
+			if (!parent) return;
+
+			// Dentro de un patrón de desestructuración (declaración,
+			// parámetro, o el lado izquierdo de una asignación) no se toca
+			// nada — ver el comentario de arriba.
+			if (ancestors.some((a) => a.type === "ObjectPattern" || a.type === "ArrayPattern" || a.type === "AssignmentPattern" || a.type === "RestElement")) {
+				return;
+			}
+
+			if ((parent.type === "BreakStatement" || parent.type === "ContinueStatement" || parent.type === "LabeledStatement") && parent.label === node) {
+				return;
+			}
+			if (parent.type === "MemberExpression" && !parent.computed && parent.property === node) {
+				return; // objeto.nombre — la propiedad no se sustituye
+			}
+			if (parent.type === "Property" && !parent.computed) {
+				if (parent.shorthand) {
+					const key = `${node.start}-${node.end}`;
+					if (shorthandDone.has(key)) return; // ya se generó la expansión (se visita la clave y el valor por separado, mismo rango)
+					shorthandDone.add(key);
+					actions.push({ start: node.start, end: node.end, text: `${node.name}: ${targetName}.${node.name}` });
+					return;
+				}
+				if (parent.key === node) return; // { nombre: valor } — la clave no se sustituye, el valor sí (sigue su propio camino)
+			}
+
+			actions.push({ start: node.start, end: node.end, text: `${targetName}.${node.name}` });
+		},
+	});
+
+	if (actions.length === 0) return code;
+	actions.sort((a, b) => b.start - a.start);
+	let out = code;
+	for (const a of actions) out = out.slice(0, a.start) + a.text + out.slice(a.end);
 	return out;
 }
 
@@ -750,7 +1323,87 @@ function extractPlainWatches(ast, listenerReactiveNames) {
 	return watches;
 }
 
-// --- Colisión de rutas: normaliza :param a un comodín --------------------
+// --- `online function`: registro de funciones expuestas a otros servidores
+
+// Recopila las `online function` alcanzables desde este .wsb — las suyas
+// propias, y las que traiga consigo un `import { nombre } from "./algo.ws"`
+// cuya declaración original, en ese .ws, también sea `online`. No hace
+// falta rebuscar el proyecto entero: si no está importada, no se expone —
+// mismo criterio que WSON.listen(), que tampoco se descubre solo.
+// Recopila las `online function` alcanzables desde este .wsb — las suyas
+// propias, y las que traiga consigo un `import { nombre } from "./algo.ws"`
+// cuya declaración original, en ese .ws, también sea `online`. No hace
+// falta rebuscar el proyecto entero: si no está importada, no se expone —
+// mismo criterio que WSON.listen(), que tampoco se descubre solo.
+//
+// `extraBindings` (imports ya resueltos + function propias no-online del
+// mismo .wsb, ver createRequestHandler) queda disponible dentro de las
+// declaradas aquí mismo — así una online function puede llamar a una
+// function corriente o a algo importado, sin ninguna limitación distinta
+// a cualquier otra function. Las importadas de un .ws se compilan JUNTO a
+// las demás function de ESE MISMO fichero (sean online o no), para que
+// puedan llamarse entre sí igual que si nunca hubieran salido de ahí.
+//
+// El acceso a `global` (y la protección contra el estado de sesión) llega
+// igual a las propias y a las importadas de un `.ws`: ambas se compilan en
+// createRequestHandler con el mismo `globalInfo` (antes, las importadas no
+// — se compilaban dentro de resolveImports, antes de conocer el estado).
+// Recopila las `online function` alcanzables desde este .wsb — las suyas
+// propias, y las que traiga consigo un `import { nombre } from "./algo.ws"`
+// cuya declaración original, en ese .ws, también sea `online`. No hace
+// falta rebuscar el proyecto entero: si no está importada, no se expone —
+// mismo criterio que WSON.listen(), que tampoco se descubre solo.
+//
+// `compiledOwn` son las function de ESTE `.wsb` YA COMPILADAS (junto a
+// todas sus hermanas, `online` o no, en un único lote — ver
+// createRequestHandler) — aquí no se vuelven a compilar aparte, solo se
+// seleccionan por nombre las que sean `online`, para no perder la
+// visibilidad cruzada entre una `function` normal y una `online function`
+// del mismo fichero (si se compilaran en lotes separados, una no podría
+// llamar a la otra según cuál se compilara antes — se detectó así, con
+// código real). Las importadas de un .ws sí se compilan aquí, JUNTO a
+// las demás function de ESE MISMO fichero (sean online o no), para que
+// puedan llamarse entre sí igual que si nunca hubieran salido de ahí.
+//
+// `compiledWsFiles` (Map ruta -> { nombre: función }), si se pasa, son los
+// .ws YA compilados por createRequestHandler (con acceso a `global`) — se
+// reutilizan tal cual. Antes aquí se volvía a compilar el .ws por segunda
+// vez, así que la MISMA function importada existía en dos instancias
+// distintas: una para las llamadas en local y otra, sin estado, para RPC.
+function extractOnlineFunctions(ast, baseDir, compiledOwn = {}, compiledWsFiles = null) {
+	const { parse } = require("./parser");
+	const found = [];
+	const seen = new Set();
+	const claim = (name, label) => {
+		if (seen.has(name)) throw new Error(`"online function ${name}" está declarada más de una vez (revisa los imports) — ${label}`);
+		seen.add(name);
+	};
+
+	const ownOnlineDecls = ast.body.filter((n) => n.type === "FunctionDecl" && n.online);
+	for (const decl of ownOnlineDecls) {
+		claim(decl.name, "declarada en este .wsb");
+		found.push({ name: decl.name, params: decl.params.map((p) => p.name), idempotent: !!decl.idempotent, fn: compiledOwn[decl.name] });
+	}
+
+	if (!baseDir) return found;
+	for (const node of ast.body) {
+		if (node.type !== "Import" || isPackageSpecifier(node.from)) continue;
+		const targetPath = resolveImportPath(baseDir, node.from);
+		if (!targetPath || !targetPath.endsWith(".ws")) continue; // solo .ws — un .wsb no debería exponer online functions de otro .wsb
+		const wsAst = parse(fs.readFileSync(targetPath, "utf8"));
+		const declared = wsAst.body.map((n) => (n.type === "Export" ? n.declaration : n));
+		const compiledFile =
+			(compiledWsFiles && compiledWsFiles.get(targetPath)) || compileFunctionBatch(declared.filter((d) => d && d.type === "FunctionDecl"));
+		for (const name of node.names) {
+			const decl = declared.find((d) => d && d.name === name);
+			if (decl && decl.type === "FunctionDecl" && decl.online) {
+				claim(decl.name, `importada de "${node.from}"`);
+				found.push({ name: decl.name, params: decl.params.map((p) => p.name), idempotent: !!decl.idempotent, fn: compiledFile[decl.name] });
+			}
+		}
+	}
+	return found;
+}
 
 function normalizeRoute(to) {
 	return to.replace(/:[^/]+/g, ":param");
@@ -791,12 +1444,20 @@ function compileRoutePattern(to) {
 // casi-JS, y Raw para el resto) — la mayoría de sentencias de un `.wsb` ya
 // SON JS válido dado que la API de WSON es estática (WSON.send(x), no
 // x.send()), así que se emiten casi literalmente.
-// Si WSON.send(...) es la ÚLTIMA sentencia de una rama (el caso normal —
-// incluso dentro de if/else), se compila como `return WSON.send(...)` en
-// vez de una llamada suelta: así quien invoca al handler puede esperar de
-// verdad a que termine (relevante para un guardado de sesión asíncrono,
-// como Redis) antes de responder o soltar el bloqueo de la sesión.
+// Si WSON.httpSend(...)/WSON.send(...) es la ÚLTIMA sentencia de una rama
+// (el caso normal — incluso dentro de if/else), se compila como
+// `return WSON.httpSend(...)` en vez de una llamada suelta: así quien
+// invoca al handler puede esperar de verdad a que termine (relevante para
+// un guardado de sesión asíncrono, como Redis) antes de responder o soltar
+// el bloqueo de la sesión.
+// Toda sentencia generada pasa por la reescritura de `.where(...)` (ver
+// wsdb-query.js) — idempotente, así que da igual que un bloque anidado ya
+// venga reescrito desde dentro.
 function genStatement(node) {
+	return rewriteWhereCalls(genStatementRaw(node));
+}
+
+function genStatementRaw(node) {
 	if (node.type === "VarDecl" || node.type === "ConstDecl") {
 		return `${node.type === "ConstDecl" ? "const" : "let"} ${node.name} = ${node.expr};`;
 	}
@@ -819,29 +1480,47 @@ function genStatement(node) {
 	if (node.type === "Else") {
 		return `else {\n${(node.body || []).map(genStatement).join("\n")}\n}`;
 	}
+	if (node.type === "For") {
+		// Misma semántica que ya usa el lado cliente para esto mismo
+		// (codegen-client.js: genFor) — valores del listado, no índices ni
+		// claves. Antes no había ningún caso para "For" aquí: caía en el
+		// mensaje de "sentencia no reconocida" de más abajo, que solo
+		// genera un comentario — el cuerpo del bucle (lo que fuera que
+		// acumulara) no se ejecutaba nunca, sin ningún error ni aviso.
+		return `for (const ${node.item} of (${node.list})) {\n${(node.body || []).map(genStatement).join("\n")}\n}`;
+	}
 	return `// TODO codegen-server: sentencia no reconocida (${node.type})`;
 }
 
-// "Async/await implícito" (DISEÑO.md): `WSON.send()` es la única llamada
-// de la API estática de WSON que representa "espera esto" de verdad — a
-// diferencia de `WSON.enqueue()`, que es fire-and-forget A PROPÓSITO, por
-// diseño (esperar sus reintentos con backoff dentro de la misma petición
-// sería contraproducente, no un descuido). Se espera en CUALQUIER
-// posición del cuerpo, no solo si es la última sentencia — antes, un
-// `WSON.send()` que no fuera la última línea se disparaba y se
-// olvidaba, exactamente el mismo problema que ya se corrigió para la
-// cascada de watch().
+// "Async/await implícito" (DISEÑO.md): `WSON.send()` (llamada saliente,
+// la usa quien invoca) y `WSON.httpSend()` (responde la petición entrante,
+// la usa quien fue invocado — ver DISEÑO.md, sección "WSON.httpSend...")
+// son las dos únicas llamadas de la API estática de WSON que representan
+// "espera esto" de verdad — a diferencia de `WSON.enqueue()`, que es
+// fire-and-forget A PROPÓSITO, por diseño (esperar sus reintentos con
+// backoff dentro de la misma petición sería contraproducente, no un
+// descuido). Se esperan en CUALQUIER posición del cuerpo, no solo si son
+// la última sentencia — antes, una de estas que no fuera la última línea
+// se disparaba y se olvidaba, exactamente el mismo problema que ya se
+// corrigió para la cascada de watch().
 function injectSendAwait(bodyText) {
-	return bodyText.replace(/(?<!await\s)\bWSON\.send\(/g, "await WSON.send(");
+	return bodyText.replace(/(?<!await\s)\bWSON\.(?:send|httpSend)\(/g, (m) => `await ${m}`);
 }
 
-function genHandlerBody(watchNode, stateNames) {
+function genHandlerBody(watchNode, stateNames, knownFunctionNames, globalNames) {
 	if (!watchNode) return "";
 	// Dentro del handler, `peticion` (alias del nombre de la reactive) es
-	// la instancia ya recibida — showContent/params/query actúan sobre ese
-	// mismo objeto, coherente con la API estática de WSON.
-	const raw = (watchNode.body || []).map(genStatement).join("\n");
-	return injectSendAwait(substituteServerState(raw, stateNames));
+	// la instancia ya recibida — showContent/httpParams/httpQuery actúan
+	// sobre ese mismo objeto, coherente con la API estática de WSON.
+	let raw = (watchNode.body || []).map(genStatement).join("\n");
+	raw = substituteServerState(raw, stateNames);
+	// Un watch() de sesión (o de una ruta WSON.listen()) también puede
+	// leer/escribir una reactive `global` — no hay ambigüedad de sabores
+	// aquí: la reactive en sí ya dice si es de sesión o global, nunca las
+	// dos cosas, así que combinar las dos sustituciones en el mismo
+	// cuerpo es seguro.
+	if (globalNames && globalNames.length > 0) raw = substituteServerState(raw, globalNames, "getGlobalState()");
+	return injectAwaitForKnownCalls(injectSendAwait(raw), knownFunctionNames);
 }
 
 // Compila un cuerpo de watch() a una función real — antes de hacerlo,
@@ -867,7 +1546,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 function compileWatchFunction(paramNames, bodyText, label) {
 	// eslint-disable-next-line no-new-func
-	const faltantes = findUndeclaredReferences(bodyText, [...paramNames, "__trigger"]);
+	const faltantes = findUndeclaredReferences(bodyText, [...paramNames, "__trigger", "__triggerGlobal"]);
 	if (faltantes && faltantes.length > 0) {
 		const lista = faltantes.map((n) => `"${n}"`).join(", ");
 		throw new Error(
@@ -890,16 +1569,16 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 	// Import hacia .wsb puede traer consigo una ruta completa (WSON +
 	// reactive + watch) — se empalma en el AST ANTES de extraer las rutas,
 	// para que se sirva exactamente igual que si se hubiera escrito aquí.
-	const { bindings: importBindings, extraNodes } = baseDir
-		? resolveImports(ast, baseDir, sessionBaseDir)
-		: { bindings: {}, extraNodes: [] };
+	// Las function de un .ws importado se APLAZAN (deferWsFunctions): se
+	// compilan más abajo, en cuanto se sabe qué es `global` y qué es de
+	// sesión — ver el comentario de resolveImports.
+	const { bindings: importBindings, extraNodes, wsRegistry } = baseDir
+		? resolveImports(ast, baseDir, sessionBaseDir, { deferWsFunctions: true })
+		: { bindings: {}, extraNodes: [], wsRegistry: createWsRegistry(null) };
 	const expandedAst = extraNodes.length > 0 ? { ...ast, body: [...ast.body, ...extraNodes] } : ast;
 
 	const listeners = extractListeners(expandedAst);
 	validateNoCollisions(listeners);
-
-	const importNames = Object.keys(importBindings);
-	const importValues = importNames.map((n) => importBindings[n]);
 
 	const sessionDecls = extractSessionStateDecls(expandedAst, listeners);
 	{
@@ -913,32 +1592,256 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 			seen.add(d.name);
 		}
 	}
-	const stateNames = sessionDecls.map((d) => d.name);
+	// `global` separa de raíz dos cosas que antes compartían un solo
+	// mecanismo confuso: una reactive normal es POR SESIÓN, como
+	// siempre — una copia propia por visitante, invisible del todo para
+	// cualquier function/online function (se comprueba y se rechaza al
+	// compilar, ver checkNoSessionOnlyReferences). Una `global reactive`
+	// es una única instancia compartida por todo el proceso, alcanzable
+	// desde CUALQUIER sitio — un watch(), una function, una online
+	// function — sin ningún "sabor" que mezclar, porque nunca tuvo el
+	// otro. Antes de esto, TODA reactive de nivel superior se ofrecía
+	// como si fuera global a cualquier function/online function que la
+	// tocara, en silencio y sin que nadie lo pidiera — el bug real que
+	// llevó a este rediseño: una function llamada desde un watch() de
+	// sesión escribía en la copia global, no en la de esa sesión, sin
+	// ningún error ni aviso.
+	const sessionOnlyDecls = sessionDecls.filter((d) => !d.global);
+	const globalDecls = sessionDecls.filter((d) => d.global);
+	const stateNames = sessionOnlyDecls.map((d) => d.name);
 	const sessionTypeSchema = {};
-	for (const d of sessionDecls) {
+	for (const d of sessionOnlyDecls) {
 		if (d.varType) sessionTypeSchema[d.name] = d.varType;
 	}
-	const sessionStore = createSessionStore(sessionDecls, wconfig, sessionBaseDir || baseDir);
+	const globalNames = globalDecls.map((d) => d.name);
+	const globalTypeSchema = {};
+	for (const d of globalDecls) {
+		if (d.varType) globalTypeSchema[d.name] = d.varType;
+	}
+	const sessionOnlyNamesSet = new Set(stateNames);
 
-	// `watch()` sobre cualquier reactive que no sea WSON.listen() (string,
-	// boolean, DTO, array...) — se compilan una vez aquí (igual mecanismo
-	// que el handler de una ruta), y se invocan cuando se les asigna un
-	// valor nuevo (ver __trigger, más abajo), no por ninguna petición HTTP
-	// en concreto.
-	const plainWatches = extractPlainWatches(
+	// Creada la PRIMERA VEZ que de verdad hace falta, no al arrancar el
+	// servidor: un valor inicial mal tipado, como en cualquier sesión
+	// normal, debe dar un error solo en la llamada que lo dispare, nunca
+	// tirar el proceso entero al arrancar. Memorizada para las siguientes.
+	let globalStateCache = null;
+	function getGlobalState() {
+		if (!globalStateCache) globalStateCache = wrapReactiveState(instantiateSessionState(globalDecls), globalTypeSchema);
+		return globalStateCache;
+	}
+
+	// `watch()` sobre cualquier reactive que no sea WSON.listen() — se
+	// compilan una vez aquí, y se invocan cuando se les asigna un valor
+	// nuevo. Se separan por si su reactive es `global` o de sesión ANTES
+	// de compilarlas, porque cada una necesita un mecanismo de disparo
+	// distinto (__trigger, por sesión, más abajo — o __triggerGlobal,
+	// compartido por todo el proceso, justo aquí debajo) — nunca los dos
+	// a la vez, porque una reactive es de un tipo o del otro, no ambos.
+	const allPlainWatches = extractPlainWatches(
 		expandedAst,
 		listeners.map((l) => l.reactiveName)
 	);
-	// Todo nombre que tiene su propio watch() (ruta o reactive normal) —
-	// una asignación a cualquiera de ellos, en el cuerpo de CUALQUIER
-	// watch(), lleva su `await __trigger(...)` inyectado automáticamente.
-	const allWatchedNames = new Set([...listeners.map((l) => l.reactiveName), ...plainWatches.map((w) => w.target)]);
+	const globalNamesSet = new Set(globalNames);
+	const globalPlainWatches = allPlainWatches.filter((w) => globalNamesSet.has(w.target));
+	const plainWatches = allPlainWatches.filter((w) => !globalNamesSet.has(w.target));
+	// `shared global reactive` necesita que CUALQUIER reasignación suya
+	// dispare `__triggerGlobal` — no solo las que tienen su propio
+	// `watch()` (que ya lo necesitaban para eso) — porque la difusión a
+	// los clientes suscritos (ver `wireSharedReactivesRpc`) vive dentro de
+	// `__triggerGlobal` y debe ocurrir SIEMPRE que cambie, tenga o no un
+	// `watch()` declarado. Sin esto, una `shared global reactive` sin
+	// `watch()` (el caso más simple: compartir un valor sin ninguna
+	// lógica de validación) nunca se habría difundido en absoluto.
+	const sharedGlobalNames = new Set(globalDecls.filter((d) => d.type === "ReactiveDecl" && d.shared).map((d) => d.name));
+	const globalWatchedNames = new Set([...globalPlainWatches.map((w) => w.target), ...sharedGlobalNames]);
+
+	// __triggerGlobal se define ANTES de compilar los propios global
+	// watches (para que puedan inyectárselo entre sí y encadenar una
+	// cascada), pero el mapa que consulta se rellena DESPUÉS de
+	// compilarlos — el mismo truco de siempre (closure sobre una
+	// variable que se puebla más tarde, nunca invocada antes de eso).
+	const globalWatchesByName = new Map();
+	// Dos guardas contra un watch() que se dispara a sí mismo sin parar
+	// (reproducido con código real: `watch(contador) { contador = contador
+	// }` — sin ninguna de las dos, revienta la pila: "Maximum call stack
+	// size exceeded"):
+	// 1. Si el valor NO cambió de verdad respecto al último disparo que se
+	//    atendió, no se llama al watch() — cubre el caso típico (una
+	//    corrección/normalización que, aplicada dos veces, da lo mismo:
+	//    se ejecuta una vez, corrige, y la segunda vez ya no hay nada que
+	//    corregir). No es una ocurrencia nueva: es la misma guarda que ya
+	//    usa cualquier motor reactivo (React, Vue) para esto mismo.
+	// 2. Un contador de profundidad, como red de seguridad para el caso
+	//    que la guarda 1 NO cubre — un valor que cambia de verdad en
+	//    cada disparo, sin converger nunca (p. ej. `contador =
+	//    contador + 1` sin condición dentro de su propio watch()). Sin
+	//    esto, ese caso seguiría reventando la pila; con esto, da un
+	//    error claro y accionable en vez de un cuelgue.
+	const globalLastTriggeredValues = new Map();
+	let globalTriggerDepth = 0;
+	const GLOBAL_TRIGGER_MAX_DEPTH = 50;
+	// Registro de conexiones WebSocket suscritas a cada `shared global
+	// reactive` — por NOMBRE, no por conexión, porque difundir es "para
+	// cada suscriptor de este nombre, manda el valor nuevo" (ver
+	// `wireSharedReactivesRpc`, que es quien añade/quita conexiones aquí
+	// al conectar/desconectar). Vive en este mismo cierre, junto al resto
+	// del estado global, por la misma razón: compartido por TODO el
+	// proceso, no por sesión ni por conexión.
+	const sharedSubscribers = new Map(); // nombre -> Set<ws>
+	// Última versión DIFUNDIDA de cada `shared global reactive` — guarda
+	// aparte de `globalLastTriggeredValues` (esa es para el `watch()`, y
+	// una `shared` puede no tener ninguno). Necesaria porque un `watch()`
+	// que corrige su propio valor dispara `__triggerGlobal` DOS veces para
+	// el mismo asentamiento final: una vez desde quien causó el cambio
+	// original (que sigue ejecutando DESPUÉS de que el `watch()` en
+	// cascada ya terminó y ya difundió el valor corregido) y otra desde la
+	// propia corrección — sin esta guarda, el mismo valor final se manda
+	// dos veces seguidas a cada suscrito. Reproducido con código real
+	// antes de añadirla: `propose` con un valor que el `watch()` recorta
+	// llegaba a los suscritos como DOS mensajes "update" idénticos.
+	const sharedLastBroadcastValues = new Map();
+
+	const __triggerGlobal = async (name) => {
+		const fn = globalWatchesByName.get(name);
+		if (fn) {
+			const current = getGlobalState()[name];
+			const changed = !globalLastTriggeredValues.has(name) || globalLastTriggeredValues.get(name) !== current;
+			if (changed) {
+				globalLastTriggeredValues.set(name, current);
+				if (globalTriggerDepth >= GLOBAL_TRIGGER_MAX_DEPTH) {
+					console.error(
+						`watch("${name}") [global]: posible bucle — se superaron ${GLOBAL_TRIGGER_MAX_DEPTH} disparos en cascada sin converger (cada disparo reasigna un valor DISTINTO al anterior; revisa si el propio watch() necesita una condición de parada).`
+					);
+				} else {
+					globalTriggerDepth++;
+					try {
+						await fn();
+					} catch (err) {
+						console.error(`Error en watch("${name}") [global]:`, err && err.message);
+					} finally {
+						globalTriggerDepth--;
+					}
+				}
+			}
+		}
+		// La difusión a los suscritos es INDEPENDIENTE de que haya o no un
+		// `watch()` — una `shared global reactive` sin ninguna lógica de
+		// validación propia (el caso más simple: solo compartir un valor)
+		// se difunde igual. Ocurre DESPUÉS de que el `watch()` (si lo hay)
+		// haya tenido ocasión de corregir el valor — así quien recibe el
+		// `update` ve el valor YA corregido, nunca el provisional.
+		if (sharedGlobalNames.has(name)) {
+			const currentValue = getGlobalState()[name];
+			const alreadyBroadcast = sharedLastBroadcastValues.has(name) && sharedLastBroadcastValues.get(name) === currentValue;
+			if (!alreadyBroadcast) {
+				sharedLastBroadcastValues.set(name, currentValue);
+				const subs = sharedSubscribers.get(name);
+				if (subs && subs.size > 0) {
+					const payload = JSON.stringify({ type: "update", name, value: currentValue });
+					for (const ws of subs) {
+						try {
+							ws.send(payload);
+						} catch {
+							// una conexión rota al difundir no debe tumbar la difusión
+							// a las demás — se limpiará sola al llegar su "close".
+						}
+					}
+				}
+			}
+		}
+	};
+
+	// Las `function` normales (no `online`) declaradas DIRECTAMENTE en
+	// este .wsb no se procesaban en ningún sitio — invisibles del todo
+	// para cualquier watch(), como si no existieran. Se compilan JUNTO A
+	// las `online function` propias del mismo `.wsb`, en el MISMO lote —
+	// no en dos pasadas separadas: si se compilaran aparte, una `function`
+	// no podría llamar a una `online function` del mismo fichero ni al
+	// revés, según cuál se compilara primero (se detectó exactamente así,
+	// probándolo). Con acceso además a todo lo ya importado
+	// (`importBindings`) — así pueden llamar a algo traído de un .ws
+	// igual que si lo hubieran importado ellas mismas.
+	const globalInfo = { names: globalNames, getValue: getGlobalState, forbiddenNames: sessionOnlyNamesSet, watchedNames: globalWatchedNames, triggerGlobal: __triggerGlobal };
+
+	// Las function importadas de un .ws, ya con `globalInfo` — MISMA regla
+	// que las declaradas aquí: acceso a `global reactive/var/const` como
+	// identificador suelto (resuelto contra el `global` de ESTE .wsb, el que
+	// las importa: un .ws no tiene estado de servidor propio), disparo de
+	// su watch() si lo reasignan, y error claro al compilar si tocan una
+	// reactive/var de SESIÓN. Un lote por fichero, con TODAS sus function
+	// (se importen o no por nombre), para que sigan pudiendo llamarse entre
+	// sí. Se compilan ANTES que las propias, para que estas puedan
+	// llamarlas (mismo orden que antes, cuando salían de resolveImports).
+	// Esa misma instancia es la que se expone luego por RPC si es `online`
+	// (extractOnlineFunctions ya no la recompila).
+	// Cada .ws se compila con SU ámbito de imports (lo que ese .ws importa),
+	// no solo con `globalInfo` — ver createWsRegistry. Lo alcanzable
+	// transitivamente (un .ws que importa otro .ws...) entra en el mismo
+	// registro, sin importar quién lo pidió primero.
+	compileWsRegistry(wsRegistry, globalInfo);
+	const compiledWsFiles = wsRegistry.compiled;
+	for (const d of wsRegistry.list) {
+		for (const name of d.names) importBindings[name] = compiledWsFiles.get(d.targetPath)[name];
+	}
+
+	const ownFunctionDecls = expandedAst.body.filter((n) => n.type === "FunctionDecl");
+	const compiledOwn = compileFunctionBatch(ownFunctionDecls, importBindings, globalInfo);
+	Object.assign(importBindings, compiledOwn);
+
+	// Los watch() de una reactive `global` se compilan como si fueran
+	// function síncronas de cero argumentos — reutilizando el mismo
+	// mecanismo que cualquier function/online function, así heredan
+	// gratis: la prohibición de tocar una reactive de sesión sin serlo,
+	// el await implícito, y el disparo en cascada de OTROS watches
+	// globales que su propio cuerpo pudiera reasignar.
+	const globalWatchFnNodes = globalPlainWatches.map((w) => ({ type: "FunctionDecl", name: w.target, params: [], body: w.body }));
+	const compiledGlobalWatchFns = compileFunctionBatch(globalWatchFnNodes, importBindings, globalInfo);
+	for (const w of globalPlainWatches) globalWatchesByName.set(w.target, compiledGlobalWatchFns[w.target]);
+
+	// `online` es aditivo — expone TAMBIÉN a otros servidores, no
+	// sustituye el comportamiento normal de función: una `online
+	// function` (propia de este .wsb, o importada de un .ws) se fusiona
+	// aquí en el mismo `importBindings` que usa todo lo demás, así que se
+	// puede llamar en local exactamente igual que a cualquier otra
+	// function (desde un watch(), o desde otra function) — además de
+	// estar disponible por RPC para otros servidores. Antes de esto, una
+	// `online function` era invisible para cualquier watch()/function del
+	// MISMO servidor que la declaraba: ni compilaba (watch(), que sí
+	// comprueba referencias no declaradas) ni funcionaba en tiempo de
+	// ejecución (function normal, que no lo comprueba y solo fallaba al
+	// llamarla de verdad, con un ReferenceError).
+	const onlineFunctions = extractOnlineFunctions(expandedAst, baseDir, compiledOwn, compiledWsFiles);
+	for (const f of onlineFunctions) importBindings[f.name] = f.fn;
+
+	importBindings.__wsq = __wsq;
+	const importNames = Object.keys(importBindings);
+	const importValues = importNames.map((n) => importBindings[n]);
+
+	const sessionStore = createSessionStore(sessionOnlyDecls, wconfig, sessionBaseDir || baseDir);
+
+	// Todo nombre que tiene su propio watch() (ruta, reactive de sesión, o
+	// reactive global) — una asignación a cualquiera de ellos, en el
+	// cuerpo de CUALQUIER watch()/function, lleva su disparo inyectado
+	// automáticamente. Dos grupos, nunca mezclados: sesión (`serverState.`
+	// -> `__trigger`) y global (`getGlobalState().` -> `__triggerGlobal`)
+	// — dispara uno u otro según de qué tipo sea CADA reactive, nunca los
+	// dos para la misma.
+	const sessionWatchedNames = new Set([...listeners.map((l) => l.reactiveName), ...plainWatches.map((w) => w.target)]);
+	const triggerGroups = [
+		{ names: sessionWatchedNames, prefix: "serverState.", triggerFn: "__trigger" },
+		{ names: globalWatchedNames, prefix: "getGlobalState().", triggerFn: "__triggerGlobal" },
+	];
+	// Cualquier import (incluidas las function propias del .wsb, ya
+	// fusionadas en importBindings) es candidato a "await implícito" si
+	// se llama como identificador suelto — mismo mecanismo que ya usan
+	// las propias function entre sí (compileFunctionBatch).
+	const knownFunctionNames = new Set(importNames);
 
 	const compiledPlainWatches = plainWatches.map((w) => ({
 		target: w.target,
 		fn: compileWatchFunction(
-			[reactiveArgName(w.target), "WSON", "serverState", ...importNames],
-			injectAsyncTriggers(genHandlerBody(w, stateNames), allWatchedNames),
+			[reactiveArgName(w.target), "WSON", "serverState", "getGlobalState", "__triggerGlobal", ...importNames],
+			injectAsyncTriggers(genHandlerBody(w, stateNames, knownFunctionNames, globalNames), triggerGroups),
 			`watch(${w.target})`
 		),
 	}));
@@ -953,8 +1856,8 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 		// hasta que llegara la primera petición real, en vez de saltar al
 		// arrancar el servidor.
 		handlerFn: compileWatchFunction(
-			[reactiveArgName(l.reactiveName), "WSON", "serverState", ...importNames],
-			injectAsyncTriggers(genHandlerBody(l.watch, stateNames), allWatchedNames),
+			[reactiveArgName(l.reactiveName), "WSON", "serverState", "getGlobalState", "__triggerGlobal", ...importNames],
+			injectAsyncTriggers(genHandlerBody(l.watch, stateNames, knownFunctionNames, globalNames), triggerGroups),
 			`watch(${l.reactiveName})`
 		),
 	}));
@@ -1074,8 +1977,9 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 				: null;
 
 			// Objeto "petición": lo que dentro del watch() se referencia con
-			// el nombre de la reactive — trae httpCode mutable y los métodos
-			// WSON.* actúan sobre este mismo objeto.
+			// el nombre de la reactive — los métodos WSON.* actúan sobre este
+			// mismo objeto. Sin httpCode mutable: el código de estado se pasa
+			// como argumento explícito a WSON.httpSend(peticion, httpCode).
 			const peticion = {
 				to: match.wson.to,
 				via: match.wson.via,
@@ -1083,7 +1987,6 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 				from: parsed.from,
 				id: parsed.id,
 				signatureValid,
-				httpCode: null,
 				_params: params,
 				_query: query,
 				_secret: match.wson.secret,
@@ -1091,14 +1994,20 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 				_sent: false,
 			};
 
-			// `WSON.params`/`WSON.query`/`WSON.showContent`/`WSON.send` dentro
-			// del handler generado necesitan resolver sobre `peticion` — se
-			// exponen aquí como funciones de ámbito local con esos nombres
-			// fijos, ya que el handler generado los llama tal cual.
+			// `WSON.httpParams`/`WSON.httpQuery` llegan gratis vía `...WSON`
+			// (wson-runtime.js): son genéricas, leen `_params`/`_query` de
+			// CUALQUIER instancia, y devuelven `null` si no los hay — no hace
+			// falta redefinirlas aquí. `WSON.showContent`/`WSON.httpSend` SÍ
+			// necesitan resolver contra el `peticion` de ESTA petición en
+			// concreto (secret/encrypt de la ruta, res/sessionStore/sessionId
+			// de este cierre) — se exponen como funciones de ámbito local con
+			// esos nombres fijos, ya que el handler generado los llama tal
+			// cual. Nótese que `WSON.send` NO se sobreescribe aquí: dentro de
+			// un watch() de ruta, `WSON.send(x)` sigue siendo el envío
+			// SALIENTE de siempre (heredado de `...WSON`) — antes este mismo
+			// nombre se usaba, de forma confusa, para las dos cosas a la vez.
 			const localWSON = {
 				...WSON,
-				params: (inst) => inst._params,
-				query: (inst) => inst._query,
 				showContent: (inst, secretoExplicito) => {
 					if (!inst._encrypt) {
 						// Sin `encrypt: true`, el content viaja en claro (el
@@ -1119,10 +2028,15 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 						return decrypted;
 					}
 				},
-				send: async (inst) => {
+				// `httpSend` responde la petición HTTP entrante — no devuelve
+				// nada (a diferencia de `WSON.send`, que siempre devuelve la
+				// respuesta de la llamada saliente que hizo). El código de
+				// estado es un argumento explícito, no una propiedad mutable
+				// del WSON (`httpCode` ya no existe como campo).
+				httpSend: async (inst, httpCode) => {
 					inst._sent = true;
 					await sessionStore.save(sessionId, session); // antes de responder: si el proceso muere justo después (o el guardado es a través de la red, como Redis), la sesión ya está a salvo
-					res.writeHead(inst.httpCode || 200, { "Content-Type": "application/json" });
+					res.writeHead(httpCode || 200, { "Content-Type": "application/json" });
 					res.end(JSON.stringify(inst.content ?? { status: "OK" }));
 				},
 			};
@@ -1138,27 +2052,49 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 				// reactive con watch() propio, se encadena — cada nivel
 				// espera de verdad al siguiente, todo dentro de la misma
 				// petición que arrancó la cascada.
+				//
+				// Mismas dos guardas que __triggerGlobal (ver ese
+				// comentario para el razonamiento completo), aquí con
+				// alcance de UNA SOLA petición — nuevas en cada una, sin
+				// arrastrar nada de la anterior: no cambiar si el valor es
+				// igual al último disparo YA ATENDIDO en esta petición, y
+				// un límite de profundidad como red de seguridad.
 				const asyncWatchersByName = new Map(compiledPlainWatches.map((cw) => [cw.target, cw.fn]));
+				const sessionLastTriggeredValues = new Map();
+				let sessionTriggerDepth = 0;
+				const SESSION_TRIGGER_MAX_DEPTH = 50;
 				let reactiveState;
 				const __trigger = async (name) => {
 					const fn = asyncWatchersByName.get(name);
 					if (!fn) return;
+					const current = reactiveState[name];
+					if (sessionLastTriggeredValues.has(name) && sessionLastTriggeredValues.get(name) === current) return;
+					sessionLastTriggeredValues.set(name, current);
+					if (sessionTriggerDepth >= SESSION_TRIGGER_MAX_DEPTH) {
+						console.error(
+							`watch("${name}"): posible bucle — se superaron ${SESSION_TRIGGER_MAX_DEPTH} disparos en cascada sin converger (cada disparo reasigna un valor DISTINTO al anterior; revisa si el propio watch() necesita una condición de parada).`
+						);
+						return;
+					}
+					sessionTriggerDepth++;
 					try {
-						await fn(reactiveState[name], WSON, reactiveState, ...importValues, __trigger);
+						await fn(reactiveState[name], WSON, reactiveState, getGlobalState, __triggerGlobal, ...importValues, __trigger);
 					} catch (err) {
 						// Un watch() en cascada que falla no debe tumbar
 						// la petición que lo disparó — ya puede estar
 						// respondida, o ser de una reactive distinta.
 						console.error(`Error en watch("${name}"):`, err && err.message);
+					} finally {
+						sessionTriggerDepth--;
 					}
 				};
 				reactiveState = wrapReactiveState(session.state, sessionTypeSchema);
 
-				const result = handler(peticion, localWSON, reactiveState, ...importValues, __trigger);
+				const result = handler(peticion, localWSON, reactiveState, getGlobalState, __triggerGlobal, ...importValues, __trigger);
 				await Promise.resolve(result);
 				if (!peticion._sent) {
 					await sessionStore.save(sessionId, session); // idem: antes de responder
-					res.writeHead(peticion.httpCode || 200, { "Content-Type": "application/json" });
+					res.writeHead(200, { "Content-Type": "application/json" }); // sin WSON.httpSend() explícito: 200 por defecto, como siempre
 					res.end(JSON.stringify({ status: "OK" }));
 				}
 			} catch (err) {
@@ -1185,6 +2121,20 @@ function createRequestHandler(ast, wconfig = {}, { baseDir, sessionBaseDir } = {
 	// Expuesto para poder cerrar conexiones externas (p. ej. Redis) al
 	// apagar el servidor — memoria/fichero no tienen nada que cerrar.
 	requestHandler.sessionStore = sessionStore;
+	// Expuesto para que createServer() pueda enganchar el "upgrade" del
+	// http.Server real si hay alguna online function que servir — este
+	// nivel (createRequestHandler) no tiene acceso al servidor en sí.
+	requestHandler.onlineFunctions = onlineFunctions;
+	// Lo mismo, para que createServer() pueda enganchar el mismo
+	// "upgrade" cuando hay alguna `shared global reactive` que servir,
+	// incluso sin ninguna `online function` — son dos motivos
+	// independientes para necesitar el mismo WebSocket.
+	requestHandler.sharedGlobalReactives = {
+		names: sharedGlobalNames,
+		getGlobalState,
+		triggerGlobal: __triggerGlobal,
+		subscribers: sharedSubscribers,
+	};
 
 	return requestHandler;
 }
@@ -1200,7 +2150,151 @@ function createServer(ast, wconfig = {}, opts = {}) {
 	// apagar el servidor — memoria/fichero no tienen nada que cerrar, pero
 	// Redis sí (session-store: "redis"): server.sessionStore.close?.().
 	server.sessionStore = handler.sessionStore;
+
+	if (handler.onlineFunctions.length > 0 || handler.sharedGlobalReactives.names.size > 0) {
+		server.onlineFunctionsRpc = wireWebSocketProtocol(server, handler.onlineFunctions, handler.sharedGlobalReactives);
+	}
 	return server;
+}
+
+// --- Un único WebSocket por servidor, dos protocolos sobre él -------------
+//
+// `online function` (llamada/respuesta) y `shared global reactive`
+// (suscripción/empuje) comparten la MISMA conexión — un mensaje JSON de
+// texto con su propio `type` decide a cuál de los dos pertenece. Mensajes,
+// en los dos sentidos:
+//
+//   { type: "reflect" }
+//     -> { type: "reflect", functions: [{ name, params, idempotent }] }
+//   { type: "call", id, name, args, idempotencyKey? }
+//     -> { type: "result", id, value } | { type: "error", id, message }
+//   { type: "subscribe", name }
+//     -> { type: "update", name, value }   (inmediato, con el valor actual,
+//                                            y de nuevo cada vez que cambie)
+//   { type: "propose", name, value }
+//     -> (nada directamente — si se acepta, llega como un "update" más,
+//         igual que a cualquier otro suscrito; ver DISEÑO.md, "shared
+//         reactive": el servidor nunca confirma la propuesta en sí, solo
+//         difunde el valor real una vez aplicado)
+//
+// `id` lo pone quien llama y se devuelve tal cual — permite tener varias
+// llamadas en curso a la vez sobre la MISMA conexión sin confundir sus
+// respuestas (un WSClient real hará varias llamadas concurrentes).
+//
+// La caché de idempotencia es del SERVIDOR entero (no por conexión): si el
+// cliente se reconecta y repite la misma idempotencyKey, tiene que
+// encontrar el mismo resultado — es la razón de ser de la clave. Aplica a
+// CUALQUIER llamada que la incluya, sin mirar si la función se declaró
+// "-> idempotent": el mecanismo (no repetir la ejecución, devolver lo ya
+// resuelto) funciona igual en los dos casos — "-> idempotent" es la
+// promesa hacia quien llama de que repetir es seguro, no una condición
+// para que la caché en sí funcione. Es solo en memoria por ahora — se
+// pierde si el proceso se reinicia; ver limitaciones en INSTRUCCIONES.md.
+function wireWebSocketProtocol(server, onlineFunctions, sharedGlobalReactives) {
+	const byName = new Map(onlineFunctions.map((f) => [f.name, f]));
+	const idempotencyCache = new Map(); // key -> { status: "pending"|"done"|"error", value?, error? }
+	const { names: sharedNames, getGlobalState, subscribers } = sharedGlobalReactives;
+
+	server.on("upgrade", (req, socket, head) => {
+		const ws = acceptUpgrade(req, socket, head);
+		if (!ws) return;
+		ws.parser.on("error", () => {}); // un mensaje mal formado cierra ESTA conexión, no debe tumbar nada más
+		ws.parser.on("message", (msg) => onRpcMessage(ws, msg).catch(() => ws.socket.destroy()));
+		// Al cerrarse la conexión, se quita de CUALQUIER lista de
+		// suscriptores en la que estuviera — sin esto, una conexión
+		// muerta se quedaría para siempre en `subscribers`, acumulando
+		// (una fuga de memoria) y gastando intentos de envío que fallan
+		// en silencio en cada difusión futura.
+		ws.socket.on("close", () => {
+			for (const subs of subscribers.values()) subs.delete(ws);
+		});
+	});
+
+	async function onRpcMessage(ws, msg) {
+		if (msg.opcode !== OPCODE.TEXT) return;
+		let request;
+		try {
+			request = JSON.parse(msg.text);
+		} catch {
+			return; // no es JSON — se ignora, no es motivo para cortar la conexión
+		}
+
+		if (request.type === "reflect") {
+			ws.send(JSON.stringify({ type: "reflect", functions: onlineFunctions.map((f) => ({ name: f.name, params: f.params, idempotent: f.idempotent })) }));
+			return;
+		}
+
+		if (request.type === "subscribe") {
+			const { name } = request;
+			// Un nombre que no es ninguna `shared global reactive` de
+			// este servidor se ignora, sin más — no es un error de
+			// protocolo grave (podría ser una versión distinta del
+			// cliente, o un nombre mal escrito), solo no hay nada que
+			// suscribir.
+			if (!sharedNames.has(name)) return;
+			if (!subscribers.has(name)) subscribers.set(name, new Set());
+			subscribers.get(name).add(ws);
+			// El valor ACTUAL se manda de inmediato, sin esperar al
+			// siguiente cambio — quien se suscribe tarde no debe quedarse
+			// a ciegas hasta que algo cambie por su cuenta.
+			ws.send(JSON.stringify({ type: "update", name, value: getGlobalState()[name] }));
+			return;
+		}
+
+		if (request.type === "propose") {
+			const { name, value } = request;
+			if (!sharedNames.has(name)) return;
+			// El cliente nunca muta la reactive directamente — propone, y
+			// es el SERVIDOR quien reasigna de verdad. Esa reasignación
+			// real es la que dispara `watch()` (si lo hay, con sus
+			// guardas contra bucle — ver DISEÑO.md) y la difusión a los
+			// demás suscritos — el mismo camino que cualquier otra
+			// reasignación de esa reactive, venga de donde venga. Si
+			// `watch()` corrige el valor, lo que se difunde es el YA
+			// corregido, nunca el propuesto tal cual.
+			getGlobalState()[name] = value;
+			await sharedGlobalReactives.triggerGlobal(name);
+			return;
+		}
+
+		if (request.type !== "call") return;
+		const { id, name, args, idempotencyKey } = request;
+		const respond = (payload) => ws.send(JSON.stringify({ id, ...payload }));
+
+		if (idempotencyKey) {
+			const cached = idempotencyCache.get(idempotencyKey);
+			if (cached) {
+				if (cached.status === "pending") {
+					respond({ type: "error", message: `ya hay una llamada en curso con la idempotencyKey "${idempotencyKey}"` });
+				} else if (cached.status === "done") {
+					respond({ type: "result", value: cached.value });
+				} else {
+					respond({ type: "error", message: cached.error });
+				}
+				return;
+			}
+			idempotencyCache.set(idempotencyKey, { status: "pending" });
+		}
+
+		const target = byName.get(name);
+		if (!target) {
+			const message = `no existe ninguna "online function ${name}"`;
+			if (idempotencyKey) idempotencyCache.set(idempotencyKey, { status: "error", error: message });
+			respond({ type: "error", message });
+			return;
+		}
+
+		try {
+			const value = await target.fn(...(Array.isArray(args) ? args : []));
+			if (idempotencyKey) idempotencyCache.set(idempotencyKey, { status: "done", value });
+			respond({ type: "result", value });
+		} catch (err) {
+			if (idempotencyKey) idempotencyCache.set(idempotencyKey, { status: "error", error: err.message });
+			respond({ type: "error", message: err.message });
+		}
+	}
+
+	return { idempotencyCache, onlineFunctions };
 }
 
 function reactiveArgName(name) {
@@ -1225,4 +2319,9 @@ module.exports = {
 	isRequestSecure,
 	acquireFileLock,
 	releaseFileLock,
+	substituteServerState,
+	extractOnlineFunctions,
+	wireWebSocketProtocol,
+	injectAwaitForKnownCalls,
+	compileFunctionBatch,
 };

@@ -109,7 +109,7 @@ const SESSION_SOURCE = [
 	"watch(peticion)",
 	"\tvisitas++",
 	"\tpeticion.content = { visitas: visitas }",
-	"\tWSON.send(peticion)",
+	"\tWSON.httpSend(peticion)",
 ].join("\n");
 
 async function startServer(sessionDir) {

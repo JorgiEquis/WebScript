@@ -24,9 +24,9 @@ const USUARIOS_WSB = [
 	"export reactive any peticionUsuarios = WSON.listen(wsonUsuarios)",
 	"",
 	"watch(peticionUsuarios)",
-	"\tconst { id } = WSON.params(peticionUsuarios)",
+	"\tconst { id } = WSON.httpParams(peticionUsuarios)",
 	'\tpeticionUsuarios.content = { id: id, nombre: "Usuario " + id }',
-	"\tWSON.send(peticionUsuarios)",
+	"\tWSON.httpSend(peticionUsuarios)",
 ].join("\n");
 
 const API_WSB = [
@@ -40,7 +40,7 @@ const API_WSB = [
 	"",
 	"watch(peticionSalud)",
 	"\tpeticionSalud.content = { ok: true }",
-	"\tWSON.send(peticionSalud)",
+	"\tWSON.httpSend(peticionSalud)",
 ].join("\n");
 
 function get(port, pathname) {
@@ -146,7 +146,7 @@ test(
 				"",
 				"watch(peticion)",
 				'\tpeticion.content = { mensaje: saludar("Ana"), ext: path.extname("archivo.wsb") }',
-				"\tWSON.send(peticion)",
+				"\tWSON.httpSend(peticion)",
 			].join("\n")
 		);
 		runWebsc(["build", dir]);
@@ -190,7 +190,7 @@ test(
 		runWebsc(["init", dir]);
 		fs.writeFileSync(
 			path.join(dir, "src", "usuarios.wsdb"),
-			['-> collection: "usuarios"', "-> schema:", "\tnombre: string", "\tedad: integer"].join("\n")
+			["-> name: 'usuario'", "-> schema:", "\t-> id: integer(10)(primary)/", "\t-> nombre: string(40)", "\t-> edad: integer(3)"].join("\n")
 		);
 		fs.writeFileSync(
 			path.join(dir, "src", "api.wsb"),
@@ -205,10 +205,9 @@ test(
 				"",
 				"watch(peticionCrear)",
 				"\tconst datos = WSON.showContent(peticionCrear)",
-				"\tconst usuario = new Usuario(datos.nombre, datos.edad)",
-				"\tusuario.save()",
+				"\tconst usuario = Usuario.save({ nombre: datos.nombre, edad: datos.edad })",
 				"\tpeticionCrear.content = { id: usuario.id }",
-				"\tWSON.send(peticionCrear)",
+				"\tWSON.httpSend(peticionCrear)",
 				"",
 				"const WSON wsonListar =",
 				'\t-> to: "/usuarios"',
@@ -217,8 +216,8 @@ test(
 				"reactive any peticionListar = WSON.listen(wsonListar)",
 				"",
 				"watch(peticionListar)",
-				"\tpeticionListar.content = { usuarios: Usuario.find().map(u => u.nombre) }",
-				"\tWSON.send(peticionListar)",
+				"\tpeticionListar.content = { usuarios: Usuario.selectAll().map(u => u.nombre) }",
+				"\tWSON.httpSend(peticionListar)",
 			].join("\n")
 		);
 		runWebsc(["build", dir]);
@@ -275,3 +274,70 @@ test(
 		}
 	}
 );
+
+test("REGRESIÓN (eliminación del formato antiguo): websc build con un .wsdb de \"-> collection:\" falla (exit 1) nombrando el fichero y cómo migrar", () => {
+	const dir = path.join(tmpDir(), "proyecto");
+	runWebsc(["init", dir]);
+	fs.writeFileSync(path.join(dir, "src", "viejo.wsdb"), ['-> collection: "viejos"', "-> schema:", "\tnombre: string"].join("\n"));
+
+	let error = null;
+	try {
+		runWebsc(["build", dir]);
+	} catch (e) {
+		error = e;
+	}
+	assert.ok(error, "el build debe fallar, no ignorar el .wsdb antiguo en silencio");
+	assert.equal(error.status, 1);
+	const stderr = String(error.stderr);
+	assert.match(stderr, /viejo\.wsdb: este \.wsdb usa el formato antiguo/, "nombra el fichero concreto");
+	assert.match(stderr, /-> name:/, "y explica el formato actual");
+});
+
+test("websc init: lib/WSSchema.ws y lib/WSDB.ws son plantillas fijas (interfaces), protegidas por el lock — un .wsdb v2 no genera nada en lib/", () => {
+	const dir = tmpDir();
+	runWebsc(["init", dir]);
+
+	const schemaDecl = fs.readFileSync(path.join(dir, "lib", "WSSchema.ws"), "utf8");
+	assert.match(schemaDecl, /^interface WSSchema$/m);
+	assert.match(schemaDecl, /static getSchema\(\)/);
+	const wsdbDecl = fs.readFileSync(path.join(dir, "lib", "WSDB.ws"), "utf8");
+	assert.match(wsdbDecl, /^interface WSDB$/m);
+	assert.match(wsdbDecl, /static save\(item\)/);
+	assert.match(wsdbDecl, /static deleteWhere\(condicion\)/);
+
+	const lockPath = path.join(dir, "lib", ".websc-lock.json");
+	const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+	assert.ok(lock["WSSchema.ws"] && lock["WSDB.ws"], "las dos entran en el lock de lib/, igual que WSON.ws/Visual.ws");
+	const { validateLibUnmodified } = require("../check-lib");
+	fs.appendFileSync(path.join(dir, "lib", "WSSchema.ws"), "\n// editado a mano\n");
+	assert.throws(() => validateLibUnmodified(dir), /WSSchema\.ws" ha sido modificado/);
+	fs.writeFileSync(path.join(dir, "lib", "WSSchema.ws"), schemaDecl); // deshacer, para el resto de la prueba
+
+	fs.writeFileSync(
+		path.join(dir, "src", "personas.wsdb"),
+		["-> name: 'persona'", "-> schema", "     -> idPerson: integer(10)(primary)", "     -> nombre: string(40)/"].join("\n")
+	);
+	runWebsc(["build", dir]);
+	assert.equal(fs.readdirSync(path.join(dir, "lib")).filter((f) => f.endsWith(".ws")).sort().join(","), "Visual.ws,WSDB.ws,WSON.ws,WSSchema.ws");
+	validateLibUnmodified(dir); // el build no ha tocado lib/ — sigue validando contra el lock de websc init
+});
+
+test("websc build: un .wsdb v2 mal declarado hace fallar el build aunque nadie lo importe", () => {
+	const dir = tmpDir();
+	runWebsc(["init", dir]);
+	fs.writeFileSync(path.join(dir, "src", "malo.wsdb"), ["-> name: 'malo'", "-> schema", "     -> a: integer(5)"].join("\n"));
+	assert.throws(() => execFileSync("node", [WEBSC_BIN, "build", dir], { encoding: "utf8", stdio: "pipe" }), /exactamente un campo \(primary\)/);
+});
+
+test("websc build: -> depends hacia un .wsdb que no existe hace fallar el build (aunque nadie importe ninguno de los dos)", () => {
+	const dir = tmpDir();
+	runWebsc(["init", dir]);
+	fs.writeFileSync(
+		path.join(dir, "src", "personas.wsdb"),
+		["-> name: 'persona'", "-> depends: ['coches']", "-> schema", "     -> idPerson: integer(10)(primary)"].join("\n")
+	);
+	assert.throws(
+		() => execFileSync("node", [WEBSC_BIN, "build", dir], { encoding: "utf8", stdio: "pipe" }),
+		/no existe.*coches\.wsdb/
+	);
+});

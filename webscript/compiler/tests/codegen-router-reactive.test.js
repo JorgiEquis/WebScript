@@ -89,7 +89,7 @@ test("router reactivo: navigate({replace:true}) sustituye la entrada del histori
 test("router reactivo: SSR + hidratación + navegación posterior conservan el mismo nodo del SSR", () => {
 	const ast = parse(ROUTE_SOURCE);
 	const ssrHtml = renderPageToHTML(ast, { requestUrl: "/personas/7" });
-	assert.equal(ssrHtml, "<div><p>ID actual: 7</p></div>");
+	assert.equal(ssrHtml, "<div><p><!--t-->ID actual: 7<!--/t--></p></div>");
 
 	const bundle = generateClientBundle(ast, {});
 	const dom = new JSDOM(`<!DOCTYPE html><html><body>${ssrHtml}</body></html>`, {

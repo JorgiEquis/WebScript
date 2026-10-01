@@ -1,0 +1,328 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "WebScript",
+	"scopeName": "source.webscript",
+	"patterns": [
+		{ "include": "#comments" },
+		{ "include": "#meta-arrow" },
+		{ "include": "#imports" },
+		{ "include": "#function-decl" },
+		{ "include": "#declarations" },
+		{ "include": "#control-keywords" },
+		{ "include": "#lib-stub-keywords" },
+		{ "include": "#builtin-namespaces" },
+		{ "include": "#types" },
+		{ "include": "#constants" },
+		{ "include": "#strings" },
+		{ "include": "#numbers" },
+		{ "include": "#tags" },
+		{ "include": "#interpolation" },
+		{ "include": "#operators" }
+	],
+	"repository": {
+		"comments": {
+			"patterns": [
+				{
+					"name": "comment.line.double-slash.webscript",
+					"match": "//.*$"
+				}
+			]
+		},
+		"meta-arrow": {
+			"patterns": [
+				{
+					"comment": "-> clave: valor  (metadata de WSON/WSDB/style: -> to:, -> via:, -> schema:, -> name:, -> depends:, etc.)",
+					"match": "(->)\\s*([A-Za-z_][\\w-]*)\\s*(:)?",
+					"captures": {
+						"1": { "name": "keyword.operator.arrow.webscript" },
+						"2": { "name": "entity.other.attribute-name.webscript" },
+						"3": { "name": "punctuation.separator.key-value.webscript" }
+					}
+				},
+				{
+					"comment": "modificadores entre paréntesis en un campo de .wsdb: integer(10)(primary)",
+					"match": "\\((primary|array)\\)",
+					"name": "storage.modifier.webscript"
+				},
+				{
+					"comment": "campo opcional: nombre: tipo/",
+					"match": "/(?=\\s*(//|$))",
+					"name": "keyword.operator.optional.webscript"
+				}
+			]
+		},
+		"imports": {
+			"patterns": [
+				{
+					"comment": "import { A, B } from \"./fichero.ext\"",
+					"match": "^\\s*(import)\\s*\\{([^}]*)\\}\\s*(from)\\s*([\"'])([^\"']+)([\"'])",
+					"captures": {
+						"1": { "name": "keyword.control.import.webscript" },
+						"2": { "name": "variable.other.imported.webscript" },
+						"3": { "name": "keyword.control.import.webscript" },
+						"4": { "name": "punctuation.definition.string.begin.webscript" },
+						"5": { "name": "string.quoted.other.import-path.webscript" },
+						"6": { "name": "punctuation.definition.string.end.webscript" }
+					}
+				},
+				{
+					"comment": "import defecto (JSON): import nombre from \"./fichero.json\"",
+					"match": "^\\s*(import)\\s+(\\w+)\\s+(from)\\s*([\"'])([^\"']+)([\"'])",
+					"captures": {
+						"1": { "name": "keyword.control.import.webscript" },
+						"2": { "name": "variable.other.imported.webscript" },
+						"3": { "name": "keyword.control.import.webscript" },
+						"4": { "name": "punctuation.definition.string.begin.webscript" },
+						"5": { "name": "string.quoted.other.import-path.webscript" },
+						"6": { "name": "punctuation.definition.string.end.webscript" }
+					}
+				},
+				{
+					"name": "keyword.control.export.webscript",
+					"match": "^\\s*\\bexport\\b"
+				}
+			]
+		},
+		"function-decl": {
+			"patterns": [
+				{
+					"comment": "(online) function nombre(params) (-> idempotent)",
+					"match": "^\\s*(online\\s+)?(function)\\s+([A-Za-z_]\\w*)\\s*(\\()([^)]*)(\\))",
+					"captures": {
+						"1": { "name": "storage.modifier.online.webscript" },
+						"2": { "name": "storage.type.function.webscript" },
+						"3": { "name": "entity.name.function.webscript" },
+						"4": { "name": "punctuation.definition.parameters.begin.webscript" },
+						"5": { "patterns": [{ "include": "#param-list" }] },
+						"6": { "name": "punctuation.definition.parameters.end.webscript" }
+					}
+				}
+			]
+		},
+		"param-list": {
+			"patterns": [
+				{
+					"match": "\\b([\\w/]+)\\s+(\\w+)\\b",
+					"captures": {
+						"1": { "name": "storage.type.webscript" },
+						"2": { "name": "variable.parameter.webscript" }
+					}
+				},
+				{
+					"match": "\\b\\w+\\b",
+					"name": "variable.parameter.webscript"
+				}
+			]
+		},
+		"declarations": {
+			"patterns": [
+				{
+					"comment": "visual nombre =  /  style nombre =",
+					"match": "^\\s*(visual|style)\\s+([A-Za-z_]\\w*)\\s*(=)",
+					"captures": {
+						"1": { "name": "storage.type.webscript" },
+						"2": { "name": "entity.name.type.webscript" },
+						"3": { "name": "keyword.operator.assignment.webscript" }
+					}
+				},
+				{
+					"comment": "(global) reactive/var/const [tipo] nombre =",
+					"match": "^\\s*(global\\s+)?(reactive|var|const)\\s+(?:([\\w/]+(?:\\(array\\))?)\\s+)?([A-Za-z_]\\w*)\\s*(=)",
+					"captures": {
+						"1": { "name": "storage.modifier.global.webscript" },
+						"2": { "name": "storage.type.webscript" },
+						"3": { "name": "storage.type.webscript" },
+						"4": { "name": "variable.other.webscript" },
+						"5": { "name": "keyword.operator.assignment.webscript" }
+					}
+				},
+				{
+					"comment": "const WSON nombre =",
+					"match": "^\\s*(const)\\s+(WSON)\\s+([A-Za-z_]\\w*)\\s*(=)",
+					"captures": {
+						"1": { "name": "storage.type.webscript" },
+						"2": { "name": "support.class.webscript" },
+						"3": { "name": "variable.other.webscript" },
+						"4": { "name": "keyword.operator.assignment.webscript" }
+					}
+				},
+				{
+					"comment": "watch(nombre)",
+					"match": "^\\s*(watch)(\\()(\\w+)(\\))",
+					"captures": {
+						"1": { "name": "keyword.control.watch.webscript" },
+						"2": { "name": "punctuation.definition.parameters.begin.webscript" },
+						"3": { "name": "variable.other.webscript" },
+						"4": { "name": "punctuation.definition.parameters.end.webscript" }
+					}
+				},
+				{
+					"name": "keyword.operator.new.webscript",
+					"match": "\\bnew\\b"
+				}
+			]
+		},
+		"control-keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control.conditional.webscript",
+					"match": "\\b(if|else)\\b"
+				},
+				{
+					"name": "keyword.control.loop.webscript",
+					"match": "\\bfor\\b"
+				},
+				{
+					"name": "keyword.operator.wordlike.webscript",
+					"match": "\\bin\\b"
+				}
+			]
+		},
+		"lib-stub-keywords": {
+			"comment": "Sintaxis de referencia usada en lib/*.ws (WSON.ws, Visual.ws, WSDB.ws, WSSchema.ws) — ficheros de solo lectura generados por websc init.",
+			"patterns": [
+				{
+					"name": "storage.type.class.webscript",
+					"match": "\\b(class|interface)\\b"
+				},
+				{
+					"name": "storage.modifier.webscript",
+					"match": "\\bstatic\\b"
+				},
+				{
+					"name": "storage.type.function.webscript",
+					"match": "\\bconstructor\\b"
+				}
+			]
+		},
+		"builtin-namespaces": {
+			"patterns": [
+				{
+					"name": "support.class.builtin.webscript",
+					"match": "\\b(WSON|Visual|WSDB|WSSchema|WSClient)\\b"
+				}
+			]
+		},
+		"types": {
+			"patterns": [
+				{
+					"name": "storage.type.primitive.webscript",
+					"match": "\\b(string|integer|decimal|number|float|boolean|object|any)\\b(\\(array\\))?"
+				}
+			]
+		},
+		"constants": {
+			"patterns": [
+				{
+					"name": "constant.language.webscript",
+					"match": "\\b(true|false|null|undefined)\\b"
+				}
+			]
+		},
+		"strings": {
+			"patterns": [
+				{
+					"name": "string.quoted.double.webscript",
+					"begin": "\"",
+					"end": "\"",
+					"patterns": [{ "name": "constant.character.escape.webscript", "match": "\\\\." }]
+				},
+				{
+					"name": "string.quoted.single.webscript",
+					"begin": "'",
+					"end": "'",
+					"patterns": [{ "name": "constant.character.escape.webscript", "match": "\\\\." }]
+				},
+				{
+					"name": "string.quoted.template.webscript",
+					"begin": "`",
+					"end": "`",
+					"patterns": [
+						{ "name": "constant.character.escape.webscript", "match": "\\\\." },
+						{
+							"name": "meta.embedded.expr.webscript",
+							"begin": "\\$\\{",
+							"end": "\\}",
+							"patterns": [{ "include": "$self" }]
+						}
+					]
+				}
+			]
+		},
+		"numbers": {
+			"patterns": [
+				{
+					"name": "constant.numeric.webscript",
+					"match": "\\b\\d+(\\.\\d+)?\\b"
+				}
+			]
+		},
+		"tags": {
+			"comment": "Plantilla HTML de un `visual` — etiquetas de apertura/cierre y atributos (clave, clave=\"texto\", clave={expr}).",
+			"patterns": [
+				{
+					"name": "meta.tag.close.webscript",
+					"match": "(</)([A-Za-z][\\w-]*)(>)",
+					"captures": {
+						"1": { "name": "punctuation.definition.tag.webscript" },
+						"2": { "name": "entity.name.tag.webscript" },
+						"3": { "name": "punctuation.definition.tag.webscript" }
+					}
+				},
+				{
+					"name": "meta.tag.open.webscript",
+					"begin": "(<)([A-Za-z][\\w-]*)",
+					"beginCaptures": {
+						"1": { "name": "punctuation.definition.tag.webscript" },
+						"2": { "name": "entity.name.tag.webscript" }
+					},
+					"end": "(/?>)",
+					"endCaptures": {
+						"1": { "name": "punctuation.definition.tag.webscript" }
+					},
+					"patterns": [
+						{
+							"comment": "atributo={expresión} — la expresión es JS/WebScript real (onclick={...})",
+							"begin": "([A-Za-z_:][\\w-]*)\\s*(=)\\s*(\\{)",
+							"beginCaptures": {
+								"1": { "name": "entity.other.attribute-name.webscript" },
+								"2": { "name": "keyword.operator.assignment.webscript" },
+								"3": { "name": "punctuation.section.embedded.begin.webscript" }
+							},
+							"end": "\\}",
+							"endCaptures": { "0": { "name": "punctuation.section.embedded.end.webscript" } },
+							"patterns": [{ "include": "$self" }]
+						},
+						{
+							"match": "([A-Za-z_:][\\w-]*)\\s*(=)\\s*(\"[^\"]*\"|'[^']*')",
+							"captures": {
+								"1": { "name": "entity.other.attribute-name.webscript" },
+								"2": { "name": "keyword.operator.assignment.webscript" },
+								"3": { "name": "string.quoted.webscript" }
+							}
+						},
+						{
+							"name": "entity.other.attribute-name.webscript",
+							"match": "[A-Za-z_:][\\w-]*"
+						}
+					]
+				}
+			]
+		},
+		"interpolation": {
+			"comment": "{expr} de texto dentro de una plantilla visual (fuera de un atributo)",
+			"name": "meta.embedded.expr.webscript",
+			"begin": "\\{",
+			"end": "\\}",
+			"patterns": [{ "include": "$self" }]
+		},
+		"operators": {
+			"patterns": [
+				{
+					"name": "keyword.operator.webscript",
+					"match": "(===|!==|==|!=|<=|>=|&&|\\|\\||=>|=|\\+|-|\\*|/|%|<|>|!)"
+				}
+			]
+		}
+	}
+}

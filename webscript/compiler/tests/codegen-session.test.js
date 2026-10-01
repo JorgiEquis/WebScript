@@ -119,7 +119,7 @@ const SESSION_DEMO_SOURCE = [
 	"watch(peticion)",
 	"\tvisitas++",
 	"\tpeticion.content = { visitas: visitas }",
-	"\tWSON.send(peticion)",
+	"\tWSON.httpSend(peticion)",
 ].join("\n");
 
 test("integración real: dos visitantes sin cookie tienen estado de sesión independiente", async () => {

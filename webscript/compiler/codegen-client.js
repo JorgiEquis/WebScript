@@ -13,6 +13,7 @@
 //   un `.wsb` es lógica de servidor, no algo que se ejecute en navegador).
 
 const fs = require("fs");
+const { findImplicitPageTarget } = require("./codegen");
 const { genDtoClassSource } = require("./codegen-dto");
 const path = require("path");
 const { resolveImportPath, isPackageSpecifier } = require("./resolve-imports");
@@ -42,9 +43,35 @@ function substituteReactive(expr, reactiveNames) {
 	for (const name of reactiveNames) {
 		// No sustituir si es una CLAVE de objeto literal ({ nombre: ... } o
 		// , nombre: ...) — solo el valor debe convertirse en state.nombre,
-		// la clave se queda tal cual.
-		const re = new RegExp(`(?<![.\\w])(?<![{,]\\s{0,20})\\b${name}\\b(?!\\s{0,20}:)`, "g");
+		// la clave se queda tal cual. Tampoco si ya es un acceso a
+		// propiedad de otra cosa (`algo.nombre`) — pero ojo: la exclusión
+		// debe mirar "letra+punto" (`\w\.`), NO "cualquier punto", porque
+		// el operador de propagación (`...nombre`) también termina en un
+		// punto justo antes del nombre — con "cualquier punto" como
+		// exclusión, `{ ...cursores }` nunca se sustituía (bug real,
+		// encontrado al usar una `shared reactive` dentro de un spread:
+		// `{ ...cursores, x: 1 }`).
+		const re = new RegExp(`(?<!\\w\\.)(?<![{,]\\s{0,20})\\b${name}\\b(?!\\s{0,20}:)`, "g");
 		out = out.replace(re, `state.${name}`);
+	}
+	return out;
+}
+
+// El cliente nunca muta una `shared global reactive` directamente — una
+// asignación simple (`state.nombre = EXPR;`, ya reescrita por
+// `substituteReactive` desde `nombre = EXPR`) se convierte en una llamada a
+// `__proposeShared`, que manda la propuesta al servidor en vez de tocar
+// `state`. Deliberadamente por TEXTO, sobre el bundle ya ensamblado entero
+// (ver el comentario en `generateClientBundle`, donde se llama) — cubre
+// cualquier sitio donde pueda aparecer la asignación (atributos, eventos,
+// cuerpos de function) sin tener que tocar cada punto de compilación por
+// separado. Solo `=` simple; un operador compuesto (`+=`, `++`...) queda
+// sin cubrir — limitación conocida, ver DISEÑO.md.
+function rewriteSharedAssignments(text, sharedNames) {
+	let out = text;
+	for (const name of sharedNames) {
+		const re = new RegExp(`\\bstate\\.${name}\\s*=(?!=)\\s*([^;]+);`, "g");
+		out = out.replace(re, (_match, expr) => `__proposeShared(${JSON.stringify(name)}, (${expr}));`);
 	}
 	return out;
 }
@@ -145,169 +172,499 @@ function genFunctionSource(fnNode, reactiveNames) {
 	return `function ${fnNode.name}(${paramNames.join(", ")}) {\n${body}\n}`;
 }
 
-// Resuelve recursivamente los `import` de un .wsf: componentes de otro
-// .wsf (sus VisualDecl se añaden al bundle) y funciones/reactive de un
-// .ws (se traducen a JS real e inyectan también). `visited` evita
-// reprocesar el mismo fichero dos veces (imports compartidos/circulares).
-function collectImportedPieces(ast, baseDir, visited = new Set()) {
+// --- Lo que un .wsf trae por `import` (bundle de cliente, SSR y build) ---
+//
+// Componentes de otro .wsf (sus VisualDecl se añaden al bundle), y
+// function/reactive/const de un .ws (se traducen a JS real e inyectan
+// también), clases de un .wson, módulos .js y datos .json.
+//
+// DIFERENCIA CLAVE CON EL SERVIDOR: allí cada .ws tiene su ámbito de imports
+// privado (ver codegen-server.js); aquí el bundle es UN ÚNICO TEXTO con UN
+// ÚNICO ÁMBITO — todo lo que se trae (function, const/var, clases, módulos
+// .js) queda al mismo nivel y se resuelve por nombre. Por eso, dos
+// declaraciones con el mismo nombre se pisarían: cuando una de ellas viene
+// de un .ws se detecta y se da un error que nombra los dos ficheros, en vez
+// de dejar que una gane en silencio (ver `claimName`).
+//
+// El trabajo es DIRIGIDO POR DEMANDA para los .ws: pedir una function de un
+// .ws trae esa function y lo que ELLA referencia (otras function del mismo
+// fichero, y los nombres que ese .ws importa) de forma transitiva — no todos
+// los imports del fichero. Así un .ws mixto (una function que usa un .wsdb,
+// solo de servidor, y otra apta para el navegador) sigue funcionando en el
+// cliente mientras solo se pida la segunda. Antes no se seguía NINGÚN import
+// de un .ws (una function que llamaba a un helper del mismo fichero, o a algo
+// importado, daba `X is not defined` en el navegador), y un segundo `import`
+// del mismo fichero perdía sus nombres (`visited` lo saltaba entero).
+
+const ROOT_ORIGIN = "<este .wsf>";
+
+// Nombre interno del HTML suelto de una página (PageDecl) una vez se trata
+// como una `visual` más — ver generateClientBundle. Un `visual` real nunca
+// puede llamarse así (los nombres de `visual` son identificadores válidos
+// de WebScript, y `__page__` no lo es como palabra escrita a mano en el
+// fichero), así que no hay colisión posible con algo que el usuario escriba.
+const PAGE_DECL_NAME = "__page__";
+
+function createCollectState(rootDir) {
+	return {
+		rootDir,
+		// Ficheros cuyo trabajo "de fichero" (reactive, const/var, componentes...)
+		// ya se hizo. Antes `visited`, que además saltaba los NOMBRES de un
+		// segundo import del mismo fichero.
+		files: new Set(),
+		// "ruta::nombre" ya traídos: un mismo nombre pedido desde varias líneas
+		// de import (o desde varios ficheros) se trae UNA sola vez.
+		requested: new Set(),
+		// ruta de .js -> id del módulo embebido (global al recorrido; antes era
+		// el nº de módulos de cada resultado parcial, y dos recorridos anidados
+		// podían generar el mismo id).
+		jsModuleIds: new Map(),
+		// ruta de .ws -> análisis (parseado una sola vez)
+		wsFiles: new Map(),
+		// nombre -> { origin, fromWs }, para detectar colisiones
+		claimed: new Map(),
+	};
+}
+
+function describeOrigin(state, origin) {
+	if (origin === ROOT_ORIGIN) return "este .wsf";
+	return path.relative(state.rootDir, origin) || origin;
+}
+
+// Reserva `name` para `origin`. Pedirlo otra vez desde el mismo origen es
+// normal (varias rutas hasta el mismo fichero, diamante) y no es una
+// colisión. Cualquier otro caso de origen distinto SÍ lo es — antes, entre
+// dos `.wsf` (dos componentes, o un componente y la propia página), no se
+// comprobaba: una function/const con el mismo nombre en dos componentes se
+// pisaba en silencio, sin aviso, y cuál "ganaba" dependía del orden de los
+// imports (confirmado con código: dos componentes con un `fmt` cada uno,
+// el segundo importado siempre ganaba, en cliente Y en SSR, para AMBOS
+// componentes — no solo para el que lo declaró). Mismo criterio que ya
+// tenía la colisión con un `.ws`: preferible un error claro, que nombra
+// los dos ficheros, a un pisado silencioso.
+function claimName(state, name, origin, fromWs) {
+	const prev = state.claimed.get(name);
+	if (!prev) {
+		state.claimed.set(name, { origin, fromWs });
+		return;
+	}
+	if (prev.origin === origin) return;
+	throw new Error(
+		`"${name}" lo declaran a la vez ${describeOrigin(state, prev.origin)} y ${describeOrigin(state, origin)}: ` +
+			"el bundle de cliente es un único ámbito compartido (a diferencia del servidor, donde cada .ws tiene el suyo), " +
+			"así que dos declaraciones con el mismo nombre se pisarían — renombra una de las dos."
+	);
+}
+
+// Nombres de `candidates` que aparecen REFERENCIADOS en alguno de los
+// fragmentos de JS. Sobrestima a propósito (un local que se llame igual que
+// un candidato cuenta): traer de más solo es una función sin usar; traer de
+// menos sería un `X is not defined` en el navegador. Sí ignora las
+// propiedades (`obj.nombre`, `{ nombre: 1 }`) y las declaraciones. Si un
+// fragmento no se puede parsear, se escanea por palabra (también
+// sobrestimando).
+function referencedNames(snippets, candidates) {
+	const found = new Set();
+	if (candidates.size === 0) return found;
+	let acorn = null;
+	let walk = null;
+	try {
+		acorn = require("acorn");
+		walk = require("acorn-walk");
+	} catch {
+		// sin acorn: solo escaneo por palabra
+	}
+	for (const snippet of snippets) {
+		let tree = null;
+		if (acorn) {
+			try {
+				tree = acorn.parse(snippet, { ecmaVersion: "latest", sourceType: "script", allowReturnOutsideFunction: true });
+			} catch {
+				tree = null;
+			}
+		}
+		if (!tree) {
+			for (const c of candidates) {
+				if (new RegExp(`(?<![.\\w$])${c.replace(/\$/g, "\\$")}(?![\\w$])`).test(snippet)) found.add(c);
+			}
+			continue;
+		}
+		walk.ancestor(tree, {
+			Identifier(node, _state, ancestors) {
+				if (!candidates.has(node.name)) return;
+				const parent = ancestors[ancestors.length - 2];
+				if (parent && parent.type === "MemberExpression" && parent.property === node && !parent.computed) return;
+				if (parent && parent.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand) return;
+				found.add(node.name);
+			},
+		});
+	}
+	return found;
+}
+
+function emptyPieces() {
+	return {
+		reactiveInits: [],
+		functionSources: [],
+		visualDecls: [],
+		styleNames: [],
+		topLevelInits: [],
+		classSources: [],
+		jsModuleSources: [],
+		sharedWsbReactives: [],
+	};
+}
+
+// Análisis de un .ws, hecho una sola vez por recorrido.
+function loadClientWs(state, targetPath) {
+	const cached = state.wsFiles.get(targetPath);
+	if (cached) return cached;
 	const { parse } = require("./parser");
-	const result = { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [], topLevelInits: [], classSources: [], jsModuleSources: [] };
+	const ast = parse(fs.readFileSync(targetPath, "utf8"));
+	const declaredByName = new Map();
+	const fnByName = new Map();
+	const visualByName = new Map();
+	for (const n of ast.body) {
+		const d = n.type === "Export" ? n.declaration : n;
+		if (!d || !d.name) continue;
+		if (!declaredByName.has(d.name)) declaredByName.set(d.name, d);
+		if (d.type === "FunctionDecl" && !fnByName.has(d.name)) fnByName.set(d.name, d);
+		if (d.type === "VisualDecl" && !visualByName.has(d.name)) visualByName.set(d.name, d);
+	}
+	const importBindings = new Map(); // nombre local -> nodo Import que lo trae
+	for (const n of ast.body) {
+		if (n.type !== "Import") continue;
+		for (const nm of n.names) importBindings.set(nm, n);
+	}
+	// Declaraciones de nivel superior con el `export` desenvuelto: el AST guarda
+	// `export const X` / `export reactive X` como un nodo Export que envuelve la
+	// declaración, y filtrar `ast.body` por tipo se las saltaba — una constante
+	// o reactive EXPORTADA de un .ws no llegaba nunca al bundle (solo las que no
+	// llevaban `export`), y las function de ese .ws que la usaban daban `X is
+	// not defined` en el navegador.
+	const topDecls = ast.body.map((n) => (n.type === "Export" ? n.declaration : n)).filter(Boolean);
+	const ws = { path: targetPath, dir: path.dirname(targetPath), ast, declaredByName, fnByName, visualByName, importBindings, topDecls };
+	state.wsFiles.set(targetPath, ws);
+	return ws;
+}
 
-	for (const node of ast.body) {
-		if (node.type !== "Import") continue;
+// Un identificador referenciado desde dentro de un .ws: o es otra function
+// del mismo fichero, o es algo que ese .ws importa (y entonces se le pide a
+// su fichero de origen, solo ese nombre).
+function demandFromWs(state, result, ws, id) {
+	if (ws.fnByName.has(id)) {
+		requestWsFunction(state, result, ws, id);
+	} else if (ws.visualByName.has(id)) {
+		requestWsVisual(state, result, ws, id);
+	} else if (ws.importBindings.has(id)) {
+		const importNode = ws.importBindings.get(id);
+		processImport(state, result, importNode, ws.dir, [id], { isWs: true, label: path.relative(state.rootDir, ws.path) });
+	}
+}
 
-		if (isPackageSpecifier(node.from)) {
-			// A diferencia del servidor (donde esto es un require() real,
-			// sin riesgo), aquí no hay ningún bundler que resuelva las
-			// propias dependencias del paquete — incrustar su código a
-			// ciegas podría producir un bundle roto de formas difíciles de
-			// prever. Se rechaza con un mensaje claro, no en silencio.
-			throw new Error(
-				`No se puede importar el paquete "${node.from}" desde el cliente: no hay un bundler que resuelva sus propias dependencias (sí funciona en servidor, desde un .wsb). Si es código propio sin dependencias externas, usa una ruta relativa a un .js en su lugar.`
-			);
-		}
+function wsCandidateNames(ws) {
+	return new Set([...ws.fnByName.keys(), ...ws.visualByName.keys(), ...ws.importBindings.keys()]);
+}
 
-		const targetPath = resolveImportPath(baseDir, node.from);
-		if (!targetPath) {
-			throw new Error(`No se pudo resolver el import "${node.from}" (buscado desde ${baseDir})`);
-		}
-		if (visited.has(targetPath)) continue;
-		visited.add(targetPath);
+// Trae la `visual nombre = ` de un .ws (una página o un componente puede
+// importarla como si fuera de un .wsf — mismo mecanismo, sin `export`
+// tampoco aquí: ninguna visual, de un .ws o de un .wsf, lo necesita para
+// ser importable por nombre) y, de forma transitiva, lo que su propia
+// plantilla referencia (otra function/const/visual del MISMO .ws, o algo
+// que ese .ws importa) — igual que ya hace `requestWsFunction` con el
+// cuerpo de una function. El análisis de referencias es deliberadamente
+// por texto (el árbol HTML no es una expresión JS parseable de un tirón),
+// igual de conservador que en el resto del análisis de referencias de este
+// fichero: sobrestima (trae de más) antes que dejar algo sin resolver.
+function requestWsVisual(state, result, ws, name) {
+	const key = `${ws.path}::visual::${name}`;
+	if (state.requested.has(key)) return;
+	state.requested.add(key);
+	const visual = ws.visualByName.get(name);
+	result.visualDecls.push(visual);
+	// Escaneo por palabra DIRECTO, sin pasar por `referencedNames` (que
+	// intenta `acorn` primero): el árbol HTML convertido a texto con
+	// `JSON.stringify` PARSEA como JS válido (es, literalmente, un array de
+	// objetos) — así que `acorn` lo acepta sin más, y el recorrido de
+	// identificadores nunca encuentra los nombres reales, porque están
+	// dentro de STRINGS (el valor de un nodo Text), no como sintaxis JS de
+	// verdad. `acorn` nunca "falla" aquí, así que el escaneo por palabra de
+	// reserva nunca se activaba — confirmado con una reproducción real
+	// antes de corregirlo.
+	const text = JSON.stringify(visual.html);
+	for (const candidate of wsCandidateNames(ws)) {
+		if (candidate !== name && new RegExp(`\\b${candidate}\\b`).test(text)) demandFromWs(state, result, ws, candidate);
+	}
+}
 
-		if (targetPath.endsWith(".js")) {
-			// JS normal ya existente, sin sus propias dependencias externas
-			// — vía de adopción incremental: meter WebScript fichero a
-			// fichero en un proyecto Node ya existente. Se incrusta su
-			// código fuente tal cual, envuelto en un módulo CommonJS
-			// aislado (module.exports/exports) — si ese .js a su vez
-			// importara/requiriera otra cosa, eso NO se resuelve aquí (sin
-			// bundler, solo se admite un fichero suelto).
-			const moduleId = `__jsmod_${result.jsModuleSources.length}`;
+// Trae la function `name` de un .ws y, de forma transitiva, todo lo que ella
+// referencia (ver el comentario de arriba).
+function requestWsFunction(state, result, ws, name) {
+	const key = `${ws.path}::${name}`;
+	if (state.requested.has(key)) return;
+	state.requested.add(key);
+	const node = ws.fnByName.get(name);
+	claimName(state, name, ws.path, true);
+	result.functionSources.push({ node });
+	for (const ref of referencedNames([genFunctionSource(node, [])], wsCandidateNames(ws))) {
+		if (ref !== name) demandFromWs(state, result, ws, ref);
+	}
+}
+
+// Lo que se trae de un .ws al visitarlo por primera vez, se pida lo que se
+// pida: TODAS sus reactive y const/var (como siempre — pueden ser estado
+// compartido que las function usan sin nombrarlo en el import). Como se
+// emiten sin condición, lo que ELLAS referencian también se trae, y antes
+// que ellas (las const se evalúan en orden).
+function collectWsFileLevel(state, result, ws) {
+	const reactives = ws.topDecls.filter((n) => n.type === "ReactiveDecl");
+	const consts = ws.topDecls.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl");
+	const snippets = [...reactives.map((r) => `void (${r.expr});`), ...consts.map((c) => genFunctionStatement(c, []))];
+	for (const ref of referencedNames(snippets, wsCandidateNames(ws))) demandFromWs(state, result, ws, ref);
+
+	result.reactiveInits.push(...reactives.map((n) => ({ name: n.name, expr: n.expr, varType: n.varType })));
+	for (const c of consts) {
+		for (const bound of extractBoundNames(c.name)) claimName(state, bound, ws.path, true);
+	}
+	result.topLevelInits.push(...consts);
+}
+
+// Procesa un nodo Import pidiendo SOLO los `names` indicados. Para un .wsf o
+// la raíz son todos los del import; para un .ws son los que su código
+// alcanza (ver requestWsFunction).
+function processImport(state, result, node, baseDir, names, importer) {
+	const { parse } = require("./parser");
+	const where = importer.label ? `${importer.label}: ` : "";
+
+	if (isPackageSpecifier(node.from)) {
+		// A diferencia del servidor (donde esto es un require() real,
+		// sin riesgo), aquí no hay ningún bundler que resuelva las
+		// propias dependencias del paquete — incrustar su código a
+		// ciegas podría producir un bundle roto de formas difíciles de
+		// prever. Se rechaza con un mensaje claro, no en silencio.
+		throw new Error(
+			`${where}No se puede importar el paquete "${node.from}" desde el cliente: no hay un bundler que resuelva sus propias dependencias (sí funciona en servidor, desde un .wsb). Si es código propio sin dependencias externas, usa una ruta relativa a un .js en su lugar.`
+		);
+	}
+
+	const targetPath = resolveImportPath(baseDir, node.from);
+	if (!targetPath) {
+		throw new Error(`${where}No se pudo resolver el import "${node.from}" (buscado desde ${baseDir})`);
+	}
+	const firstVisit = !state.files.has(targetPath);
+	state.files.add(targetPath);
+	const fromWs = importer.isWs;
+
+	// "ruta::nombre" -> true la primera vez que se pide; false si ya estaba.
+	const first = (name) => {
+		const key = `${targetPath}::${name}`;
+		if (state.requested.has(key)) return false;
+		state.requested.add(key);
+		return true;
+	};
+
+	if (targetPath.endsWith(".js")) {
+		// JS normal ya existente, sin sus propias dependencias externas
+		// — vía de adopción incremental: meter WebScript fichero a
+		// fichero en un proyecto Node ya existente. Se incrusta su
+		// código fuente tal cual, envuelto en un módulo CommonJS
+		// aislado (module.exports/exports) — si ese .js a su vez
+		// importara/requiriera otra cosa, eso NO se resuelve aquí (sin
+		// bundler, solo se admite un fichero suelto).
+		let moduleId = state.jsModuleIds.get(targetPath);
+		if (!moduleId) {
+			moduleId = `__jsmod_${state.jsModuleIds.size}`;
+			state.jsModuleIds.set(targetPath, moduleId);
 			const jsSource = fs.readFileSync(targetPath, "utf8");
 			result.jsModuleSources.push(
 				`const ${moduleId} = (function () {\n  const module = { exports: {} };\n  const exports = module.exports;\n${jsSource}\n  return module.exports;\n})();`
 			);
-			if (node.isDefault) {
-				result.topLevelInits.push({ type: "ConstDecl", varType: null, name: node.names[0], expr: moduleId });
-			} else {
-				for (const name of node.names) {
-					result.topLevelInits.push({ type: "ConstDecl", varType: null, name, expr: `${moduleId}.${name}` });
-				}
+		}
+		if (node.isDefault) {
+			const name = node.names[0];
+			if (first(name)) {
+				claimName(state, name, targetPath, fromWs);
+				result.topLevelInits.push({ type: "ConstDecl", varType: null, name, expr: moduleId });
 			}
-			continue;
-		}
-
-		if (targetPath.endsWith(".wsdb")) {
-			// Una base de datos es, por definición, algo del servidor — no
-			// hay forma segura ni con sentido de que el navegador hable con
-			// SQLite directamente. Mismo criterio que un paquete de npm:
-			// rechazo explícito, con mensaje claro, no un error genérico.
-			throw new Error(
-				`No se puede importar "${node.from}" desde el cliente: un .wsdb es una base de datos, solo tiene sentido en el servidor (desde un .wsb).`
-			);
-		}
-
-		if (targetPath.endsWith(".json")) {
-			// El contenido de un .json es dato puro, conocido en tiempo de
-			// compilación — se embebe como const literal (JSON válido es
-			// JS válido), no como un import en tiempo de ejecución (el
-			// bundle de cliente no tiene require()). `import posts from
-			// "./posts.json"` liga el contenido entero a `posts`; `import
-			// { campo } from "./datos.json"` liga solo esa propiedad.
-			const jsonContent = JSON.parse(fs.readFileSync(targetPath, "utf8"));
-			if (node.isDefault) {
-				result.topLevelInits.push({ type: "ConstDecl", varType: null, name: node.names[0], expr: JSON.stringify(jsonContent) });
-			} else {
-				for (const name of node.names) {
-					result.topLevelInits.push({
-						type: "ConstDecl",
-						varType: null,
-						name,
-						expr: JSON.stringify(jsonContent[name]),
-					});
-				}
+		} else {
+			for (const name of names) {
+				if (!first(name)) continue;
+				claimName(state, name, targetPath, fromWs);
+				result.topLevelInits.push({ type: "ConstDecl", varType: null, name, expr: `${moduleId}.${name}` });
 			}
-			continue;
 		}
-
-		if (targetPath.endsWith(".wsf")) {
-			const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
-
-			// Primero sus propios imports (para que un componente que a su
-			// vez use otro componente quede resuelto también).
-			const nested = collectImportedPieces(targetAst, path.dirname(targetPath), visited);
-			result.reactiveInits.push(...nested.reactiveInits);
-			result.functionSources.push(...nested.functionSources);
-			result.visualDecls.push(...nested.visualDecls);
-			result.topLevelInits.push(...nested.topLevelInits);
-			result.classSources.push(...nested.classSources);
-			result.jsModuleSources.push(...nested.jsModuleSources);
-
-			result.reactiveInits.push(
-				...targetAst.body.filter((n) => n.type === "ReactiveDecl").map((n) => ({ name: n.name, expr: n.expr, varType: n.varType }))
-			);
-			// Las function declaradas directamente en el .wsf importado
-			// (no solo las que a su vez importa de un .ws) también viajan
-			// — antes se quedaban fuera, y una función de un componente
-			// importado que la usara en su propio onclick/interpolación se
-			// quedaba sin definir en el bundle.
-			result.functionSources.push(...targetAst.body.filter((n) => n.type === "FunctionDecl").map((n) => ({ node: n })));
-			// const/var de nivel superior del .wsf importado — mismo
-			// criterio que reactive/function: se traen TODOS sin
-			// condición, la pida o no el import por nombre (antes no se
-			// traían en absoluto: ReferenceError real al usarlos).
-			result.topLevelInits.push(...targetAst.body.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl"));
-			result.visualDecls.push(...targetAst.body.filter((n) => n.type === "VisualDecl"));
-			result.styleNames.push(...targetAst.body.filter((n) => n.type === "StyleDecl").map((n) => n.name));
-			continue;
-		}
-
-		if (targetPath.endsWith(".wson")) {
-			const wsonAst = parse(fs.readFileSync(targetPath, "utf8"), { isWsonFile: true });
-			for (const name of node.names) {
-				result.classSources.push(genDtoClassSource(wsonAst, name));
-			}
-			continue;
-		}
-
-		if (targetPath.endsWith(".ws")) {
-			const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
-			const declared = targetAst.body.map((n) => (n.type === "Export" ? n.declaration : n));
-
-			// TODAS las reactive del .ws se traen sin condición — igual
-			// que ya se hace al importar de otro .wsf (línea ~176). Una
-			// función importada puede depender de una reactive "hermana"
-			// que nadie pidió en el import; sin esto, se quedaba sin
-			// definir de verdad (ReferenceError real, no solo un valor
-			// perdido — confirmado antes de este arreglo).
-			result.reactiveInits.push(
-				...targetAst.body
-					.filter((n) => n.type === "ReactiveDecl")
-					.map((n) => ({ name: n.name, expr: n.expr, varType: n.varType }))
-			);
-			// const/var de nivel superior del .ws — mismo criterio: se
-			// traen todos sin condición (antes no se traían en absoluto).
-			result.topLevelInits.push(...targetAst.body.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl"));
-
-			for (const name of node.names) {
-				const decl = declared.find((d) => d && d.name === name);
-				if (!decl) throw new Error(`"${name}" no está exportado en ${targetPath}`);
-
-				if (decl.type === "FunctionDecl") {
-					// Las reactive globales que la función pueda usar son las
-					// del propio fichero de origen — ya se trajeron arriba,
-					// se resuelven cuando se genera el bundle completo.
-					result.functionSources.push({ node: decl });
-				}
-				// ReactiveDecl y ConstDecl/VarDecl: ya se trajeron arriba
-				// (todos, no solo los pedidos por nombre).
-			}
-			continue;
-		}
-
-		throw new Error(`Import no soportado en el cliente: "${node.from}" (solo .wsf, .ws, .wson y .js)`);
+		return;
 	}
 
+	if (targetPath.endsWith(".wsdb")) {
+		// Una base de datos es, por definición, algo del servidor — no
+		// hay forma segura ni con sentido de que el navegador hable con
+		// SQLite directamente. Mismo criterio que un paquete de npm:
+		// rechazo explícito, con mensaje claro, no un error genérico.
+		throw new Error(
+			`${where}No se puede importar "${node.from}" desde el cliente: un .wsdb es una base de datos, solo tiene sentido en el servidor (desde un .wsb).`
+		);
+	}
+
+	if (targetPath.endsWith(".wsb")) {
+		// Un .wsb es lógica de servidor — nada de él tiene sentido en el
+		// navegador, CON UNA ÚNICA EXCEPCIÓN DELIBERADA: una `reactive`
+		// (o `global reactive`) marcada `shared` puede cruzar esta
+		// frontera, porque es justo para lo que existe esa marca — un
+		// valor de servidor que se sigue en vivo desde un `.wsf`, con
+		// suscripción y actualización por WebSocket (ver DISEÑO.md,
+		// "`shared reactive`"). Cualquier otra cosa del `.wsb` (una
+		// function, una `reactive` normal sin `shared`, una `const`...)
+		// sigue bloqueada — ahora con un motivo específico en vez del
+		// rechazo genérico de antes, que no distinguía nada.
+		const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
+		const declaredByName = new Map();
+		for (const n of targetAst.body) {
+			const d = n.type === "Export" ? n.declaration : n;
+			if (d && d.name) declaredByName.set(d.name, d);
+		}
+		for (const name of names) {
+			const decl = declaredByName.get(name);
+			if (!decl) throw new Error(`${where}"${name}" no existe en ${targetPath}`);
+			if (decl.type !== "ReactiveDecl" || !decl.shared) {
+				throw new Error(
+					`${where}"${name}" existe en ${targetPath}, pero no es una reactive "shared": solo una \`reactive\`/\`global reactive\` marcada \`shared\` se puede importar desde un .wsf — el resto de un .wsb (function, reactive normal, const...) es lógica de servidor, sin sentido en el navegador.`
+				);
+			}
+			if (!first(name)) continue;
+			claimName(state, name, targetPath, fromWs);
+			result.sharedWsbReactives.push({ name, wsbPath: targetPath, global: decl.global, varType: decl.varType });
+			// Se trata como cualquier otra reactive importada para LEER
+			// (entra en `state`, por eso en `reactiveInits` con su mismo
+			// valor inicial DECLARADO en el .wsb) — así `{cursores.x}` ya
+			// funciona con la maquinaria de siempre, reactiva de verdad en
+			// cuanto llegue un "update" real por WebSocket. ESCRIBIR es
+			// aparte — ver `rewriteSharedAssignments`, más abajo: una
+			// asignación a este nombre no debe mutar `state` en el
+			// cliente, debe proponerse al servidor.
+			result.reactiveInits.push({ name, expr: decl.expr, varType: decl.varType });
+		}
+		return;
+	}
+
+	if (targetPath.endsWith(".json")) {
+		// El contenido de un .json es dato puro, conocido en tiempo de
+		// compilación — se embebe como const literal (JSON válido es
+		// JS válido), no como un import en tiempo de ejecución (el
+		// bundle de cliente no tiene require()). `import posts from
+		// "./posts.json"` liga el contenido entero a `posts`; `import
+		// { campo } from "./datos.json"` liga solo esa propiedad.
+		const jsonContent = JSON.parse(fs.readFileSync(targetPath, "utf8"));
+		if (node.isDefault) {
+			const name = node.names[0];
+			if (first(name)) {
+				claimName(state, name, targetPath, fromWs);
+				result.topLevelInits.push({ type: "ConstDecl", varType: null, name, expr: JSON.stringify(jsonContent) });
+			}
+		} else {
+			for (const name of names) {
+				if (!first(name)) continue;
+				claimName(state, name, targetPath, fromWs);
+				result.topLevelInits.push({ type: "ConstDecl", varType: null, name, expr: JSON.stringify(jsonContent[name]) });
+			}
+		}
+		return;
+	}
+
+	if (targetPath.endsWith(".wsf")) {
+		if (!firstVisit) return;
+		const targetAst = parse(fs.readFileSync(targetPath, "utf8"));
+		// `export function`/`export const`/`export visual`/`export style`
+		// dentro de un .wsf componente se parsean como un nodo Export que
+		// ENVUELVE la declaración (igual que en un .ws — ver `topDecls` en
+		// loadClientWs). Filtrar `targetAst.body` por tipo sin desenvolver
+		// primero los saltaba enteros: una `export function fmt(x)` en un
+		// componente importado era invisible, ni siquiera llegaba a
+		// `claimName` — no "colisionaba en silencio", directamente NO
+		// EXISTÍA, y una plantilla que la usara daba `fmt is not defined`
+		// al renderizar (confirmado con código: sin `export` sí viajaba).
+		const topDecls = targetAst.body.map((n) => (n.type === "Export" ? n.declaration : n)).filter(Boolean);
+
+		// Primero sus propios imports (para que un componente que a su
+		// vez use otro componente quede resuelto también).
+		const nested = collectImportedPieces(targetAst, path.dirname(targetPath), state);
+		result.reactiveInits.push(...nested.reactiveInits);
+		result.functionSources.push(...nested.functionSources);
+		result.visualDecls.push(...nested.visualDecls);
+		result.topLevelInits.push(...nested.topLevelInits);
+		result.classSources.push(...nested.classSources);
+		result.jsModuleSources.push(...nested.jsModuleSources);
+		result.sharedWsbReactives.push(...nested.sharedWsbReactives);
+
+		result.reactiveInits.push(
+			...topDecls.filter((n) => n.type === "ReactiveDecl").map((n) => ({ name: n.name, expr: n.expr, varType: n.varType }))
+		);
+		// Las function declaradas directamente en el .wsf importado
+		// (no solo las que a su vez importa de un .ws) también viajan
+		// — antes se quedaban fuera, y una función de un componente
+		// importado que la usara en su propio onclick/interpolación se
+		// quedaba sin definir en el bundle. `claimName` aquí con
+		// `fromWs: false` ya NO tiene el pase libre que tenía antes entre
+		// dos .wsf (ver más abajo): dos componentes con un helper interno
+		// del mismo nombre dan ahora el mismo error explícito que ya daban
+		// dos .ws.
+		const ownFns = topDecls.filter((n) => n.type === "FunctionDecl");
+		for (const f of ownFns) claimName(state, f.name, targetPath, false);
+		result.functionSources.push(...ownFns.map((n) => ({ node: n })));
+		// const/var de nivel superior del .wsf importado — mismo
+		// criterio que reactive/function: se traen TODOS sin
+		// condición, la pida o no el import por nombre (antes no se
+		// traían en absoluto: ReferenceError real al usarlos).
+		const ownConsts = topDecls.filter((n) => n.type === "ConstDecl" || n.type === "VarDecl");
+		for (const c of ownConsts) for (const bound of extractBoundNames(c.name)) claimName(state, bound, targetPath, false);
+		result.topLevelInits.push(...ownConsts);
+		result.visualDecls.push(...topDecls.filter((n) => n.type === "VisualDecl"));
+		result.styleNames.push(...topDecls.filter((n) => n.type === "StyleDecl").map((n) => n.name));
+		return;
+	}
+
+	if (targetPath.endsWith(".wson")) {
+		const wsonAst = parse(fs.readFileSync(targetPath, "utf8"), { isWsonFile: true });
+		for (const name of names) {
+			if (!first(name)) continue;
+			claimName(state, name, targetPath, fromWs);
+			result.classSources.push(genDtoClassSource(wsonAst, name));
+		}
+		return;
+	}
+
+	if (targetPath.endsWith(".ws")) {
+		const ws = loadClientWs(state, targetPath);
+		if (firstVisit) collectWsFileLevel(state, result, ws);
+		for (const name of names) {
+			const decl = ws.declaredByName.get(name);
+			if (!decl) throw new Error(`${where}"${name}" no está exportado en ${targetPath}`);
+			// ReactiveDecl y ConstDecl/VarDecl: ya se trajeron al visitar
+			// el fichero (todos, no solo los pedidos por nombre).
+			if (decl.type === "FunctionDecl") requestWsFunction(state, result, ws, name);
+			else if (decl.type === "VisualDecl") requestWsVisual(state, result, ws, name);
+		}
+		return;
+	}
+
+	throw new Error(`${where}Import no soportado en el cliente: "${node.from}" (solo .wsf, .ws, .wson y .js)`);
+}
+
+function collectImportedPieces(ast, baseDir, state = null) {
+	if (!state) {
+		state = createCollectState(baseDir);
+		// Lo que declara el propio fichero raíz se reserva de antemano, para
+		// detectar una colisión con lo que traiga un .ws.
+		for (const n of ast.body) {
+			if (n.type === "FunctionDecl") claimName(state, n.name, ROOT_ORIGIN, false);
+			else if (n.type === "ConstDecl" || n.type === "VarDecl") for (const b of extractBoundNames(n.name)) claimName(state, b, ROOT_ORIGIN, false);
+		}
+	}
+	const result = emptyPieces();
+	for (const node of ast.body) {
+		if (node.type !== "Import") continue;
+		processImport(state, result, node, baseDir, node.names, { isWs: false, label: null });
+	}
 	return result;
 }
 
@@ -581,10 +938,28 @@ function genHydrateText(cursorVar, node, ctx, lines) {
 	const parts = splitInterpolations(node.value);
 	const hasExpr = parts.some((p) => p.expr !== undefined);
 
+	if (!hasExpr) {
+		// Texto estático: ya está bien tal cual desde el SSR, sin marcadores
+		// (su contenido nunca cambia — nada que la hidratación deba
+		// reenganchar). Simplemente se salta el nodo.
+		lines.push(`${cursorVar} = ${cursorVar}.nextSibling;`);
+		return;
+	}
+
+	// Texto DINÁMICO: el SSR lo envolvió en `<!--t-->...<!--/t-->` (ver
+	// renderGroupSSR) precisamente porque puede haber renderizado VACÍO — sin
+	// el marcador no habría forma de distinguir "aquí no había nada" de "el
+	// SSR no llegó a esta rama". Entre los dos comentarios puede haber CERO
+	// nodos de texto (contenido vacío) o UNO (el caso normal); si falta, se
+	// crea aquí mismo antes de seguir.
 	const textVar = uniq("t");
-	lines.push(`const ${textVar} = ${cursorVar};`);
-	lines.push(`${cursorVar} = ${cursorVar}.nextSibling;`);
-	if (!hasExpr) return; // texto estático: ya está bien tal cual desde el SSR
+	const anchor = uniq("anchorStart");
+	const anchorEnd = uniq("anchorEnd");
+	lines.push(`const ${anchor} = ${cursorVar};`); // el comentario "t"
+	lines.push(`let ${textVar} = ${anchor}.nextSibling;`);
+	lines.push(`if (!${textVar} || ${textVar}.nodeType !== 3) { ${textVar} = document.createTextNode(""); ${anchor}.after(${textVar}); }`);
+	lines.push(`const ${anchorEnd} = ${textVar}.nextSibling;`); // el comentario "/t"
+	lines.push(`${cursorVar} = ${anchorEnd}.nextSibling;`);
 
 	const exprParts = parts.map((p) =>
 		p.literal !== undefined ? jsString(p.literal) : `(${substituteReactive(p.expr, ctx.reactiveNames)})`
@@ -822,10 +1197,8 @@ function extractBoundNames(name) {
 	return [name];
 }
 
-function generateClientBundle(ast, { baseDir } = {}) {
-	const imported = baseDir
-		? collectImportedPieces(ast, baseDir)
-		: { reactiveInits: [], functionSources: [], visualDecls: [], styleNames: [], topLevelInits: [], classSources: [], jsModuleSources: [] };
+function generateClientBundle(ast, { baseDir, routePattern = null } = {}) {
+	const imported = baseDir ? collectImportedPieces(ast, baseDir) : emptyPieces();
 
 	// Las reactive propias del fichero ganan si hay colisión de nombre con
 	// una importada (poco probable, pero más predecible así).
@@ -850,6 +1223,13 @@ function generateClientBundle(ast, { baseDir } = {}) {
 	const routeDerivedNames = new Set();
 	function dependsOnRoute(expr) {
 		if (/\bVisual\.(route|params|query)\(/.test(expr)) return true;
+		// `params`/`query` sueltas (sistema nuevo) cuentan igual que
+		// `Visual.route()`/`params()`/`query()` del sistema antiguo: un
+		// `const` que las use también necesita recalcularse solo tras un
+		// `goto()`, así que entra en el MISMO mecanismo (routeDerivedDecls
+		// → dentro del `effect()` de abajo), no en el camino normal de una
+		// vez.
+		if (routePattern && /\b(params|query)\b/.test(expr)) return true;
 		for (const n of routeDerivedNames) {
 			if (new RegExp(`\\b${n}\\b`).test(expr)) return true;
 		}
@@ -870,8 +1250,91 @@ function generateClientBundle(ast, { baseDir } = {}) {
 	// tratar id/tab/screen... como reactive de verdad — se añaden a la
 	// lista general ANTES de construir el ctx que usan genChildren/etc.
 	routeDerivedNames.forEach((n) => reactiveNames.push(n));
+	// `params`/`query` (sistema nuevo, sin Visual.ws) son reactivos por el
+	// mismo motivo: tras un `goto()` (o el atrás/adelante del navegador),
+	// deben recalcularse solos — mismo mecanismo que id/tab arriba, ver
+	// más abajo el `effect()` que los recalcula.
+	if (routePattern) reactiveNames.push("params", "query");
 
-	const ownVisuals = ast.body.filter((n) => n.type === "VisualDecl");
+	// const/var de nivel superior SIN relación con la ruta (p. ej. algo
+	// derivado de una reactive) — se emiten como JS real, una sola vez.
+	//
+	// De estas, las que NO leen ninguna reactive de verdad se adelantan
+	// ANTES de `const state = createStore(...)` — así una `reactive` puede
+	// usar una de estas const en su propio valor inicial. Antes todas se
+	// emitían DESPUÉS de `state` sin excepción (hacía falta para que las que
+	// SÍ leen una reactive, vía `state.NOMBRE`, tuvieran `state` ya creado) y
+	// una `reactive integer c = LIMITE` daba `Cannot access 'LIMITE' before
+	// initialization`: el propio `const LIMITE` estaba en el bundle, pero
+	// más abajo — una TDZ de verdad, no un fallo del compilador. Las
+	// function no tenían este problema — una `function` declarada más abajo
+	// ya era invocable desde antes por el *hoisting* normal de JS — así que
+	// solo hacía falta resolver este caso para const/var. Un `const`/`var`
+	// que a su vez depende (directa o transitivamente) de otro que SÍ lee
+	// una reactive se queda detrás de `state` igual que antes — no hay forma
+	// de que exista antes de que exista lo que necesita, y ese caso ya era
+	// ambiguo antes de este cambio.
+	const trueReactiveNames = new Set(reactiveMap.keys());
+	const needsStateNames = new Set(trueReactiveNames);
+	function usesAny(expr, names) {
+		for (const n of names) {
+			if (new RegExp(`\\b${n}\\b`).test(expr)) return true;
+		}
+		return false;
+	}
+	// Llamar a una function DE WEBSCRIPT (propia de este .wsf, o importada de
+	// un .ws) exige `state` ya completo — no hay forma de saber, sin
+	// analizar su cuerpo, si esa function lee una reactive por dentro (p.
+	// ej. `conBase(x) { return x + base }`, donde `base` es una reactive: la
+	// CONST que la llama, `resultado = conBase(1)`, no menciona "base" en
+	// absoluto). Se trata como conservador a propósito: cualquier llamada a
+	// una de ESTAS fuerza POST-estado, aunque en muchos casos la function
+	// llamada sea inocua — más seguro que adivinar (bug real: sin esto,
+	// `resultado` daba `NaN` en vez del valor real). Una llamada a un módulo
+	// `.js` embebido o a una clase `.wson` (`new Persona(...)`) NO cuenta:
+	// esas nunca tienen acceso a `state` (son JS aislado, sin closure sobre
+	// él), así que una const como `TRIPLE_DE_DOS = triple(2)` (de un .js) sí
+	// puede adelantarse.
+	const riskyFunctionNames = new Set([
+		...ast.body.filter((n) => n.type === "FunctionDecl").map((n) => n.name),
+		...imported.functionSources.map((f) => f.node.name),
+	]);
+	function callsRiskyFunction(expr) {
+		for (const name of riskyFunctionNames) {
+			if (new RegExp(`\\b${name}\\s*\\(`).test(expr)) return true;
+		}
+		return false;
+	}
+	{
+		let changed = true;
+		while (changed) {
+			changed = false;
+			for (const decl of plainTopLevelDecls) {
+				const bound = extractBoundNames(decl.name);
+				if (bound.some((n) => needsStateNames.has(n))) continue;
+				if (usesAny(decl.expr, needsStateNames) || callsRiskyFunction(decl.expr)) {
+					bound.forEach((n) => needsStateNames.add(n));
+					changed = true;
+				}
+			}
+		}
+	}
+	const preStateDecls = [];
+	const postStateDecls = [];
+	for (const decl of plainTopLevelDecls) {
+		const bound = extractBoundNames(decl.name);
+		(bound.some((n) => needsStateNames.has(n)) ? postStateDecls : preStateDecls).push(decl);
+	}
+
+	// El PageDecl (HTML suelto, sin `visual nombre = `) se trata como una
+	// `visual` más, con un nombre interno fijo (`__page__`) — así
+	// reutiliza tal cual generateCreateFunction/generateHydrateFunction,
+	// sin duplicar la compilación de plantillas para el sistema nuevo.
+	const ownPageDecl = ast.body.find((n) => n.type === "PageDecl");
+	const ownVisuals = [
+		...ast.body.filter((n) => n.type === "VisualDecl"),
+		...(ownPageDecl ? [{ type: "VisualDecl", name: PAGE_DECL_NAME, html: ownPageDecl.html, htmlErrors: ownPageDecl.htmlErrors, line: ownPageDecl.line }] : []),
+	];
 	const allVisuals = [...imported.visualDecls, ...ownVisuals];
 	const visualNames = new Set(allVisuals.map((v) => v.name));
 
@@ -898,19 +1361,47 @@ function generateClientBundle(ast, { baseDir } = {}) {
 	// los referencie (incluidos los de topLevelInits, más abajo).
 	const jsModuleSources = imported.jsModuleSources;
 
-	// const/var de nivel superior SIN relación con la ruta (p. ej. algo
-	// derivado de una reactive) — se emiten como JS real, una sola vez.
-	const topLevelSources = plainTopLevelDecls.map((n) => genFunctionStatement(n, reactiveNames));
+	// const/var de nivel superior POST-estado (leen una reactive vía
+	// `state.NOMBRE`, directa o transitivamente) — se emiten como JS real,
+	// una sola vez, DESPUÉS de `state` (ver el reparto pre/post arriba).
+	const topLevelSources = postStateDecls.map((n) => genFunctionStatement(n, reactiveNames));
+	// Las PRE-estado (no leen ninguna reactive) se emiten ANTES de `state`,
+	// para que una `reactive` pueda usarlas en su propio valor inicial.
+	const preStateSources = preStateDecls.map((n) => genFunctionStatement(n, reactiveNames));
 
-	// Los derivados de ruta se recalculan dentro de un único effect() — la
-	// primera ejecución (inmediata, como todo effect()) deja los valores
-	// iniciales en `state`, y las siguientes ocurren solas cuando cambia
-	// la URL. `reactiveNamesForRouteEffect` NO incluye los propios nombres
+	// Los derivados de ruta (Visual.route()/params()/query() del sistema
+	// antiguo, y params/query SUELTAS del sistema nuevo — ver
+	// `dependsOnRoute` arriba) se recalculan dentro de un ÚNICO effect() —
+	// la primera ejecución (inmediata, como todo effect()) deja los
+	// valores iniciales en `state`, y las siguientes ocurren solas cuando
+	// cambia la URL (`goto()`, o el atrás/adelante del navegador).
+	// `reactiveNamesForRouteEffect` NO incluye los propios nombres
 	// route-derived (dentro del effect son locals `const` normales, no se
 	// prefijan con `state.`), pero SÍ las reactive de verdad del fichero.
+	//
+	// `params`/`query` (sistema nuevo) se calculan aquí mismo, ANTES que
+	// cualquier `routeDerivedDecls` que las use (`const titulo = "Producto
+	// " + params.id`) — dentro del MISMO effect(), como locals normales,
+	// para que esa referencia se resuelva por closure normal de JS, sin
+	// necesidad de reescribirla a `state.params.id` (ver por qué
+	// `reactiveNamesForRouteEffect` no las incluye, arriba). Solo se
+	// añaden si quien llama pasa `routePattern` — un .wsf del sistema
+	// antiguo no lo recibe, sigue con Visual.params(screen)/query(screen).
 	const reactiveNamesForRouteEffect = [...reactiveMap.keys()];
+	const paramsQueryPreamble = routePattern
+		? [
+				`  const __url = new URL(routerState.href || (typeof location !== "undefined" ? location.href : "http://localhost/"));`,
+				`  const __route = compileRoutePatternClient(${JSON.stringify(routePattern)});`,
+				`  const __routeMatch = __route.regex.exec(__url.pathname);`,
+				`  const params = {};`,
+				`  if (__routeMatch) __route.paramNames.forEach((n, i) => { params[n] = __routeMatch[i + 1]; });`,
+				`  const query = Object.fromEntries(__url.searchParams.entries());`,
+				`  state.params = params;`,
+				`  state.query = query;`,
+			].join("\n")
+		: "";
 	let routeEffectSource = "";
-	if (routeDerivedDecls.length > 0) {
+	if (routeDerivedDecls.length > 0 || paramsQueryPreamble) {
 		const body = routeDerivedDecls
 			.map((d) => {
 				const rhs = substituteReactive(d.expr, reactiveNamesForRouteEffect);
@@ -920,10 +1411,42 @@ function generateClientBundle(ast, { baseDir } = {}) {
 				return `  const ${d.name} = (${rhs});\n${assigns}`;
 			})
 			.join("\n");
-		routeEffectSource = `effect(() => {\n${body}\n});`;
+		routeEffectSource = `effect(() => {\n${paramsQueryPreamble}\n${body}\n});`;
 	}
 
 	const wsonSources = ast.body.filter((n) => n.type === "WsonInlineDecl").map(genWsonInlineSource);
+
+	// `shared global reactive` importadas de un `.wsb`: una conexión
+	// WebSocket (al mismo origen de la página — nunca una URL declarada,
+	// igual que cualquier `fetch()` de esa página) que se suscribe a cada
+	// una al conectar, y aplica cualquier `update` que llegue directamente
+	// sobre `state` — así cualquier plantilla que la lea ya es reactiva de
+	// verdad, sin tocar el motor de reactividad para nada. Las escrituras
+	// se tratan aparte — ver `rewriteSharedAssignments`, al final de esta
+	// función: una asignación a uno de estos nombres no llega a mutar
+	// `state` directamente, se reescribe en una llamada a
+	// `__proposeShared`, definida aquí mismo.
+	const sharedNames = imported.sharedWsbReactives.map((s) => s.name);
+	const sharedWsSource =
+		sharedNames.length > 0
+			? [
+					`const __sharedNames = ${JSON.stringify(sharedNames)};`,
+					`const __sharedWs = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/");`,
+					`__sharedWs.addEventListener("open", () => { for (const __n of __sharedNames) __sharedWs.send(JSON.stringify({ type: "subscribe", name: __n })); });`,
+					`__sharedWs.addEventListener("message", (__ev) => {`,
+					`  let __msg;`,
+					`  try { __msg = JSON.parse(__ev.data); } catch { return; }`,
+					`  if (__msg.type === "update" && __sharedNames.includes(__msg.name)) state[__msg.name] = __msg.value;`,
+					`});`,
+					// El cliente NUNCA muta una `shared` directamente — solo
+					// propone. Si la conexión aún no está lista (reconectando,
+					// o la primera propuesta llega antes de que termine el
+					// saludo), la propuesta se pierde en silencio — limitación
+					// conocida, documentada en DISEÑO.md; un reintento o cola
+					// de propuestas pendientes queda para una vuelta futura.
+					`function __proposeShared(name, value) { if (__sharedWs.readyState === WebSocket.OPEN) __sharedWs.send(JSON.stringify({ type: "propose", name, value })); }`,
+				].join("\n")
+			: "";
 
 	const renderCall = ast.body.find((n) => n.type === "Raw" && /^Visual\.render\(/.test(n.text));
 
@@ -932,20 +1455,69 @@ function generateClientBundle(ast, { baseDir } = {}) {
 		RUNTIME_SOURCE,
 		...jsModuleSources,
 		...classSources,
+		...preStateSources,
 		typedNames.length > 0
 			? `const state = createStore({\n${stateInit}\n}, {\n${typeSchemaLiteral}\n});`
 			: `const state = createStore({\n${stateInit}\n});`,
+		...(sharedWsSource ? [sharedWsSource] : []),
+		// `routeEffectSource` (derivados de Visual.route()/params()/query()
+		// del sistema antiguo, Y params/query sueltas del sistema nuevo —
+		// ver `dependsOnRoute` arriba) va ANTES de `topLevelSources`: un
+		// `const` POST-estado normal (`const titulo = "Producto " +
+		// params.id`) que las use ya entró en `routeDerivedDecls`, no en
+		// `topLevelSources` — pero por si acaso algo más las necesitara
+		// pronto, este orden es el correcto de todos modos.
+		...(routeEffectSource ? [routeEffectSource] : []),
 		...functionSources,
 		...wsonSources,
 		...topLevelSources,
-		...(routeEffectSource ? [routeEffectSource] : []),
 		...allVisuals.map((v) => generateCreateFunction(v, ctx)),
 		...allVisuals.map((v) => generateHydrateFunction(v, ctx)),
 	];
 
+	// Nombre de lo que se monta al cargar: el de siempre (Visual.render(x)
+	// explícito) si está, y si no, el sistema nuevo (aditivo, sin
+	// Visual.ws) — ver findImplicitPageTarget en codegen.js. Un PageDecl
+	// (HTML suelto) SIEMPRE gana si está presente; si no, exactamente una
+	// `visual` declarada se renderiza implícita, sin llamada. Dos o más
+	// `visual` sin Visual.render() y sin PageDecl es un fichero librería —
+	// no se monta nada — SALVO que alguien llame a generateClientBundle
+	// directamente sobre un AST así esperando una página: entonces sí es
+	// el conflicto real ("no se sabe cuál renderizar") y se avisa con un
+	// error claro, en vez de montar cualquiera de las dos sin criterio.
+	let targetName = null;
 	if (renderCall) {
 		const m = /^Visual\.render\((\w+)\)$/.exec(renderCall.text);
-		if (m) {
+		if (m) targetName = m[1];
+	} else {
+		const implicitTarget = findImplicitPageTarget(ast);
+		if (implicitTarget) {
+			targetName = implicitTarget.type === "PageDecl" ? PAGE_DECL_NAME : implicitTarget.name;
+		} else if (ownVisuals.filter((v) => v.name !== PAGE_DECL_NAME).length > 1) {
+			throw new Error(
+				`Este .wsf declara ${ownVisuals.length} \`visual\` y no tiene HTML suelto ni Visual.render(): no se sabe cuál renderizar como página. ` +
+					"Deja solo una, envuelve el HTML de la página sin nombre, o llama a Visual.render(la_que_sea) explícitamente."
+			);
+		}
+	}
+
+	if (targetName) {
+		// Una página cuyo HTML suelto es literalmente un documento
+		// completo (`<html>...</html>`, con su `<head>`) no se puede
+		// "montar" dentro de `document.body` — ya ES el documento, y
+		// anidar `<html>` dentro de `<body>` no tiene sentido y el propio
+		// navegador lo reordenaría. Aquí se asume que el servidor SIEMPRE
+		// mandó ese HTML completo como la página (por eso existe: para
+		// escribirla como un fichero HTML normal) — se hidrata
+		// directamente contra `document.documentElement`, el `<html>` que
+		// el navegador ya parseó. Sin SSR no hay nada sensato que crear
+		// (una página así no tiene sentido sin servirla ya completa), así
+		// que ese camino no se genera para este caso.
+		const targetVisual = allVisuals.find((v) => v.name === targetName);
+		const rootIsHtmlDocument = targetVisual && targetVisual.html.length === 1 && targetVisual.html[0].type === "Element" && targetVisual.html[0].name.toLowerCase() === "html";
+		if (rootIsHtmlDocument) {
+			parts.push(`hydrate_${targetName}({}, {}, document.documentElement);`);
+		} else {
 			// Si hubo SSR, el body ya trae HTML del servidor — se hidrata de
 			// verdad (se reutilizan elementos/texto, solo if/for se
 			// reconstruyen localmente; ver limitaciones en codegen-ssr.js).
@@ -954,12 +1526,25 @@ function generateClientBundle(ast, { baseDir } = {}) {
 			// mirar solo "firstChild" nunca sabría diferenciarlos (el script
 			// también es un hijo de body).
 			parts.push(
-				`{ const ssrNode = document.body.firstChild; if (ssrNode && ssrNode !== document.currentScript) { hydrate_${m[1]}({}, {}, ssrNode); } else { document.body.appendChild(create_${m[1]}({}, {})); } }`
+				`{ const ssrNode = document.body.firstChild; if (ssrNode && ssrNode !== document.currentScript) { hydrate_${targetName}({}, {}, ssrNode); } else { document.body.appendChild(create_${targetName}({}, {})); } }`
 			);
 		}
 	}
 
-	return parts.join("\n\n");
+	const bundleText = parts.join("\n\n");
+	// Última pasada, sobre el texto YA ensamblado entero: cualquier
+	// asignación a una `shared` (ya reescrita a `state.nombre = ...` por
+	// `substituteReactive`, como cualquier otra reactive) se convierte en
+	// una llamada a `__proposeShared` — el cliente nunca muta una `shared`
+	// de verdad, solo propone (ver DISEÑO.md). Deliberadamente a nivel de
+	// texto completo, no en cada punto de compilación por separado (atrs,
+	// eventos, cuerpos de function...) — así cubre CUALQUIER sitio donde
+	// pueda aparecer una asignación así, sin tener que tocar cada uno de
+	// esos sitios uno a uno ni arriesgarse a olvidar alguno. Limitación
+	// deliberada: solo cubre una asignación simple con `=` — un operador
+	// compuesto (`+=`, `++`...) sobre una `shared` no se reescribe todavía
+	// (documentado en DISEÑO.md).
+	return sharedNames.length > 0 ? rewriteSharedAssignments(bundleText, sharedNames) : bundleText;
 }
 
 module.exports = {
@@ -970,4 +1555,6 @@ module.exports = {
 	groupSlotContent,
 	collectImportedPieces,
 	genFunctionStatement,
+	extractBoundNames,
+	PAGE_DECL_NAME,
 };

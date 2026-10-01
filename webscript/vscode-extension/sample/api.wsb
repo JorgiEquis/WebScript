@@ -1,0 +1,16 @@
+// Prueba aquí la extensión:
+//  - Pasa el ratón sobre WSON.httpSend, WSON.httpParams, reactive, watch...
+//  - Ctrl+Click sobre "saludar" (línea de import) para saltar a saludo.ws
+//  - Ctrl+Click sobre "./saludo.ws" para abrir el fichero
+import { saludar } from "./saludo.ws"
+
+const WSON wsonSaludo =
+	-> to: "/saludo/:nombre"
+	-> via: "GET"
+
+reactive any peticion = WSON.listen(wsonSaludo)
+
+watch(peticion)
+	var nombre = WSON.httpParams(peticion).nombre
+	peticion.content = { mensaje: saludar(nombre) }
+	WSON.httpSend(peticion)
